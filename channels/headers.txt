@@ -1,0 +1,7 @@
+Accept: */*
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-US,en;q=0.5
+Connection: keep-alive
+Origin: https://www.elahmad.com
+User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0
+Host: live.kwikmotion.com
