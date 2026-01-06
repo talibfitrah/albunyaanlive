@@ -205,10 +205,10 @@ Channels are managed in `run_all_channels.sh`.
 2. Add `#` at the start of the channel line:
    ```bash
    # This channel is now disabled:
-   #sh channel_safa.sh
+   #./channel_arrahmah.sh
 
    # This channel is still enabled:
-   sh channel_basmah_revised.sh
+   ./channel_basmah_revised.sh
    ```
 
 3. Save and restart:

@@ -570,6 +570,68 @@ reload_config_if_changed() {
 }
 
 # =============================================================================
+# STARTUP FIX: Load backup URLs from config if none were passed via -b
+# =============================================================================
+# This ensures fallback is enabled even if:
+#   1. Channel was started without -b flag
+#   2. Backup URLs are added to config file at any time
+# The hot-reload will then detect future changes to backup URLs.
+# =============================================================================
+
+load_backup_urls_from_config() {
+    local script="$1"
+
+    if [[ -z "$script" || ! -f "$script" ]]; then
+        return 1
+    fi
+
+    local new_backups=""
+    local backups_found=false
+
+    # Check for BACKUP_URLS variable first
+    if grep -qE "^[[:space:]]*(export[[:space:]]+)?BACKUP_URLS[[:space:]]*=" "$script" 2>/dev/null; then
+        backups_found=true
+        new_backups=$(parse_config_value "$script" "BACKUP_URLS")
+    # Then check for stream_url_backup1/backup2 variables
+    elif grep -qE "^[[:space:]]*(export[[:space:]]+)?stream_url_backup[12][[:space:]]*=" "$script" 2>/dev/null; then
+        backups_found=true
+        local b1 b2
+        b1=$(parse_config_value "$script" "stream_url_backup1")
+        b2=$(parse_config_value "$script" "stream_url_backup2")
+        [[ -n "$b1" ]] && new_backups="$b1"
+        [[ -n "$b2" ]] && new_backups="${new_backups:+$new_backups|}$b2"
+    fi
+
+    if [[ "$backups_found" == true && -n "$new_backups" ]]; then
+        # Add backup URLs to url_array
+        IFS='|' read -ra backup_array <<< "$new_backups"
+        for backup in "${backup_array[@]}"; do
+            backup=$(echo "$backup" | xargs)  # trim whitespace
+            if [[ -n "$backup" ]]; then
+                url_array+=("$backup")
+            fi
+        done
+        url_count=${#url_array[@]}
+        return 0
+    fi
+
+    return 1
+}
+
+# If no backup URLs were passed via -b, try loading them from config file
+if [[ $url_count -eq 1 && -n "$config_file" && -f "$config_file" ]]; then
+    log "STARTUP: No backup URLs passed via -b flag. Checking config file..."
+    if load_backup_urls_from_config "$config_file"; then
+        log "STARTUP: Loaded backup URLs from config file. URL count: $url_count"
+        for i in $(seq 1 $((url_count - 1))); do
+            log "STARTUP: Backup URL $i: ${url_array[$i]}"
+        done
+    else
+        log "STARTUP: No backup URLs found in config file."
+    fi
+fi
+
+# =============================================================================
 # URL validation function with HTTP status detection
 # =============================================================================
 
@@ -597,7 +659,7 @@ is_4xx_error() {
 
 # -rw_timeout: 30 seconds in microseconds (was 4+ hours - BUG FIX)
 # Use the shared USER_AGENT variable for consistency with preflight curl checks
-base_flags=( -user_agent "$USER_AGENT" -http_persistent 1 -rw_timeout 30000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
+base_flags=( -user_agent "$USER_AGENT" -rw_timeout 30000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
 
 # =============================================================================
 # HLS output settings for seamless transitions
