@@ -3,8 +3,50 @@
 # =============================================================================
 # HLS Channel Health Monitor with Auto-Restart
 # =============================================================================
+
+SUDO_PASS_FILE="${SUDO_PASS_FILE:-$HOME/.sudo_pass.sh}"
+sudo_run() {
+    if [[ $(id -u) -eq 0 ]]; then
+        "$@"
+        return $?
+    fi
+    if [[ -r "$SUDO_PASS_FILE" ]]; then
+        sudo -S "$@" < "$SUDO_PASS_FILE"
+        return $?
+    fi
+    sudo -n "$@"
+}
+
+DEVNULL="/dev/null"
+devnull_fallback=0
+if [[ ! -c /dev/null || ! -w /dev/null ]]; then
+    DEVNULL="/tmp/albunyaan-dev-null"
+    : > "$DEVNULL" || true
+    devnull_fallback=1
+fi
+
+# STABILITY: Ensure /dev/null is a character device (not a regular file)
+if [[ ! -c /dev/null ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] CRITICAL: /dev/null is not a character device, attempting fix..."
+    # Use atomic replacement to avoid races with concurrent redirects to /dev/null.
+    sudo_run rm -f /dev/null.new 2>$DEVNULL || true
+    sudo_run mknod -m 666 /dev/null.new c 1 3 2>$DEVNULL || true
+    sudo_run chown root:root /dev/null.new 2>$DEVNULL || true
+    sudo_run chmod 666 /dev/null.new 2>$DEVNULL || true
+    sudo_run mv -f /dev/null.new /dev/null 2>$DEVNULL || true
+    if [[ ! -c /dev/null ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FATAL: Cannot fix /dev/null, exiting"
+        exit 1
+    fi
+fi
+
+if [[ $devnull_fallback -eq 1 && -c /dev/null && -w /dev/null ]]; then
+    DEVNULL="/dev/null"
+fi
+
+# =============================================================================
 # Monitors HLS output directories for stale segments and auto-restarts channels
-# Run via cron: */1 * * * * /path/to/health_monitor.sh
+# Run via cron: */2 * * * * /path/to/health_monitor.sh >> /tmp/albunyaan-logs/health_cron.log 2>&1
 #
 # Fixed Issues:
 #   - [BLOCKER] Uses channel_id (HLS directory name) for process detection
@@ -25,12 +67,12 @@ resolve_log_dir() {
     local preferred="$1"
     local fallback="/tmp/albunyaan-logs"
 
-    if mkdir -p "$preferred" 2>/dev/null && [[ -w "$preferred" ]]; then
+    if mkdir -p "$preferred" 2>$DEVNULL && [[ -w "$preferred" ]]; then
         echo "$preferred"
         return
     fi
 
-    mkdir -p "$fallback" 2>/dev/null || true
+    mkdir -p "$fallback" 2>$DEVNULL || true
     if [[ -w "$fallback" ]]; then
         echo "$fallback"
         return
@@ -42,7 +84,7 @@ resolve_log_dir() {
 LOG_DIR=$(resolve_log_dir "$SCRIPT_DIR/logs")
 LOG_FILE="$LOG_DIR/health_monitor.log"
 
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+mkdir -p "$(dirname "$LOG_FILE")" 2>$DEVNULL || true
 mkdir -p "$RESTART_TRACKING_DIR"
 
 log() {
@@ -148,14 +190,14 @@ get_channel_script() {
     done
 
     # Last resort: fuzzy match
-    local match=$(find "$SCRIPT_DIR" -maxdepth 1 -name "channel_*${channel_id}*.sh" -type f 2>/dev/null | head -1)
+    local match=$(find "$SCRIPT_DIR" -maxdepth 1 -name "channel_*${channel_id}*.sh" -type f 2>$DEVNULL | head -1)
     if [[ -n "$match" ]]; then
         echo "$match"
         return
     fi
 
     # Try with underscores
-    match=$(find "$SCRIPT_DIR" -maxdepth 1 -name "channel_*${underscore_name}*.sh" -type f 2>/dev/null | head -1)
+    match=$(find "$SCRIPT_DIR" -maxdepth 1 -name "channel_*${underscore_name}*.sh" -type f 2>$DEVNULL | head -1)
     if [[ -n "$match" ]]; then
         echo "$match"
         return
@@ -180,8 +222,8 @@ is_channel_running() {
 
     # Method 1: Check pidfile (most reliable)
     if [[ -f "$pidfile" ]]; then
-        local pid=$(cat "$pidfile" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        local pid=$(cat "$pidfile" 2>$DEVNULL)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>$DEVNULL; then
             return 0  # Running
         fi
     fi
@@ -189,13 +231,13 @@ is_channel_running() {
     # Method 2: Check lock directory
     if [[ -d "$lockdir" ]]; then
         # Lock exists - check if FFmpeg is writing to this channel
-        if pgrep -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" >/dev/null 2>&1; then
+        if pgrep -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" >$DEVNULL 2>&1; then
             return 0  # Running
         fi
     fi
 
     # Method 3: Direct FFmpeg check (in case lock/pid are missing)
-    if pgrep -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" >/dev/null 2>&1; then
+    if pgrep -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" >$DEVNULL 2>&1; then
         return 0  # Running
     fi
 
@@ -217,11 +259,23 @@ restart_channel() {
     log_console "RESTARTING channel: $channel_id"
 
     # Kill existing FFmpeg processes for this channel
-    pkill -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" 2>/dev/null
+    # NOTE: FFmpeg may run as root, so try both regular and sudo kill
+    pkill -9 -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" 2>$DEVNULL || true
+
+    # If running as non-root and processes are owned by root, use sudo
+    if [[ $(id -u) -ne 0 ]]; then
+        local ffmpeg_pids=$(pgrep -f "ffmpeg.*/${escaped_channel_id}/master\\.m3u8" 2>$DEVNULL)
+        if [[ -n "$ffmpeg_pids" ]]; then
+            log "Processes still running after pkill, trying sudo kill..."
+            for pid in $ffmpeg_pids; do
+                sudo_run kill -9 "$pid" 2>$DEVNULL || true
+            done
+        fi
+    fi
 
     # Remove lock and pid files (generic_channel.sh or try_start_stream.sh will recreate)
-    rmdir "/tmp/stream_${channel_id}.lock" 2>/dev/null
-    rm -f "/tmp/stream_${channel_id}.pid" 2>/dev/null
+    rmdir "/tmp/stream_${channel_id}.lock" 2>$DEVNULL || sudo_run rmdir "/tmp/stream_${channel_id}.lock" 2>$DEVNULL || true
+    rm -f "/tmp/stream_${channel_id}.pid" 2>$DEVNULL || sudo_run rm -f "/tmp/stream_${channel_id}.pid" 2>$DEVNULL || true
 
     sleep 2
 
@@ -246,11 +300,11 @@ check_channel_health() {
     fi
 
     # Check playlist age
-    local playlist_mtime=$(stat -c %Y "$playlist" 2>/dev/null || echo 0)
+    local playlist_mtime=$(stat -c %Y "$playlist" 2>$DEVNULL || echo 0)
     local playlist_age=$((current_time - playlist_mtime))
 
     # Find the newest .ts segment
-    local newest_segment=$(find "$channel_dir" -name "*.ts" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)
+    local newest_segment=$(find "$channel_dir" -name "*.ts" -type f -printf '%T@ %p\n' 2>$DEVNULL | sort -n | tail -1)
     local segment_mtime=0
     local segment_age=999999
 

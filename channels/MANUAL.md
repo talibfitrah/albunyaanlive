@@ -234,12 +234,13 @@ Add this to your crontab:
 crontab -e
 ```
 
-Add this line:
+Add these lines:
 ```
-* * * * * /home/msa/Development/scripts/albunyaan/channels/health_monitor.sh
+*/2 * * * * /home/msa/Development/scripts/albunyaan/channels/health_monitor.sh >> /tmp/albunyaan-logs/health_cron.log 2>&1
+0 */2 * * * find /tmp -name "ffmpeg_error_*.log" -mmin +120 -delete
 ```
 
-This checks all channels every minute and:
+This checks all channels every 2 minutes and:
 - Restarts stopped channels
 - Restarts channels with stale segments (not updated in 15+ seconds)
 - Limits to 5 automatic restarts per hour per channel
