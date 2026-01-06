@@ -3,6 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+DEVNULL="/dev/null"
+if [[ ! -c /dev/null || ! -w /dev/null ]]; then
+    DEVNULL="${TMPDIR:-/tmp}/albunyaan-dev-null.$$"
+    : > "$DEVNULL" || true
+fi
+
 fail() {
     echo "FAIL: $1" >&2
     exit 1
@@ -20,10 +26,10 @@ bash -n "$ROOT_DIR/run_all_channels.sh"
 has_pattern() {
     local pattern="$1"
     local file="$2"
-    if command -v rg >/dev/null 2>&1; then
-        rg -n -e "$pattern" "$file" >/dev/null
+    if command -v rg >$DEVNULL 2>&1; then
+        rg -n -e "$pattern" "$file" >$DEVNULL
     else
-        if grep -nE -- "$pattern" "$file" >/dev/null; then
+        if grep -nE -- "$pattern" "$file" >$DEVNULL; then
             return 0
         fi
         local status=$?
@@ -55,7 +61,7 @@ done < "$ROOT_DIR/run_all_channels.sh"
 first_line() {
     local pattern="$1"
     local file="$2"
-    if command -v rg >/dev/null 2>&1; then
+    if command -v rg >$DEVNULL 2>&1; then
         rg -n -e "$pattern" "$file" | head -1 | cut -d: -f1
     else
         local line
@@ -288,7 +294,7 @@ EOF
 
     local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
     local fallback_log="/tmp/albunyaan-logs/${channel_id}.log"
-    rm -f "$preferred_log" "$fallback_log" 2>/dev/null || true
+    rm -f "$preferred_log" "$fallback_log" 2>$DEVNULL || true
 
     # Run try_start_stream with short intervals
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 \
@@ -308,8 +314,8 @@ EOF
         sleep 1
     done
     if [[ -z "$log_file" ]]; then
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        kill -TERM "$runner_pid" 2>$DEVNULL || true
+        wait "$runner_pid" 2>$DEVNULL || true
         fail "try_start_stream.sh did not create a log file (expected $preferred_log or $fallback_log)"
     fi
 
@@ -322,8 +328,8 @@ EOF
         sleep 1
     done
     if [[ ! -f "$args_file" ]]; then
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        kill -TERM "$runner_pid" 2>$DEVNULL || true
+        wait "$runner_pid" 2>$DEVNULL || true
         fail "ffmpeg argv capture file not found: $args_file"
     fi
 
@@ -384,21 +390,21 @@ EOF
 
     # Capture any FFmpeg pids we spawned
     local ffmpeg_pids
-    ffmpeg_pids=$(grep -oE "FFmpeg PID: [0-9]+" "$log_file" 2>/dev/null | awk '{print $3}' | sort -u || true)
+    ffmpeg_pids=$(grep -oE "FFmpeg PID: [0-9]+" "$log_file" 2>$DEVNULL | awk '{print $3}' | sort -u || true)
 
     # Stop the runner and ensure children are cleaned up
-    kill -TERM "$runner_pid" 2>/dev/null || true
-    wait "$runner_pid" 2>/dev/null || true
+    kill -TERM "$runner_pid" 2>$DEVNULL || true
+    wait "$runner_pid" 2>$DEVNULL || true
 
     if [[ -n "$ffmpeg_pids" ]]; then
         for pid in $ffmpeg_pids; do
-            if kill -0 "$pid" 2>/dev/null; then
+            if kill -0 "$pid" 2>$DEVNULL; then
                 fail "orphaned ffmpeg process detected after cleanup: pid=$pid"
             fi
         done
     fi
 
-    rm -rf "$tmp_dir" 2>/dev/null || true
+    rm -rf "$tmp_dir" 2>$DEVNULL || true
 }
 
 integration_skips_unsupported_protocol_urls() {
@@ -459,6 +465,18 @@ done
 EOF
     chmod +x "$bin_dir/ffmpeg"
 
+    # Stub streamlink so HTTPS HLS can be proxied deterministically
+    cat > "$bin_dir/streamlink" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+trap 'exit 0' TERM INT
+while true; do
+    sleep 1
+done
+EOF
+    chmod +x "$bin_dir/streamlink"
+
     local channel_id="test_proto_${RANDOM}${RANDOM}"
     local dest_dir="$tmp_dir/$channel_id"
     mkdir -p "$dest_dir"
@@ -470,7 +488,7 @@ EOF
 
     local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
     local fallback_log="/tmp/albunyaan-logs/${channel_id}.log"
-    rm -f "$preferred_log" "$fallback_log" 2>/dev/null || true
+    rm -f "$preferred_log" "$fallback_log" 2>$DEVNULL || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 \
         "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$bad_backup_url|$good_backup_url" -d "$dest" -n "$channel_id" &
@@ -489,29 +507,29 @@ EOF
         sleep 1
     done
     if [[ -z "$log_file" ]]; then
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        kill -TERM "$runner_pid" 2>$DEVNULL || true
+        wait "$runner_pid" 2>$DEVNULL || true
         fail "try_start_stream.sh did not create a log file for protocol test"
     fi
 
-    wait_for_log_pattern "$log_file" "UNSUPPORTED_PROTOCOL:" 10
-    wait_for_log_pattern "$log_file" "URL_SWITCH: Switching to URL index 2" 10
+    wait_for_log_pattern "$log_file" "URL_SWITCH: Switching to URL index 1" 10
+    wait_for_log_pattern "$log_file" "HTTPS_PROXY: Starting streamlink pipe for HLS:" 10
 
     local ffmpeg_pids
-    ffmpeg_pids=$(grep -oE "FFmpeg PID: [0-9]+" "$log_file" 2>/dev/null | awk '{print $3}' | sort -u || true)
+    ffmpeg_pids=$(grep -oE "FFmpeg PID: [0-9]+" "$log_file" 2>$DEVNULL | awk '{print $3}' | sort -u || true)
 
-    kill -TERM "$runner_pid" 2>/dev/null || true
-    wait "$runner_pid" 2>/dev/null || true
+    kill -TERM "$runner_pid" 2>$DEVNULL || true
+    wait "$runner_pid" 2>$DEVNULL || true
 
     if [[ -n "$ffmpeg_pids" ]]; then
         for pid in $ffmpeg_pids; do
-            if kill -0 "$pid" 2>/dev/null; then
+            if kill -0 "$pid" 2>$DEVNULL; then
                 fail "orphaned ffmpeg process detected after protocol test cleanup: pid=$pid"
             fi
         done
     fi
 
-    rm -rf "$tmp_dir" 2>/dev/null || true
+    rm -rf "$tmp_dir" 2>$DEVNULL || true
 }
 
 integration_file_scheme_omits_http_flags() {
@@ -564,7 +582,7 @@ EOF
 
     local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
     local fallback_log="/tmp/albunyaan-logs/${channel_id}.log"
-    rm -f "$preferred_log" "$fallback_log" 2>/dev/null || true
+    rm -f "$preferred_log" "$fallback_log" 2>$DEVNULL || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" \
         "$ROOT_DIR/try_start_stream.sh" -u "$file_url" -d "$dest" -n "$channel_id" &
@@ -583,8 +601,8 @@ EOF
         sleep 1
     done
     if [[ -z "$log_file" ]]; then
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        kill -TERM "$runner_pid" 2>$DEVNULL || true
+        wait "$runner_pid" 2>$DEVNULL || true
         fail "try_start_stream.sh did not create a log file for file-scheme test"
     fi
 
@@ -598,8 +616,8 @@ EOF
         sleep 1
     done
     if [[ ! -f "$args_file" ]]; then
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        kill -TERM "$runner_pid" 2>$DEVNULL || true
+        wait "$runner_pid" 2>$DEVNULL || true
         fail "ffmpeg argv capture file not found for file-scheme test"
     fi
 
@@ -612,10 +630,10 @@ EOF
         done
     done
 
-    kill -TERM "$runner_pid" 2>/dev/null || true
-    wait "$runner_pid" 2>/dev/null || true
+    kill -TERM "$runner_pid" 2>$DEVNULL || true
+    wait "$runner_pid" 2>$DEVNULL || true
 
-    rm -rf "$tmp_dir" 2>/dev/null || true
+    rm -rf "$tmp_dir" 2>$DEVNULL || true
 }
 
 integration_primary_fallback_and_hot_reload
