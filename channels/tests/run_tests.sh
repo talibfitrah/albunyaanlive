@@ -15,6 +15,7 @@ bash -n "$ROOT_DIR/health_monitor.sh"
 bash -n "$ROOT_DIR/graceful_restart.sh"
 bash -n "$ROOT_DIR/channel_status.sh"
 bash -n "$ROOT_DIR/cleanup_orphaned.sh"
+bash -n "$ROOT_DIR/run_all_channels.sh"
 
 has_pattern() {
     local pattern="$1"
@@ -32,6 +33,24 @@ has_pattern() {
         return 1
     fi
 }
+
+# Ensure run_all_channels.sh does not invoke channel scripts via /bin/sh (dash breaks bashisms like [[ ]])
+if has_pattern '^[[:space:]]*sh[[:space:]]+channel_' "$ROOT_DIR/run_all_channels.sh"; then
+    fail "run_all_channels.sh should not use sh to invoke channel scripts; use ./channel_*.sh instead"
+fi
+
+# Ensure all channel scripts referenced in run_all_channels.sh exist and are executable
+while IFS= read -r line; do
+    line="${line%%#*}"
+    read -r cmd _ <<< "$line"
+    [[ -z "$cmd" ]] && continue
+    if [[ "$cmd" == ./channel_*.sh ]]; then
+        script_path="$ROOT_DIR/${cmd#./}"
+        if [[ ! -x "$script_path" ]]; then
+            fail "run_all_channels.sh references missing or non-executable script: ${cmd#./}"
+        fi
+    fi
+done < "$ROOT_DIR/run_all_channels.sh"
 
 first_line() {
     local pattern="$1"

@@ -13,6 +13,7 @@ stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/almajd-kids/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-kids/master.m3u8"
+scale=0
 
 # Build backup URL string (pipe-separated)
 backup_urls=""
