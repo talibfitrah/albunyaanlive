@@ -4,7 +4,18 @@
 # HLS Channel Health Monitor with Auto-Restart
 # =============================================================================
 
-SUDO_PASS_FILE="${SUDO_PASS_FILE:-$HOME/.sudo_pass.sh}"
+# Password file for sudo operations (plain text file containing the password)
+# For better security, consider using sudoers NOPASSWD for specific commands instead
+SUDO_PASS_FILE="${SUDO_PASS_FILE:-$HOME/.sudo_pass}"
+
+# Verify password file has restrictive permissions if it exists
+if [[ -f "$SUDO_PASS_FILE" ]]; then
+    file_perms=$(stat -c %a "$SUDO_PASS_FILE" 2>/dev/null || stat -f %OLp "$SUDO_PASS_FILE" 2>/dev/null)
+    if [[ "$file_perms" != "600" && "$file_perms" != "400" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $SUDO_PASS_FILE has insecure permissions ($file_perms). Should be 600 or 400." >&2
+    fi
+fi
+
 sudo_run() {
     if [[ $(id -u) -eq 0 ]]; then
         "$@"
@@ -20,9 +31,15 @@ sudo_run() {
 DEVNULL="/dev/null"
 devnull_fallback=0
 if [[ ! -c /dev/null || ! -w /dev/null ]]; then
-    DEVNULL="/tmp/albunyaan-dev-null"
+    # Use unique per-process fallback to avoid contention
+    DEVNULL="/tmp/albunyaan-dev-null-$$"
     : > "$DEVNULL" || true
     devnull_fallback=1
+    # Schedule periodic truncation to prevent unbounded growth
+    (while sleep 60; do : > "$DEVNULL" 2>/dev/null || true; done) &
+    _devnull_cleaner_pid=$!
+    # Cleanup fallback file and cleaner on exit (handle multiple signals to avoid orphaned processes)
+    trap 'kill $_devnull_cleaner_pid 2>/dev/null; rm -f "$DEVNULL" 2>/dev/null' EXIT INT TERM HUP
 fi
 
 # STABILITY: Ensure /dev/null is a character device (not a regular file)
