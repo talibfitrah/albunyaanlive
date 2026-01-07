@@ -31,9 +31,10 @@ stream_url="https://www.youtube.com/@ZadTVchannel/live"
 stream_url_backup1=""
 stream_url_backup2=""
 
-# Output destination
-rtmp_url="/var/www/html/stream/hls/youtube-example/master.m3u8"
-stream_id="/var/www/html/stream/hls/youtube-example/master.m3u8"
+# Output destination (HLS playlist path)
+# Note: stream_id duplicates hls_output for generic_channel.sh compatibility
+hls_output="/var/www/html/stream/hls/youtube-example/master.m3u8"
+stream_id="$hls_output"
 
 # Scale 9 recommended for YouTube (software decode handles YouTube's encoding better)
 scale=9
@@ -43,4 +44,4 @@ backup_urls=""
 [[ -n "$stream_url_backup1" ]] && backup_urls="$stream_url_backup1"
 [[ -n "$stream_url_backup2" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup2"
 
-./generic_channel.sh "$stream_name" "$stream_id" "$stream_url" "$rtmp_url" "$scale" "$backup_urls"
+./generic_channel.sh "$stream_name" "$stream_id" "$stream_url" "$hls_output" "$scale" "$backup_urls"

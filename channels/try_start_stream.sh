@@ -24,10 +24,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEVNULL="/dev/null"
 devnull_fallback=0
 if [[ ! -c /dev/null || ! -w /dev/null ]]; then
-    DEVNULL="/tmp/albunyaan-dev-null"
+    # Use unique per-process fallback to avoid contention between instances
+    DEVNULL="/tmp/albunyaan-dev-null-$$"
     : > "$DEVNULL" || true
     devnull_fallback=1
 fi
+
+# =============================================================================
+# Cross-platform stat helpers (GNU/BSD compatibility)
+# =============================================================================
+# GNU stat uses -c, BSD stat uses -f
+# =============================================================================
+
+get_file_size() {
+    local file="$1"
+    stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+}
+
+get_file_mtime() {
+    local file="$1"
+    stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0
+}
 
 url=""
 backup_urls=""
@@ -214,7 +231,7 @@ proxy_pid=""
 # Log rotation (50MB threshold, keep last 5)
 rotate_logs() {
     local file="$1"
-    if [[ -f "$file" && $(stat -c%s "$file" 2>$DEVNULL || echo 0) -gt 52428800 ]]; then
+    if [[ -f "$file" && $(get_file_size "$file") -gt 52428800 ]]; then
         # Rotate: .log -> .log.1 -> .log.2 -> ... -> .log.5 (delete .log.5)
         for i in 4 3 2 1; do
             [[ -f "${file}.$i" ]] && mv "${file}.$i" "${file}.$((i+1))"
@@ -327,13 +344,26 @@ truncate_error_log_if_needed() {
     [[ -z "$error_file" || ! -f "$error_file" ]] && return 0
 
     local file_size
-    file_size=$(stat -c%s "$error_file" 2>$DEVNULL) || return 0
+    file_size=$(get_file_size "$error_file")
+    [[ "$file_size" -eq 0 ]] && return 0
 
     if [[ "$file_size" -gt "$MAX_ERROR_LOG_SIZE" ]]; then
         log "ERROR_LOG_TRUNCATE: $error_file is ${file_size} bytes, truncating to last ${ERROR_LOG_KEEP_SIZE} bytes"
-        # Keep the last ERROR_LOG_KEEP_SIZE bytes
-        tail -c "$ERROR_LOG_KEEP_SIZE" "$error_file" > "${error_file}.tmp" 2>$DEVNULL
-        mv "${error_file}.tmp" "$error_file" 2>$DEVNULL || rm -f "${error_file}.tmp"
+        # Use flock if available to prevent race conditions with FFmpeg writes
+        if command -v flock >$DEVNULL 2>&1; then
+            (
+                flock -x 200 || exit 1
+                tail -c "$ERROR_LOG_KEEP_SIZE" "$error_file" > "${error_file}.tmp" 2>$DEVNULL
+                mv "${error_file}.tmp" "$error_file" 2>$DEVNULL || rm -f "${error_file}.tmp"
+            ) 200>"${error_file}.lock"
+            local lock_exit=$?
+            rm -f "${error_file}.lock" 2>$DEVNULL
+            [[ $lock_exit -ne 0 ]] && return 1
+        else
+            # Fallback: atomic copy-replace (best effort without locking)
+            tail -c "$ERROR_LOG_KEEP_SIZE" "$error_file" > "${error_file}.tmp" 2>$DEVNULL
+            mv "${error_file}.tmp" "$error_file" 2>$DEVNULL || rm -f "${error_file}.tmp"
+        fi
     fi
 }
 
@@ -418,6 +448,12 @@ cleanup() {
     rmdir "$lockdir" 2>$DEVNULL
     # Cleanup any error file for this process
     rm -f "/tmp/ffmpeg_error_${channel_id}_$$.log" 2>$DEVNULL
+    # Cleanup stream FIFO if it exists
+    rm -f "/tmp/stream_pipe_${channel_id}_$$" 2>$DEVNULL
+    # Cleanup DEVNULL fallback file if used
+    if [[ $devnull_fallback -eq 1 ]]; then
+        rm -f "$DEVNULL" 2>/dev/null
+    fi
     log "[$channel_id] Cleanup completed"
 }
 
@@ -538,7 +574,7 @@ fi
 
 # Store initial config file mtime for hot-reload detection
 if [[ -n "$config_file" && -f "$config_file" ]]; then
-    config_file_mtime=$(stat -c %Y "$config_file" 2>$DEVNULL || echo 0)
+    config_file_mtime=$(get_file_mtime "$config_file")
     log "Config hot-reload enabled: $config_file (mtime: $config_file_mtime)"
 fi
 
@@ -719,16 +755,17 @@ resolve_youtube_url() {
         return 1
     fi
 
+    # Require timeout command to prevent indefinite hangs
+    if ! command -v timeout >$DEVNULL 2>&1; then
+        log_error "YOUTUBE: 'timeout' command required but not found. Install coreutils."
+        return 1
+    fi
+
     # Use yt-dlp with timeout to extract stream URL
     # -g: Get URL only, --no-warnings: suppress warnings
     # -f: Format selection
     local ytdlp_cmd=(yt-dlp -g --no-warnings --no-playlist -f "$YTDLP_FORMAT" "$youtube_url")
-    if command -v timeout >$DEVNULL 2>&1; then
-        resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
-    else
-        log "YOUTUBE: 'timeout' not found; running yt-dlp without timeout"
-        resolved_url=$("${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
-    fi
+    resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
 
     if [[ -z "$resolved_url" ]]; then
         log_error "YOUTUBE: Failed to resolve URL: $youtube_url"
@@ -762,7 +799,7 @@ extract_youtube_expiry() {
     local fallback=$(($(date +%s) + 18000))
     log "YOUTUBE: No expiry found in URL, assuming 5 hours from now"
     echo "$fallback"
-    return 1
+    return 0  # Return success since we're providing a valid fallback timestamp
 }
 
 # Initialize YouTube metadata for a URL slot
@@ -1263,7 +1300,7 @@ reload_config_if_changed() {
     fi
 
     last_config_check=$now
-    local current_mtime=$(stat -c %Y "$config_file" 2>$DEVNULL || echo 0)
+    local current_mtime=$(get_file_mtime "$config_file")
 
     # Check if file was modified
     if [[ "$current_mtime" -le "$config_file_mtime" ]]; then
@@ -1866,43 +1903,77 @@ while true; do
 
     # Run FFmpeg in background so we can hot-reload config and check primary health
     proxy_pid=""
+    stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
     if [[ "$use_https_proxy" -eq 1 ]]; then
+        # Create FIFO for reliable PID capture of both proxy and FFmpeg
+        rm -f "$stream_fifo" 2>$DEVNULL
+        mkfifo "$stream_fifo" 2>$DEVNULL || {
+            log_error "HTTPS_PROXY: Failed to create FIFO; falling back to pipeline"
+            stream_fifo=""
+        }
+
         if [[ "${url_is_youtube[$current_url_index]}" == "1" ]]; then
             if ! command -v yt-dlp >$DEVNULL 2>&1; then
                 log_error "HTTPS_PROXY: yt-dlp not found for YouTube URL; switching to next URL"
+                rm -f "$stream_fifo" 2>$DEVNULL
                 switch_to_next_url "proxy_missing"
                 continue
             fi
             proxy_source_url="${url_original[$current_url_index]:-$current_url}"
             log "HTTPS_PROXY: Starting yt-dlp pipe for YouTube: $proxy_source_url"
-            yt-dlp -q -o - "$proxy_source_url" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-            ffmpeg_pid=$!
-            proxy_pid=$(pgrep -P $$ -n -f "yt-dlp.*$proxy_source_url" 2>$DEVNULL || true)
+            if [[ -n "$stream_fifo" ]]; then
+                # Use FIFO for reliable PID capture
+                yt-dlp -q -o - "$proxy_source_url" > "$stream_fifo" 2>>"$logfile" &
+                proxy_pid=$!
+                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            else
+                # Fallback to pipeline
+                yt-dlp -q -o - "$proxy_source_url" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            fi
             log "FFmpeg PID: $ffmpeg_pid, yt-dlp PID: ${proxy_pid:-unknown}"
         elif [[ "$current_url" == *.m3u8* ]]; then
             if ! command -v streamlink >$DEVNULL 2>&1; then
                 log_error "HTTPS_PROXY: streamlink not found for HLS URL; switching to next URL"
+                rm -f "$stream_fifo" 2>$DEVNULL
                 switch_to_next_url "proxy_missing"
                 continue
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for HLS: $current_url"
-            streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-            ffmpeg_pid=$!
-            proxy_pid=$(pgrep -P $$ -n -f "streamlink.*$current_url" 2>$DEVNULL || true)
+            if [[ -n "$stream_fifo" ]]; then
+                streamlink --stdout "$current_url" best > "$stream_fifo" 2>>"$logfile" &
+                proxy_pid=$!
+                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            else
+                streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            fi
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         else
             if ! command -v streamlink >$DEVNULL 2>&1; then
                 log_error "HTTPS_PROXY: streamlink not found for HTTPS URL; switching to next URL"
+                rm -f "$stream_fifo" 2>$DEVNULL
                 switch_to_next_url "proxy_missing"
                 continue
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for: $current_url"
-            streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-            ffmpeg_pid=$!
-            proxy_pid=$(pgrep -P $$ -n -f "streamlink.*$current_url" 2>$DEVNULL || true)
+            if [[ -n "$stream_fifo" ]]; then
+                streamlink --stdout "$current_url" best > "$stream_fifo" 2>>"$logfile" &
+                proxy_pid=$!
+                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            else
+                streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                ffmpeg_pid=$!
+            fi
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         fi
+        # Remove FIFO after both processes are started (they already have file descriptors open)
+        [[ -n "$stream_fifo" ]] && rm -f "$stream_fifo" 2>$DEVNULL
     else
+        stream_fifo=""  # No FIFO used for direct FFmpeg
         "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
         ffmpeg_pid=$!
         log "FFmpeg PID: $ffmpeg_pid"

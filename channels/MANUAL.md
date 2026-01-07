@@ -234,11 +234,21 @@ Add this to your crontab:
 crontab -e
 ```
 
+**Setup Prerequisites:**
+1. Create the log directory: `mkdir -p /tmp/albunyaan-logs`
+2. Ensure the directory is writable by your user
+
 Add these lines:
 ```
 */2 * * * * /home/msa/Development/scripts/albunyaan/channels/health_monitor.sh >> /tmp/albunyaan-logs/health_cron.log 2>&1
-0 */2 * * * find /tmp -name "ffmpeg_error_*.log" -mmin +120 -delete
+0 */2 * * * find /tmp/albunyaan-logs -name "ffmpeg_error_*.log" -mmin +120 -delete 2>/dev/null
+0 0 * * * truncate -s 10M /tmp/albunyaan-logs/health_cron.log 2>/dev/null
 ```
+
+**Notes:**
+- The second line permanently deletes ffmpeg error log files older than 120 minutes from the app directory.
+- The third line caps the cron log file at 10MB daily to prevent unbounded growth.
+- Consider running `find /tmp/albunyaan-logs -name "ffmpeg_error_*.log" -mmin +120` first (without `-delete`) to preview which files would be removed.
 
 This checks all channels every 2 minutes and:
 - Restarts stopped channels
