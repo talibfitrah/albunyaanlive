@@ -8,8 +8,8 @@ stream_name="034120793341/390247405461/1406"
 stream_url="http://vlc.news:9000/034120793341/390247405461/1406"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1=""
-stream_url_backup2=""
+stream_url_backup1="http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/2474"
+stream_url_backup2="http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/2474.m3u8"
 
 rtmp_url="/var/www/html/stream/hls/hadith-almajd/master.m3u8"
 stream_id="/var/www/html/stream/hls/hadith-almajd/master.m3u8"

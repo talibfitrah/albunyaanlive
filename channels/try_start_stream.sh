@@ -46,6 +46,15 @@ get_file_mtime() {
     stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0
 }
 
+get_dir_size_bytes() {
+    local dir="$1"
+    if du -sb "$dir" >$DEVNULL 2>&1; then
+        du -sb "$dir" 2>$DEVNULL | awk 'NR==1 {print $1}'
+        return
+    fi
+    du -s -B1 "$dir" 2>$DEVNULL | awk 'NR==1 {print $1}'
+}
+
 url=""
 backup_urls=""
 key=""
@@ -57,7 +66,7 @@ config_file=""
 # =============================================================================
 # NEW: Primary URL fallback and config hot-reload settings
 # =============================================================================
-PRIMARY_CHECK_INTERVAL="${PRIMARY_CHECK_INTERVAL:-300}"  # Default: check primary every 5 minutes (300 seconds)
+PRIMARY_CHECK_INTERVAL="${PRIMARY_CHECK_INTERVAL:-3600}"  # Default: check primary every 60 minutes (3600 seconds)
 PRIMARY_HLS_CHECK_DELAY="${PRIMARY_HLS_CHECK_DELAY:-8}"  # Seconds between HLS playlist samples
 PRIMARY_HLS_MAX_WAIT="${PRIMARY_HLS_MAX_WAIT:-15}"       # Cap HLS sample wait to avoid long stalls
 CONFIG_CHECK_INTERVAL="${CONFIG_CHECK_INTERVAL:-60}"     # Default: check config file every 60 seconds
@@ -75,16 +84,45 @@ SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-60}"      # Switch to backup
 SEGMENT_CHECK_INTERVAL="${SEGMENT_CHECK_INTERVAL:-10}"        # Check segment freshness every 10s
 last_segment_check=0
 stream_start_time=0
+# Segment cleanup safeguards to prevent disk growth (running channels too)
+SEGMENT_CLEANUP_INTERVAL="${SEGMENT_CLEANUP_INTERVAL:-300}"   # Seconds between cleanup passes
+SEGMENT_MAX_AGE="${SEGMENT_MAX_AGE:-1800}"                    # Max segment age in seconds (default 30 min)
+SEGMENT_MAX_COUNT="${SEGMENT_MAX_COUNT:-300}"                 # Hard cap on segment files per channel
+last_segment_cleanup=0
 
 # =============================================================================
 # YouTube URL resolution settings
 # =============================================================================
 YOUTUBE_REFRESH_MARGIN="${YOUTUBE_REFRESH_MARGIN:-1800}"  # Refresh 30 min before expiry (1800s)
-YOUTUBE_CHECK_INTERVAL="${YOUTUBE_CHECK_INTERVAL:-60}"    # Check expiry every 60s
+YOUTUBE_CHECK_INTERVAL="${YOUTUBE_CHECK_INTERVAL:-300}"   # Check expiry every 5 min (reduced from 60s to prevent rate limiting)
 YTDLP_TIMEOUT="${YTDLP_TIMEOUT:-30}"                      # yt-dlp timeout in seconds
 YTDLP_FORMAT="${YTDLP_FORMAT:-best}"                      # yt-dlp format selection
-YOUTUBE_STREAM_END_RETRY="${YOUTUBE_STREAM_END_RETRY:-5}" # Retries when stream ends (for general URLs)
+YTDLP_COOKIES="${YTDLP_COOKIES:-}"                        # Optional: path to cookies.txt for YouTube auth
+YTDLP_COOKIES_BROWSER="${YTDLP_COOKIES_BROWSER:-}"        # Optional: browser[:profile_path] for cookies
+YTDLP_PROXY="${YTDLP_PROXY:-}"                            # Optional: proxy for yt-dlp/streamlink
+TOR_ROTATE_FAILURES="${TOR_ROTATE_FAILURES:-3}"           # Rotate Tor after N consecutive YouTube failures
+TOR_ROTATE_COOLDOWN="${TOR_ROTATE_COOLDOWN:-300}"         # Min seconds between Tor rotations (5 min)
+TOR_FAILURE_FILE="${TOR_FAILURE_FILE:-/tmp/tor_youtube_failures_${UID}}"  # Track YouTube failures
+TOR_ROTATE_TIMESTAMP="${TOR_ROTATE_TIMESTAMP:-/tmp/tor_last_rotate_${UID}}"  # Last rotation timestamp
+YTDLP_THROTTLE_SECONDS="${YTDLP_THROTTLE_SECONDS:-20}"   # Min seconds between yt-dlp calls (global) - increased to prevent rate limiting
+YTDLP_LOCK_FILE="${YTDLP_LOCK_FILE:-/tmp/ytdlp_global_${UID}.lock}"  # Global lock file for throttling
+YTDLP_TIMESTAMP_FILE="${YTDLP_TIMESTAMP_FILE:-/tmp/ytdlp_last_call_${UID}}"  # Last call timestamp
+YOUTUBE_STREAM_END_RETRY="${YOUTUBE_STREAM_END_RETRY:-2}" # Retries when stream ends (reduced from 5 to prevent rate limiting)
 last_youtube_check=0
+
+# =============================================================================
+# NEW: Per-channel rate limit protection
+# =============================================================================
+# Prevents a single channel from making too many yt-dlp calls in succession
+# =============================================================================
+YTDLP_CHANNEL_COOLDOWN="${YTDLP_CHANNEL_COOLDOWN:-300}"   # Min 5 minutes between yt-dlp calls per channel
+YTDLP_CHANNEL_TIMESTAMP_DIR="${YTDLP_CHANNEL_TIMESTAMP_DIR:-/tmp/ytdlp_channel_${UID}}"  # Per-channel timestamp directory
+YTDLP_FAILURE_BACKOFF_BASE="${YTDLP_FAILURE_BACKOFF_BASE:-30}"  # Base backoff on failure (30s)
+YTDLP_FAILURE_BACKOFF_MAX="${YTDLP_FAILURE_BACKOFF_MAX:-300}"   # Max backoff on failure (5 min)
+YTDLP_STARTUP_STAGGER_MAX="${YTDLP_STARTUP_STAGGER_MAX:-30}"    # Max random delay at startup (seconds)
+ytdlp_startup_stagger_done=0
+ytdlp_cookies_browser_checked=0
+ytdlp_cookies_browser_args=()
 
 # YouTube state arrays (initialized after URL parsing)
 # url_is_youtube[i]     - 1 if YouTube URL, 0 otherwise
@@ -198,7 +236,7 @@ fi
 # Choose a writable log directory (fallback to /tmp if repo logs are not writable)
 resolve_log_dir() {
     local preferred="$1"
-    local fallback="/tmp/albunyaan-logs"
+    local fallback="/tmp/albunyaan-logs-$UID"
 
     if mkdir -p "$preferred" 2>$DEVNULL && [[ -w "$preferred" ]]; then
         echo "$preferred"
@@ -227,11 +265,22 @@ pidfile="/tmp/stream_${channel_id}.pid"
 lockdir="/tmp/stream_${channel_id}.lock"
 ffmpeg_pid=""
 proxy_pid=""
+stream_fifo=""
 
-# Log rotation (50MB threshold, keep last 5)
+# Log size limits to prevent disk exhaustion
+LOG_FILE_MAX_MB="${LOG_FILE_MAX_MB:-50}"
+LOG_FILE_MAX_BYTES=$((LOG_FILE_MAX_MB * 1024 * 1024))
+LOG_FILE_TRIM_MB="${LOG_FILE_TRIM_MB:-5}"
+LOG_FILE_TRIM_BYTES=$((LOG_FILE_TRIM_MB * 1024 * 1024))
+LOG_DIR_MAX_MB="${LOG_DIR_MAX_MB:-256}"
+LOG_DIR_MAX_BYTES=$((LOG_DIR_MAX_MB * 1024 * 1024))
+LOG_GC_INTERVAL="${LOG_GC_INTERVAL:-300}"
+last_log_gc=0
+
+# Log rotation (LOG_FILE_MAX_MB threshold, keep last 5)
 rotate_logs() {
     local file="$1"
-    if [[ -f "$file" && $(get_file_size "$file") -gt 52428800 ]]; then
+    if [[ "$LOG_FILE_MAX_BYTES" -gt 0 && -f "$file" && $(get_file_size "$file") -gt "$LOG_FILE_MAX_BYTES" ]]; then
         # Rotate: .log -> .log.1 -> .log.2 -> ... -> .log.5 (delete .log.5)
         for i in 4 3 2 1; do
             [[ -f "${file}.$i" ]] && mv "${file}.$i" "${file}.$((i+1))"
@@ -245,19 +294,78 @@ rotate_logs() {
 rotate_logs "$logfile"
 rotate_logs "$errorfile"
 
+log_dir_prune() {
+    local dir_size="$1"
+    local target="$LOG_DIR_MAX_BYTES"
+    local old_file
+
+    while [[ "$dir_size" -gt "$target" ]]; do
+        old_file=$(find "$logfile_dir" -type f ! -path "$logfile" ! -path "$errorfile" -printf '%T@ %p\n' 2>$DEVNULL \
+            | sort -n | head -1 | cut -d' ' -f2-)
+        if [[ -z "$old_file" ]]; then
+            break
+        fi
+        local old_size
+        old_size=$(get_file_size "$old_file")
+        rm -f "$old_file" 2>$DEVNULL || true
+        if [[ "$old_size" =~ ^[0-9]+$ ]]; then
+            dir_size=$((dir_size - old_size))
+        else
+            dir_size=$(get_dir_size_bytes "$logfile_dir")
+        fi
+    done
+
+    if [[ "$dir_size" -gt "$target" && "$LOG_FILE_TRIM_BYTES" -gt 0 ]]; then
+        if [[ -f "$logfile" ]]; then
+            tail -c "$LOG_FILE_TRIM_BYTES" "$logfile" > "${logfile}.tmp" 2>$DEVNULL && mv "${logfile}.tmp" "$logfile"
+        fi
+        if [[ -f "$errorfile" ]]; then
+            tail -c "$LOG_FILE_TRIM_BYTES" "$errorfile" > "${errorfile}.tmp" 2>$DEVNULL && mv "${errorfile}.tmp" "$errorfile"
+        fi
+    fi
+}
+
+log_maintenance() {
+    local now
+    now=$(date +%s)
+    if [[ $((now - last_log_gc)) -lt $LOG_GC_INTERVAL ]]; then
+        return
+    fi
+    last_log_gc=$now
+
+    rotate_logs "$logfile"
+    rotate_logs "$errorfile"
+
+    if [[ "$LOG_DIR_MAX_BYTES" -le 0 ]]; then
+        return
+    fi
+
+    local dir_size
+    dir_size=$(get_dir_size_bytes "$logfile_dir")
+    if [[ -z "$dir_size" || "$dir_size" -le "$LOG_DIR_MAX_BYTES" ]]; then
+        return
+    fi
+    log_dir_prune "$dir_size"
+}
+
 # Timestamp function for logging
 log() {
+    log_maintenance
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$logfile"
 }
 
 log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$errorfile"
-    log "$1"
+    log_maintenance
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg" >> "$errorfile"
+    echo "$msg" >> "$logfile"
 }
 
 log_console() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    log "$1"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    log_maintenance
+    echo "$msg" >> "$logfile"
 }
 
 if [[ $devnull_fallback -eq 1 ]]; then
@@ -373,6 +481,57 @@ cleanup_ffmpeg_error_file() {
     rm -f "$error_file" 2>$DEVNULL || true
 }
 
+# =============================================================================
+# SEGMENT CLEANUP (RUNNING CHANNELS)
+# =============================================================================
+# Defensive cleanup in case FFmpeg's delete_segments isn't applied or old files
+# linger across restarts. Keeps recent segments only.
+# =============================================================================
+
+prune_old_segments() {
+    local force="$1"
+    local now
+    now=$(date +%s)
+    if [[ "$force" != "force" ]]; then
+        local elapsed=$((now - last_segment_cleanup))
+        if [[ "$elapsed" -lt "$SEGMENT_CLEANUP_INTERVAL" ]]; then
+            return
+        fi
+    fi
+    last_segment_cleanup=$now
+
+    local output_dir
+    output_dir=$(dirname "$destination")
+    [[ -d "$output_dir" ]] || return
+
+    local deleted=0
+    local age_minutes=$((SEGMENT_MAX_AGE / 60))
+
+    if [[ "$SEGMENT_MAX_AGE" -gt 0 && "$age_minutes" -gt 0 ]]; then
+        while IFS= read -r old_file; do
+            rm -f "$old_file" 2>$DEVNULL && deleted=$((deleted + 1))
+        done < <(find "$output_dir" -maxdepth 1 -name "*.ts" -type f -mmin "+$age_minutes" 2>$DEVNULL)
+    fi
+
+    if [[ "$SEGMENT_MAX_COUNT" -gt 0 ]]; then
+        local total
+        total=$(find "$output_dir" -maxdepth 1 -name "*.ts" -type f 2>$DEVNULL | wc -l)
+        if [[ "$total" -gt "$SEGMENT_MAX_COUNT" ]]; then
+            local to_delete=$((total - SEGMENT_MAX_COUNT))
+            while IFS= read -r old_file; do
+                rm -f "$old_file" 2>$DEVNULL && deleted=$((deleted + 1))
+            done < <(
+                find "$output_dir" -maxdepth 1 -name "*.ts" -type f -printf '%T@ %p\n' 2>$DEVNULL \
+                    | sort -n | head -n "$to_delete" | cut -d' ' -f2-
+            )
+        fi
+    fi
+
+    if [[ "$deleted" -gt 0 ]]; then
+        log "SEGMENT_CLEANUP: Removed $deleted old segments from $output_dir"
+    fi
+}
+
 # Cleanup orphaned ffmpeg error files from /tmp on startup
 # These can accumulate when processes are killed externally
 cleanup_orphaned_error_files() {
@@ -449,7 +608,9 @@ cleanup() {
     # Cleanup any error file for this process
     rm -f "/tmp/ffmpeg_error_${channel_id}_$$.log" 2>$DEVNULL
     # Cleanup stream FIFO if it exists
-    rm -f "/tmp/stream_pipe_${channel_id}_$$" 2>$DEVNULL
+    if [[ -n "$stream_fifo" ]]; then
+        rm -f "$stream_fifo" 2>$DEVNULL
+    fi
     # Cleanup DEVNULL fallback file if used
     if [[ $devnull_fallback -eq 1 ]]; then
         rm -f "$DEVNULL" 2>/dev/null
@@ -476,6 +637,7 @@ echo $$ > "$pidfile"
 
 # Create destination directory if needed
 mkdir -p "$(dirname "$destination")"
+prune_old_segments force
 
 # Log identity for debugging
 log "=== Stream Manager Started ==="
@@ -743,8 +905,226 @@ build_youtube_general_url() {
     fi
 }
 
+# =============================================================================
+# Global yt-dlp throttle to prevent YouTube rate limiting
+# =============================================================================
+# Uses flock for cross-process synchronization and a timestamp file to enforce
+# minimum delay between yt-dlp calls across all channel scripts.
+# =============================================================================
+
+ytdlp_throttle_acquire() {
+    local lock_fd=200
+    local now last_call wait_time
+
+    # Create lock file if it doesn't exist
+    touch "$YTDLP_LOCK_FILE" 2>$DEVNULL
+
+    # Acquire exclusive lock (wait up to 60 seconds)
+    exec 200>"$YTDLP_LOCK_FILE"
+    if ! flock -w 60 200; then
+        log_error "YTDLP_THROTTLE: Failed to acquire lock after 60s"
+        return 1
+    fi
+
+    # Check last call timestamp and wait if needed
+    now=$(date +%s)
+    if [[ -f "$YTDLP_TIMESTAMP_FILE" ]]; then
+        last_call=$(cat "$YTDLP_TIMESTAMP_FILE" 2>$DEVNULL || echo "0")
+        if [[ "$last_call" =~ ^[0-9]+$ ]]; then
+            wait_time=$((YTDLP_THROTTLE_SECONDS - (now - last_call)))
+            if [[ $wait_time -gt 0 ]]; then
+                log "YTDLP_THROTTLE: Waiting ${wait_time}s before yt-dlp call (rate limit protection)"
+                sleep "$wait_time"
+            fi
+        fi
+    fi
+
+    # Update timestamp
+    date +%s > "$YTDLP_TIMESTAMP_FILE" 2>$DEVNULL
+
+    # Lock remains held - caller must call ytdlp_throttle_release
+    return 0
+}
+
+ytdlp_throttle_release() {
+    # Release the lock by closing fd 200
+    exec 200>&- 2>$DEVNULL || true
+}
+
+# =============================================================================
+# Per-channel yt-dlp rate limiting
+# =============================================================================
+# Prevents individual channels from making too many yt-dlp calls
+# Each channel has its own cooldown timer stored in a file
+# =============================================================================
+
+# Ensure per-channel timestamp directory exists and is writable
+mkdir -p "$YTDLP_CHANNEL_TIMESTAMP_DIR" 2>$DEVNULL
+if [[ ! -w "$YTDLP_CHANNEL_TIMESTAMP_DIR" ]]; then
+    YTDLP_CHANNEL_TIMESTAMP_DIR="/tmp/ytdlp_channel_${UID}_$$"
+    mkdir -p "$YTDLP_CHANNEL_TIMESTAMP_DIR" 2>$DEVNULL || true
+fi
+
+# Track per-channel failure count for exponential backoff
+declare -A channel_failure_count
+
+ytdlp_channel_can_call() {
+    # Check if this channel is allowed to make a yt-dlp call (cooldown check)
+    local now=$(date +%s)
+    local ts_file="${YTDLP_CHANNEL_TIMESTAMP_DIR}/${channel_id}"
+
+    if [[ -f "$ts_file" ]]; then
+        local last_call=$(cat "$ts_file" 2>$DEVNULL || echo 0)
+        if [[ "$last_call" =~ ^[0-9]+$ ]]; then
+            local elapsed=$((now - last_call))
+            if [[ $elapsed -lt $YTDLP_CHANNEL_COOLDOWN ]]; then
+                local remaining=$((YTDLP_CHANNEL_COOLDOWN - elapsed))
+                log "YTDLP_CHANNEL: Channel $channel_id on cooldown (${remaining}s remaining). Skipping yt-dlp call."
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+ytdlp_channel_record_call() {
+    # Record that this channel made a yt-dlp call
+    local ts_file="${YTDLP_CHANNEL_TIMESTAMP_DIR}/${channel_id}"
+    date +%s > "$ts_file" 2>$DEVNULL
+}
+
+ytdlp_get_failure_backoff() {
+    # Calculate exponential backoff based on consecutive failures
+    local failures=${channel_failure_count[$channel_id]:-0}
+    if [[ $failures -eq 0 ]]; then
+        echo 0
+        return
+    fi
+
+    # Exponential backoff: base * 2^(failures-1), capped at max
+    local backoff=$YTDLP_FAILURE_BACKOFF_BASE
+    local i
+    for ((i=1; i<failures && i<5; i++)); do
+        backoff=$((backoff * 2))
+    done
+
+    if [[ $backoff -gt $YTDLP_FAILURE_BACKOFF_MAX ]]; then
+        backoff=$YTDLP_FAILURE_BACKOFF_MAX
+    fi
+
+    echo $backoff
+}
+
+ytdlp_record_failure() {
+    # Record a failure and apply backoff
+    local current=${channel_failure_count[$channel_id]:-0}
+    channel_failure_count[$channel_id]=$((current + 1))
+
+    local backoff=$(ytdlp_get_failure_backoff)
+    if [[ $backoff -gt 0 ]]; then
+        log "YTDLP_BACKOFF: Channel $channel_id failure #${channel_failure_count[$channel_id]}, backing off ${backoff}s"
+        sleep "$backoff"
+    fi
+}
+
+ytdlp_reset_failures() {
+    # Reset failure count on success
+    channel_failure_count[$channel_id]=0
+}
+
+ytdlp_startup_stagger() {
+    # Add random delay at startup to prevent all channels hitting YouTube at once
+    if [[ $ytdlp_startup_stagger_done -eq 1 ]]; then
+        return
+    fi
+    ytdlp_startup_stagger_done=1
+    if [[ $YTDLP_STARTUP_STAGGER_MAX -gt 0 ]]; then
+        local delay=$((RANDOM % YTDLP_STARTUP_STAGGER_MAX))
+        if [[ $delay -gt 0 ]]; then
+            log "YTDLP_STAGGER: Startup delay ${delay}s to prevent rate limiting"
+            sleep "$delay"
+        fi
+    fi
+}
+
+# Resolve cookies-from-browser args once to avoid repeated failures.
+init_ytdlp_cookies_browser_args() {
+    if [[ $ytdlp_cookies_browser_checked -eq 1 ]]; then
+        return
+    fi
+    ytdlp_cookies_browser_checked=1
+
+    if [[ -z "$YTDLP_COOKIES_BROWSER" ]]; then
+        return
+    fi
+
+    if [[ "$YTDLP_COOKIES_BROWSER" == *:* ]]; then
+        local profile_path="${YTDLP_COOKIES_BROWSER#*:}"
+        if [[ -n "$profile_path" && ! -e "$profile_path" ]]; then
+            log_error "YOUTUBE: cookies-from-browser profile not found: $profile_path; skipping"
+            return
+        fi
+    fi
+
+    ytdlp_cookies_browser_args=(--cookies-from-browser "$YTDLP_COOKIES_BROWSER")
+}
+
+# =============================================================================
+# Tor circuit rotation for YouTube bot detection bypass
+# =============================================================================
+# When YouTube blocks the current Tor exit node, we rotate to a new circuit.
+# Uses a global failure counter and cooldown to prevent excessive rotations.
+# =============================================================================
+
+tor_record_youtube_failure() {
+    local failures=0
+    [[ -f "$TOR_FAILURE_FILE" ]] && failures=$(cat "$TOR_FAILURE_FILE" 2>$DEVNULL || echo 0)
+    ((failures++))
+    echo "$failures" > "$TOR_FAILURE_FILE"
+
+    if [[ $failures -ge $TOR_ROTATE_FAILURES ]]; then
+        tor_rotate_circuit
+    fi
+}
+
+tor_reset_failure_count() {
+    echo "0" > "$TOR_FAILURE_FILE" 2>$DEVNULL
+}
+
+tor_rotate_circuit() {
+    local now last_rotate wait_time
+    now=$(date +%s)
+
+    # Check cooldown
+    if [[ -f "$TOR_ROTATE_TIMESTAMP" ]]; then
+        last_rotate=$(cat "$TOR_ROTATE_TIMESTAMP" 2>$DEVNULL || echo 0)
+        wait_time=$((TOR_ROTATE_COOLDOWN - (now - last_rotate)))
+        if [[ $wait_time -gt 0 ]]; then
+            log "TOR_ROTATE: Cooldown active, ${wait_time}s remaining. Skipping rotation."
+            return 1
+        fi
+    fi
+
+    log "TOR_ROTATE: Rotating Tor circuit due to YouTube bot detection..."
+
+    # Try to restart Tor service
+    if command -v systemctl >$DEVNULL 2>&1; then
+        if SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl restart tor >$DEVNULL 2>&1; then
+            log "TOR_ROTATE: Tor service restarted successfully"
+            echo "$now" > "$TOR_ROTATE_TIMESTAMP"
+            tor_reset_failure_count
+            sleep 3  # Wait for new circuit
+            return 0
+        fi
+    fi
+
+    log_error "TOR_ROTATE: Failed to restart Tor service"
+    return 1
+}
+
 resolve_youtube_url() {
     local youtube_url="$1"
+    local skip_cooldown="${2:-0}"  # Optional: skip cooldown check (for startup)
     local resolved_url=""
 
     log "YOUTUBE: Resolving URL: $youtube_url"
@@ -761,17 +1141,51 @@ resolve_youtube_url() {
         return 1
     fi
 
-    # Use yt-dlp with timeout to extract stream URL
-    # -g: Get URL only, --no-warnings: suppress warnings
-    # -f: Format selection
-    local ytdlp_cmd=(yt-dlp -g --no-warnings --no-playlist -f "$YTDLP_FORMAT" "$youtube_url")
-    resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
-
-    if [[ -z "$resolved_url" ]]; then
-        log_error "YOUTUBE: Failed to resolve URL: $youtube_url"
+    # Check per-channel cooldown (skip on initial startup resolution)
+    if [[ "$skip_cooldown" != "1" ]] && ! ytdlp_channel_can_call; then
+        log "YOUTUBE: Skipping resolution due to per-channel cooldown"
         return 1
     fi
 
+    # Acquire global throttle lock
+    if ! ytdlp_throttle_acquire; then
+        log_error "YOUTUBE: Failed to acquire throttle lock"
+        return 1
+    fi
+
+    # Record this call for per-channel rate limiting
+    ytdlp_channel_record_call
+
+    # Use yt-dlp with timeout to extract stream URL
+    # -g: Get URL only, --no-warnings: suppress warnings
+    # -f: Format selection
+    local ytdlp_cmd=(yt-dlp -g --no-warnings --no-playlist -f "$YTDLP_FORMAT")
+    # Add proxy if configured
+    if [[ -n "$YTDLP_PROXY" ]]; then
+        ytdlp_cmd+=(--proxy "$YTDLP_PROXY")
+    fi
+    # Add cookies: prefer explicit file, fall back to browser extraction
+    init_ytdlp_cookies_browser_args
+    if [[ -n "$YTDLP_COOKIES" && -f "$YTDLP_COOKIES" ]]; then
+        ytdlp_cmd+=(--cookies "$YTDLP_COOKIES")
+    elif [[ ${#ytdlp_cookies_browser_args[@]} -gt 0 ]]; then
+        ytdlp_cmd+=("${ytdlp_cookies_browser_args[@]}")
+    fi
+    ytdlp_cmd+=("$youtube_url")
+    resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
+
+    # Release throttle lock after yt-dlp completes
+    ytdlp_throttle_release
+
+    if [[ -z "$resolved_url" ]]; then
+        log_error "YOUTUBE: Failed to resolve URL: $youtube_url"
+        tor_record_youtube_failure  # Track failure, may trigger Tor rotation
+        ytdlp_record_failure        # Apply exponential backoff
+        return 1
+    fi
+
+    tor_reset_failure_count  # Success - reset failure counter
+    ytdlp_reset_failures     # Reset exponential backoff
     log "YOUTUBE: Resolved to: ${resolved_url:0:80}..."
     echo "$resolved_url"
     return 0
@@ -807,6 +1221,7 @@ init_url_youtube_metadata() {
     local index="$1"
     local url="$2"
     local associated_general="${3:-}"  # Optional: associated general URL for specific URLs
+    local is_startup="${4:-0}"         # Optional: 1 if called during startup (for stagger)
 
     # Initialize all metadata fields
     url_stream_ended[$index]=0
@@ -829,11 +1244,11 @@ init_url_youtube_metadata() {
             url_general_url[$index]="$url"
         else
             # Try to extract channel and build general URL
-            local channel_id
-            channel_id=$(get_youtube_channel_from_url "$url")
-            if [[ -n "$channel_id" ]]; then
+            local yt_channel_id
+            yt_channel_id=$(get_youtube_channel_from_url "$url")
+            if [[ -n "$yt_channel_id" ]]; then
                 local general_url
-                general_url=$(build_youtube_general_url "$channel_id")
+                general_url=$(build_youtube_general_url "$yt_channel_id")
                 if [[ -n "$general_url" ]]; then
                     url_general_url[$index]="$general_url"
                     log "YOUTUBE: Auto-derived general URL for index $index: $general_url"
@@ -841,9 +1256,14 @@ init_url_youtube_metadata() {
             fi
         fi
 
-        # Resolve immediately
+        # Add staggered delay at startup to prevent rate limiting
+        if [[ "$is_startup" == "1" ]]; then
+            ytdlp_startup_stagger
+        fi
+
+        # Resolve immediately (skip per-channel cooldown on startup)
         local resolved
-        resolved=$(resolve_youtube_url "$url")
+        resolved=$(resolve_youtube_url "$url" "1")  # 1 = skip cooldown
         if [[ -n "$resolved" ]]; then
             local expire_time
             expire_time=$(extract_youtube_expiry "$resolved")
@@ -890,14 +1310,36 @@ youtube_check_stream_ended() {
         return 1
     fi
 
+    # Acquire global throttle lock
+    if ! ytdlp_throttle_acquire; then
+        log_error "YOUTUBE: Failed to acquire throttle lock for live check"
+        return 1  # Assume still live if we can't check
+    fi
+
     # Use yt-dlp to check if the stream is still live
     local is_live
+    local ytdlp_live_cmd=(yt-dlp --no-download --print "%(is_live)s")
+    # Add proxy if configured
+    if [[ -n "$YTDLP_PROXY" ]]; then
+        ytdlp_live_cmd+=(--proxy "$YTDLP_PROXY")
+    fi
+    # Add cookies: prefer explicit file, fall back to browser extraction
+    init_ytdlp_cookies_browser_args
+    if [[ -n "$YTDLP_COOKIES" && -f "$YTDLP_COOKIES" ]]; then
+        ytdlp_live_cmd+=(--cookies "$YTDLP_COOKIES")
+    elif [[ ${#ytdlp_cookies_browser_args[@]} -gt 0 ]]; then
+        ytdlp_live_cmd+=("${ytdlp_cookies_browser_args[@]}")
+    fi
+    ytdlp_live_cmd+=("$youtube_url")
     if command -v timeout >$DEVNULL 2>&1; then
-        is_live=$(timeout 10 yt-dlp --no-download --print "%(is_live)s" "$youtube_url" 2>$DEVNULL || echo "error")
+        is_live=$(timeout 10 "${ytdlp_live_cmd[@]}" 2>$DEVNULL || echo "error")
     else
         log "YOUTUBE: 'timeout' not found; running yt-dlp without timeout for live check"
-        is_live=$(yt-dlp --no-download --print "%(is_live)s" "$youtube_url" 2>$DEVNULL || echo "error")
+        is_live=$("${ytdlp_live_cmd[@]}" 2>$DEVNULL || echo "error")
     fi
+
+    # Release throttle lock
+    ytdlp_throttle_release
 
     if [[ "$is_live" == "False" || "$is_live" == "error" ]]; then
         log "YOUTUBE: Stream ended or unavailable for $youtube_url (is_live=$is_live)"
@@ -954,6 +1396,8 @@ youtube_refetch_via_general() {
 }
 
 # Check if current YouTube URL's stream ended and needs re-fetch
+# OPTIMIZED: Skip redundant youtube_check_stream_ended call to prevent extra yt-dlp calls
+# Since FFmpeg already failed, we know the stream needs refresh - no need to verify again
 check_youtube_stream_ended_and_refetch() {
     local index="$1"
 
@@ -967,6 +1411,7 @@ check_youtube_stream_ended_and_refetch() {
     local general_url="${url_general_url[$index]}"
 
     # For general URLs, just re-resolve (they always point to current live)
+    # No need to check stream status - general URLs auto-redirect to latest stream
     if [[ "$yt_type" == "general" ]]; then
         log "YOUTUBE_STREAM_END: General URL detected, re-resolving to get latest stream..."
         if refresh_youtube_url "$index"; then
@@ -975,19 +1420,18 @@ check_youtube_stream_ended_and_refetch() {
         return 1
     fi
 
-    # For specific URLs, confirm stream status and use general URL if available
+    # For specific URLs, try to use general URL if available
+    # OPTIMIZATION: Skip youtube_check_stream_ended call - FFmpeg failure already indicates issue
+    # This saves 1 yt-dlp call per stream-end event
     if [[ "$yt_type" == "specific" ]]; then
-        if youtube_check_stream_ended "$original_url" "$yt_type"; then
-            if [[ -n "$general_url" ]]; then
-                log "YOUTUBE_STREAM_END: Specific URL ended, using general URL for re-fetch..."
-                if youtube_refetch_via_general "$index"; then
-                    return 0
-                fi
-            else
-                log "YOUTUBE_STREAM_END: Specific URL ended and no general URL available"
+        if [[ -n "$general_url" ]]; then
+            log "YOUTUBE_STREAM_END: Specific URL failed, using general URL for re-fetch..."
+            if youtube_refetch_via_general "$index"; then
+                return 0
             fi
         else
-            log "YOUTUBE_STREAM_END: Specific URL still live, refreshing resolved URL..."
+            # No general URL - try direct refresh as fallback
+            log "YOUTUBE_STREAM_END: Specific URL failed, attempting direct refresh..."
             if refresh_youtube_url "$index"; then
                 return 0
             fi
@@ -1076,11 +1520,13 @@ check_youtube_urls_need_refresh() {
         fi
     fi
 
-    # Also proactively refresh other URLs that are expiring soon
+    # OPTIMIZATION: Only refresh ONE backup URL per cycle to prevent rate limiting
+    # Previous behavior refreshed ALL expiring backups at once, causing multiple yt-dlp calls
     for i in $(seq 0 $((url_count - 1))); do
         if [[ $i -ne $current_url_index ]] && youtube_url_needs_refresh "$i"; then
             log "YOUTUBE_REFRESH: Backup URL (index $i) needs refresh"
             refresh_youtube_url "$i" || true  # Don't fail on backup refresh
+            break  # Only refresh one backup per cycle
         fi
     done
 
@@ -1698,7 +2144,7 @@ build_ffmpeg_cmd() {
 
 log "Initializing ${url_count} URL(s) with YouTube detection..."
 for i in $(seq 0 $((url_count - 1))); do
-    init_url_youtube_metadata "$i" "${url_array[$i]}"
+    init_url_youtube_metadata "$i" "${url_array[$i]}" "" "1"  # 1 = startup mode (enables stagger)
 done
 
 # Keep primary_url as the canonical (unresolved) source for health checks
@@ -1837,6 +2283,36 @@ is_process_running() {
     return 0
 }
 
+# =============================================================================
+# CRITICAL FIX: Check for existing FFmpeg processes before starting new one
+# =============================================================================
+# Prevents duplicate FFmpeg processes for the same channel which breaks streams
+# due to source URL security limiting to 1 connection per URL
+# =============================================================================
+
+check_existing_ffmpeg() {
+    local escaped_channel_id
+    escaped_channel_id=$(printf '%s' "$channel_id" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
+
+    # Check for existing FFmpeg processes for this channel (not started by us)
+    local existing_pids
+    existing_pids=$(pgrep -f "ffmpeg.*/${escaped_channel_id}/master" 2>$DEVNULL || true)
+
+    if [[ -n "$existing_pids" ]]; then
+        # Filter out our own FFmpeg (if any)
+        for pid in $existing_pids; do
+            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$$" ]]; then
+                log_error "DUPLICATE_DETECTED: Another FFmpeg (PID $pid) is already running for $channel_id"
+                return 1
+            fi
+        done
+    fi
+    return 0
+}
+
+# Track if FFmpeg was killed externally vs exited normally
+ffmpeg_killed_externally=0
+
 while true; do
     # NEW: Check if config file changed and reload URLs
     reload_config_if_changed
@@ -1881,6 +2357,15 @@ while true; do
         log "URL validation skipped for non-HTTP scheme: $scheme"
     fi
 
+    # CRITICAL: Check for existing FFmpeg processes before starting new one
+    # This prevents duplicate processes which break streams due to source URL limits
+    if ! check_existing_ffmpeg; then
+        log_error "DUPLICATE_EXIT: Exiting to avoid duplicate FFmpeg processes for $channel_id"
+        log_error "DUPLICATE_EXIT: Another instance is already streaming. This script will exit."
+        cleanup
+        exit 0
+    fi
+
     # Build and execute FFmpeg command
     ffmpeg_cmd=()
     build_ffmpeg_cmd "$current_url" "$destination"
@@ -1903,36 +2388,60 @@ while true; do
 
     # Run FFmpeg in background so we can hot-reload config and check primary health
     proxy_pid=""
-    stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
+    stream_fifo="/dev/shm/stream_pipe_${channel_id}_$$"
     if [[ "$use_https_proxy" -eq 1 ]]; then
+        if [[ ! -d "/dev/shm" ]]; then
+            stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
+            log "HTTPS_PROXY: /dev/shm not available; using $stream_fifo"
+        fi
         # Create FIFO for reliable PID capture of both proxy and FFmpeg
         rm -f "$stream_fifo" 2>$DEVNULL
         mkfifo "$stream_fifo" 2>$DEVNULL || {
             log_error "HTTPS_PROXY: Failed to create FIFO; falling back to pipeline"
             stream_fifo=""
         }
+        # Hard safety: only use FIFO if it is actually a named pipe
+        if [[ -n "$stream_fifo" && ! -p "$stream_fifo" ]]; then
+            log_error "HTTPS_PROXY: $stream_fifo is not a FIFO; falling back to pipeline"
+            rm -f "$stream_fifo" 2>$DEVNULL
+            stream_fifo=""
+        fi
 
         if [[ "${url_is_youtube[$current_url_index]}" == "1" ]]; then
-            if ! command -v yt-dlp >$DEVNULL 2>&1; then
-                log_error "HTTPS_PROXY: yt-dlp not found for YouTube URL; switching to next URL"
+            # Use streamlink for resolved YouTube HLS (FFmpeg lacks HTTPS support)
+            if ! command -v streamlink >$DEVNULL 2>&1; then
+                log_error "HTTPS_PROXY: streamlink not found for YouTube URL; switching to next URL"
                 rm -f "$stream_fifo" 2>$DEVNULL
                 switch_to_next_url "proxy_missing"
                 continue
             fi
-            proxy_source_url="${url_original[$current_url_index]:-$current_url}"
-            log "HTTPS_PROXY: Starting yt-dlp pipe for YouTube: $proxy_source_url"
-            if [[ -n "$stream_fifo" ]]; then
+            # Get the resolved HLS manifest URL (already resolved by init_url_youtube_metadata)
+            proxy_source_url="${url_array[$current_url_index]}"
+            if [[ "$proxy_source_url" == *"youtube.com"* || "$proxy_source_url" == *"youtu.be"* ]]; then
+                log_error "HTTPS_PROXY: YouTube URL did not resolve to a stream; switching to next URL"
+                rm -f "$stream_fifo" 2>$DEVNULL
+                switch_to_next_url "youtube_resolve_failed"
+                continue
+            fi
+            log "HTTPS_PROXY: Starting streamlink pipe for YouTube HLS: ${proxy_source_url:0:80}..."
+
+            # Build streamlink command with optional proxy
+            streamlink_args=(streamlink --stdout)
+            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
+            streamlink_args+=("$proxy_source_url" best)
+
+            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
                 # Use FIFO for reliable PID capture
-                yt-dlp -q -o - "$proxy_source_url" > "$stream_fifo" 2>>"$logfile" &
+                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
                 proxy_pid=$!
                 "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             else
                 # Fallback to pipeline
-                yt-dlp -q -o - "$proxy_source_url" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             fi
-            log "FFmpeg PID: $ffmpeg_pid, yt-dlp PID: ${proxy_pid:-unknown}"
+            log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         elif [[ "$current_url" == *.m3u8* ]]; then
             if ! command -v streamlink >$DEVNULL 2>&1; then
                 log_error "HTTPS_PROXY: streamlink not found for HLS URL; switching to next URL"
@@ -1941,13 +2450,18 @@ while true; do
                 continue
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for HLS: $current_url"
-            if [[ -n "$stream_fifo" ]]; then
-                streamlink --stdout "$current_url" best > "$stream_fifo" 2>>"$logfile" &
+            # Build streamlink command with optional proxy
+            streamlink_args=(streamlink --stdout)
+            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
+            streamlink_args+=("$current_url" best)
+
+            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
+                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
                 proxy_pid=$!
                 "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             else
-                streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             fi
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
@@ -1959,13 +2473,18 @@ while true; do
                 continue
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for: $current_url"
-            if [[ -n "$stream_fifo" ]]; then
-                streamlink --stdout "$current_url" best > "$stream_fifo" 2>>"$logfile" &
+            # Build streamlink command with optional proxy
+            streamlink_args=(streamlink --stdout)
+            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
+            streamlink_args+=("$current_url" best)
+
+            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
+                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
                 proxy_pid=$!
                 "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             else
-                streamlink --stdout "$current_url" best 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
                 ffmpeg_pid=$!
             fi
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
@@ -1984,6 +2503,9 @@ while true; do
 
         # ERROR_LOG_SIZE_LIMIT: Prevent unbounded error log growth
         truncate_error_log_if_needed "$ffmpeg_error_file"
+
+        # SEGMENT_CLEANUP: keep HLS output bounded even if delete_segments fails
+        prune_old_segments
 
         # HOT_RELOAD: pick up config edits while streaming (every 60s)
         reload_config_if_changed
@@ -2053,6 +2575,20 @@ while true; do
     exit_code=$?
     end_time=$(date +%s)
     duration=$((end_time - start_time))
+
+    # ==========================================================================
+    # CRITICAL FIX: Detect external kill (e.g., by health_monitor)
+    # ==========================================================================
+    # If FFmpeg was killed externally (SIGKILL=137, SIGTERM=143) and we didn't
+    # initiate it (stop_reason is empty), exit the script to avoid race with
+    # another instance that health_monitor may have started
+    # ==========================================================================
+    if [[ -z "$stop_reason" && ($exit_code -eq 137 || $exit_code -eq 143) ]]; then
+        log "EXTERNAL_KILL: FFmpeg was killed externally (exit code $exit_code, duration ${duration}s)"
+        log "EXTERNAL_KILL: Assuming health_monitor restarted the channel. Exiting this instance."
+        cleanup
+        exit 0
+    fi
 
     # If we intentionally stopped FFmpeg to switch back to primary, restart immediately.
     if [[ "$stop_reason" == "primary_restore" ]]; then

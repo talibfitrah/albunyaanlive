@@ -4,15 +4,22 @@
 # HLS Channel Health Monitor with Auto-Restart
 # =============================================================================
 
-# Password file for sudo operations (plain text file containing the password)
+# Sudo helper script that outputs the password (used with sudo -A or -S)
 # For better security, consider using sudoers NOPASSWD for specific commands instead
-SUDO_PASS_FILE="${SUDO_PASS_FILE:-$HOME/.sudo_pass}"
+SUDO_PASS_SCRIPT="${SUDO_PASS_SCRIPT:-${SUDO_PASS_FILE:-$HOME/.sudo_pass.sh}}"
 
-# Verify password file has restrictive permissions if it exists
-if [[ -f "$SUDO_PASS_FILE" ]]; then
-    file_perms=$(stat -c %a "$SUDO_PASS_FILE" 2>/dev/null || stat -f %OLp "$SUDO_PASS_FILE" 2>/dev/null)
-    if [[ "$file_perms" != "600" && "$file_perms" != "400" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $SUDO_PASS_FILE has insecure permissions ($file_perms). Should be 600 or 400." >&2
+# Verify helper script permissions if it exists
+if [[ -f "$SUDO_PASS_SCRIPT" ]]; then
+    file_perms=$(stat -c %a "$SUDO_PASS_SCRIPT" 2>/dev/null || stat -f %OLp "$SUDO_PASS_SCRIPT" 2>/dev/null)
+    if [[ "$file_perms" =~ ^[0-7]{3}$ ]]; then
+        group_perm="${file_perms:1:1}"
+        other_perm="${file_perms:2:1}"
+        if [[ "$group_perm" != "0" || "$other_perm" != "0" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $SUDO_PASS_SCRIPT has insecure permissions ($file_perms). Should not be group/other accessible." >&2
+        fi
+    fi
+    if [[ ! -x "$SUDO_PASS_SCRIPT" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $SUDO_PASS_SCRIPT is not executable; sudo -A may fail." >&2
     fi
 fi
 
@@ -21,8 +28,13 @@ sudo_run() {
         "$@"
         return $?
     fi
-    if [[ -r "$SUDO_PASS_FILE" ]]; then
-        sudo -S "$@" < "$SUDO_PASS_FILE"
+    if [[ -r "$SUDO_PASS_SCRIPT" ]]; then
+        SUDO_ASKPASS="$SUDO_PASS_SCRIPT" sudo -A "$@" && return $?
+        if [[ -x "$SUDO_PASS_SCRIPT" ]]; then
+            "$SUDO_PASS_SCRIPT" | sudo -S "$@"
+        else
+            bash "$SUDO_PASS_SCRIPT" | sudo -S "$@"
+        fi
         return $?
     fi
     sudo -n "$@"
@@ -41,6 +53,12 @@ if [[ ! -c /dev/null || ! -w /dev/null ]]; then
     # Cleanup fallback file and cleaner on exit (handle multiple signals to avoid orphaned processes)
     trap 'kill $_devnull_cleaner_pid 2>/dev/null; rm -f "$DEVNULL" 2>/dev/null' EXIT INT TERM HUP
 fi
+
+# Cross-platform stat helpers (GNU/BSD compatibility)
+get_file_size() {
+    local file="$1"
+    stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+}
 
 # STABILITY: Ensure /dev/null is a character device (not a regular file)
 if [[ ! -c /dev/null ]]; then
@@ -72,7 +90,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HLS_BASE_DIR="/var/www/html/stream/hls"
-RESTART_TRACKING_DIR="/tmp/stream_health"
+RESTART_TRACKING_DIR="/tmp/stream_health_${UID}"
 MAX_RESTARTS_PER_HOUR=5
 
 # MINOR FIX: Updated thresholds per spec (was 30/60, now 15/30)
@@ -82,7 +100,7 @@ PLAYLIST_STALE_THRESHOLD=30  # seconds - playlist freshness check
 # Choose a writable log directory (fallback to /tmp if repo logs are not writable)
 resolve_log_dir() {
     local preferred="$1"
-    local fallback="/tmp/albunyaan-logs"
+    local fallback="/tmp/albunyaan-logs-$UID"
 
     if mkdir -p "$preferred" 2>$DEVNULL && [[ -w "$preferred" ]]; then
         echo "$preferred"
@@ -102,9 +120,46 @@ LOG_DIR=$(resolve_log_dir "$SCRIPT_DIR/logs")
 LOG_FILE="$LOG_DIR/health_monitor.log"
 
 mkdir -p "$(dirname "$LOG_FILE")" 2>$DEVNULL || true
-mkdir -p "$RESTART_TRACKING_DIR"
+if ! : >> "$LOG_FILE" 2>$DEVNULL; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Cannot write to $LOG_FILE, falling back to /tmp" >&2
+    LOG_DIR="/tmp/albunyaan-logs-$UID"
+    LOG_FILE="$LOG_DIR/health_monitor.log"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>$DEVNULL || true
+    : >> "$LOG_FILE" 2>$DEVNULL || true
+fi
+mkdir -p "$RESTART_TRACKING_DIR" 2>$DEVNULL || true
+if [[ ! -w "$RESTART_TRACKING_DIR" ]]; then
+    RESTART_TRACKING_DIR="/tmp/stream_health_${UID}_$$"
+    mkdir -p "$RESTART_TRACKING_DIR" 2>$DEVNULL || true
+fi
+
+# Log size limits to prevent disk exhaustion
+LOG_FILE_MAX_MB="${LOG_FILE_MAX_MB:-5}"
+LOG_FILE_MAX_BYTES=$((LOG_FILE_MAX_MB * 1024 * 1024))
+LOG_FILE_TRIM_MB="${LOG_FILE_TRIM_MB:-1}"
+LOG_FILE_TRIM_BYTES=$((LOG_FILE_TRIM_MB * 1024 * 1024))
+LOG_GC_INTERVAL="${LOG_GC_INTERVAL:-300}"
+last_log_gc=0
+
+log_maintenance() {
+    local now
+    now=$(date +%s)
+    if [[ $((now - last_log_gc)) -lt $LOG_GC_INTERVAL ]]; then
+        return
+    fi
+    last_log_gc=$now
+
+    if [[ -f "$LOG_FILE" && "$LOG_FILE_MAX_BYTES" -gt 0 ]]; then
+        local size
+        size=$(get_file_size "$LOG_FILE")
+        if [[ "$size" -gt "$LOG_FILE_MAX_BYTES" && "$LOG_FILE_TRIM_BYTES" -gt 0 ]]; then
+            tail -c "$LOG_FILE_TRIM_BYTES" "$LOG_FILE" > "${LOG_FILE}.tmp" 2>$DEVNULL && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+}
 
 log() {
+    log_maintenance
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
@@ -128,6 +183,56 @@ get_channel_id() {
 # Escape regex special characters for safe pgrep/pkill patterns
 escape_regex() {
     printf '%s' "$1" | sed 's/[][\\.^$*+?{}|()]/\\&/g'
+}
+
+# Validate that a pidfile points to the expected try_start_stream.sh instance
+is_expected_parent_pid() {
+    local pid="$1"
+    local channel_id="$2"
+    local -a cmd_args=()
+
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        mapfile -d '' -t cmd_args < "/proc/$pid/cmdline" 2>$DEVNULL
+    else
+        local cmdline
+        cmdline=$(ps -o args= -p "$pid" 2>$DEVNULL || true)
+        read -r -a cmd_args <<< "$cmdline"
+    fi
+
+    if [[ ${#cmd_args[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    local has_script=0
+    local dest=""
+    local i
+    for i in "${!cmd_args[@]}"; do
+        if [[ "${cmd_args[$i]}" == *"try_start_stream.sh"* ]]; then
+            has_script=1
+        fi
+        if [[ "${cmd_args[$i]}" == "-d" && -n "${cmd_args[$((i+1))]}" ]]; then
+            dest="${cmd_args[$((i+1))]}"
+        fi
+    done
+
+    if [[ $has_script -eq 0 ]]; then
+        return 1
+    fi
+
+    if [[ -n "$dest" ]]; then
+        local dest_channel_id
+        dest_channel_id=$(basename "$(dirname "$dest")")
+        [[ "$dest_channel_id" == "$channel_id" ]]
+        return $?
+    fi
+
+    for i in "${cmd_args[@]}"; do
+        if [[ "$i" == *"/${channel_id}/"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 # Get restart count for a channel in the last hour
@@ -267,6 +372,7 @@ restart_channel() {
     local script_path="$2"
     local escaped_channel_id
     escaped_channel_id=$(escape_regex "$channel_id")
+    local pidfile="/tmp/stream_${channel_id}.pid"
 
     if [[ -z "$script_path" || ! -f "$script_path" ]]; then
         log "ERROR: Cannot find script for channel $channel_id"
@@ -274,6 +380,29 @@ restart_channel() {
     fi
 
     log_console "RESTARTING channel: $channel_id"
+
+    # ==========================================================================
+    # CRITICAL FIX: Kill the parent script FIRST (try_start_stream.sh)
+    # ==========================================================================
+    # This prevents the race condition where we kill FFmpeg, the old script
+    # restarts it, AND we start a new script - causing duplicate processes
+    # ==========================================================================
+    if [[ -f "$pidfile" ]]; then
+        local parent_pid=$(cat "$pidfile" 2>$DEVNULL)
+        if [[ -n "$parent_pid" ]] && kill -0 "$parent_pid" 2>$DEVNULL; then
+            if is_expected_parent_pid "$parent_pid" "$channel_id"; then
+                log "Killing parent script (PID $parent_pid) for $channel_id"
+                kill -TERM "$parent_pid" 2>$DEVNULL || sudo_run kill -TERM "$parent_pid" 2>$DEVNULL || true
+                sleep 1
+                # Force kill if still running
+                if kill -0 "$parent_pid" 2>$DEVNULL; then
+                    kill -KILL "$parent_pid" 2>$DEVNULL || sudo_run kill -KILL "$parent_pid" 2>$DEVNULL || true
+                fi
+            else
+                log "Skipping parent kill: pidfile PID $parent_pid does not match expected channel $channel_id"
+            fi
+        fi
+    fi
 
     # Kill existing FFmpeg processes for this channel
     # NOTE: FFmpeg may run as root, so try both regular and sudo kill
