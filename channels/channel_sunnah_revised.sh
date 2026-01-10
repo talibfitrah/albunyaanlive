@@ -4,11 +4,11 @@
 # Channel: Sunnah
 # =============================================================================
 
-stream_name="705729222787/345515312457/1435"
-stream_url="http://vlc.news:9000/705729222787/345515312457/1435"
+stream_name="sunnah"
+stream_url="https://www.youtube.com/@SaudiSunnahTv/live"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="https://www.youtube.com/@SaudiSunnahTv/live"
+stream_url_backup1="http://vlc.news:9000/705729222787/345515312457/1435"
 stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/sunnah/master.m3u8"
