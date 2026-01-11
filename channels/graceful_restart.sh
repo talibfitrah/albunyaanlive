@@ -31,7 +31,7 @@ MAX_WAIT_SECONDS=60
 # Choose a writable log directory (fallback to /tmp if repo logs are not writable)
 resolve_log_dir() {
     local preferred="$1"
-    local fallback="/tmp/albunyaan-logs"
+    local fallback="/tmp/albunyaan-logs-$UID"
 
     if mkdir -p "$preferred" 2>/dev/null && [[ -w "$preferred" ]]; then
         echo "$preferred"
@@ -186,7 +186,7 @@ parse_config_value() {
     # Extract value from lines like:
     #   varname="value" | varname='value' | varname=value | export varname=value
     awk -v var="$varname" '
-        $0 ~ "^[ \t]*(export[ \t]+)?"+var"[ \t]*=" {
+        $0 ~ "^[ \t]*(export[ \t]+)?" var "[ \t]*=" {
             line = $0
             sub(/^[ \t]*(export[ \t]+)?[ \t]*[^=]+=[ \t]*/, "", line)
             # Strip inline comments (only when preceded by whitespace)

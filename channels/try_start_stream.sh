@@ -100,6 +100,7 @@ YTDLP_FORMAT="${YTDLP_FORMAT:-best}"                      # yt-dlp format select
 YTDLP_COOKIES="${YTDLP_COOKIES:-}"                        # Optional: path to cookies.txt for YouTube auth
 YTDLP_COOKIES_BROWSER="${YTDLP_COOKIES_BROWSER:-}"        # Optional: browser[:profile_path] for cookies
 YTDLP_PROXY="${YTDLP_PROXY:-}"                            # Optional: proxy for yt-dlp/streamlink
+YTDLP_ALLOW_DIRECT_FALLBACK="${YTDLP_ALLOW_DIRECT_FALLBACK:-1}"  # Retry without proxy if proxy resolve fails
 TOR_ROTATE_FAILURES="${TOR_ROTATE_FAILURES:-3}"           # Rotate Tor after N consecutive YouTube failures
 TOR_ROTATE_COOLDOWN="${TOR_ROTATE_COOLDOWN:-300}"         # Min seconds between Tor rotations (5 min)
 TOR_FAILURE_FILE="${TOR_FAILURE_FILE:-/tmp/tor_youtube_failures_${UID}}"  # Track YouTube failures
@@ -123,6 +124,8 @@ YTDLP_STARTUP_STAGGER_MAX="${YTDLP_STARTUP_STAGGER_MAX:-30}"    # Max random del
 ytdlp_startup_stagger_done=0
 ytdlp_cookies_browser_checked=0
 ytdlp_cookies_browser_args=()
+torsocks_warned=0
+tor_socks_unreachable_warned=0
 
 # YouTube state arrays (initialized after URL parsing)
 # url_is_youtube[i]     - 1 if YouTube URL, 0 otherwise
@@ -1070,6 +1073,68 @@ init_ytdlp_cookies_browser_args() {
 }
 
 # =============================================================================
+# Proxy helpers for yt-dlp/streamlink
+# =============================================================================
+proxy_is_local_tor() {
+    local proxy="$1"
+    if [[ "$proxy" =~ ^socks5h?://([^@/]+@)?(127\.0\.0\.1|localhost):([0-9]+)(/|$) ]]; then
+        local port="${BASH_REMATCH[3]}"
+        [[ "$port" == "9050" || "$port" == "9150" ]]
+        return $?
+    fi
+    return 1
+}
+
+tor_socks_reachable() {
+    local proxy="$1"
+    local host port
+    if [[ "$proxy" =~ ^socks5h?://([^@/]+@)?(127\.0\.0\.1|localhost):([0-9]+)(/|$) ]]; then
+        host="${BASH_REMATCH[2]}"
+        port="${BASH_REMATCH[3]}"
+    else
+        return 1
+    fi
+
+    if ! command -v timeout >$DEVNULL 2>&1; then
+        return 0
+    fi
+
+    timeout 2 bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>$DEVNULL
+}
+
+should_use_torsocks() {
+    local proxy="$1"
+    proxy_is_local_tor "$proxy" || return 1
+    command -v torsocks >$DEVNULL 2>&1 || return 1
+    return 0
+}
+
+set_streamlink_args() {
+    local url="$1"
+
+    if should_use_torsocks "$YTDLP_PROXY"; then
+        if ! tor_socks_reachable "$YTDLP_PROXY"; then
+            if [[ $tor_socks_unreachable_warned -eq 0 ]]; then
+                log_error "TOR: SOCKS proxy not reachable; attempting Tor restart"
+                tor_socks_unreachable_warned=1
+            fi
+            tor_rotate_circuit || true
+        fi
+        streamlink_args=(torsocks streamlink --stdout)
+    else
+        if proxy_is_local_tor "$YTDLP_PROXY" && ! command -v torsocks >$DEVNULL 2>&1; then
+            if [[ $torsocks_warned -eq 0 ]]; then
+                log_error "TOR: torsocks not found; using streamlink --http-proxy"
+                torsocks_warned=1
+            fi
+        fi
+        streamlink_args=(streamlink --stdout)
+        [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
+    fi
+    streamlink_args+=("$url" best)
+}
+
+# =============================================================================
 # Tor circuit rotation for YouTube bot detection bypass
 # =============================================================================
 # When YouTube blocks the current Tor exit node, we rotate to a new circuit.
@@ -1126,6 +1191,8 @@ resolve_youtube_url() {
     local youtube_url="$1"
     local skip_cooldown="${2:-0}"  # Optional: skip cooldown check (for startup)
     local resolved_url=""
+    local use_proxy="$YTDLP_PROXY"
+    local attempted_direct=0
 
     log "YOUTUBE: Resolving URL: $youtube_url"
 
@@ -1147,35 +1214,58 @@ resolve_youtube_url() {
         return 1
     fi
 
-    # Acquire global throttle lock
-    if ! ytdlp_throttle_acquire; then
-        log_error "YOUTUBE: Failed to acquire throttle lock"
-        return 1
-    fi
-
-    # Record this call for per-channel rate limiting
+    # Record this call for per-channel rate limiting (once per logical resolve)
     ytdlp_channel_record_call
 
-    # Use yt-dlp with timeout to extract stream URL
-    # -g: Get URL only, --no-warnings: suppress warnings
-    # -f: Format selection
-    local ytdlp_cmd=(yt-dlp -g --no-warnings --no-playlist -f "$YTDLP_FORMAT")
-    # Add proxy if configured
-    if [[ -n "$YTDLP_PROXY" ]]; then
-        ytdlp_cmd+=(--proxy "$YTDLP_PROXY")
-    fi
-    # Add cookies: prefer explicit file, fall back to browser extraction
-    init_ytdlp_cookies_browser_args
-    if [[ -n "$YTDLP_COOKIES" && -f "$YTDLP_COOKIES" ]]; then
-        ytdlp_cmd+=(--cookies "$YTDLP_COOKIES")
-    elif [[ ${#ytdlp_cookies_browser_args[@]} -gt 0 ]]; then
-        ytdlp_cmd+=("${ytdlp_cookies_browser_args[@]}")
-    fi
-    ytdlp_cmd+=("$youtube_url")
-    resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
+    while true; do
+        # Acquire global throttle lock
+        if ! ytdlp_throttle_acquire; then
+            log_error "YOUTUBE: Failed to acquire throttle lock"
+            return 1
+        fi
 
-    # Release throttle lock after yt-dlp completes
-    ytdlp_throttle_release
+        # If using local Tor, ensure SOCKS is reachable before calling yt-dlp
+        if proxy_is_local_tor "$use_proxy" && ! tor_socks_reachable "$use_proxy"; then
+            log_error "YOUTUBE: Tor SOCKS proxy not reachable; attempting Tor restart before resolve"
+            tor_rotate_circuit || true
+            sleep 2
+        fi
+
+        # Use yt-dlp with timeout to extract stream URL
+        # -g: Get URL only, --no-warnings: suppress warnings
+        # -f: Format selection
+        local ytdlp_cmd=(yt-dlp -g --no-warnings --no-playlist -f "$YTDLP_FORMAT")
+        # Add proxy if configured
+        if [[ -n "$use_proxy" ]]; then
+            ytdlp_cmd+=(--proxy "$use_proxy")
+        fi
+        # Add cookies: prefer explicit file, fall back to browser extraction
+        init_ytdlp_cookies_browser_args
+        if [[ -n "$YTDLP_COOKIES" && -f "$YTDLP_COOKIES" ]]; then
+            ytdlp_cmd+=(--cookies "$YTDLP_COOKIES")
+        elif [[ ${#ytdlp_cookies_browser_args[@]} -gt 0 ]]; then
+            ytdlp_cmd+=("${ytdlp_cookies_browser_args[@]}")
+        fi
+        ytdlp_cmd+=("$youtube_url")
+        resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
+
+        # Release throttle lock after yt-dlp completes
+        ytdlp_throttle_release
+
+        if [[ -n "$resolved_url" ]]; then
+            break
+        fi
+
+        # Retry once without proxy if allowed (helps when Tor is blocked/unreachable)
+        if [[ -n "$use_proxy" && $attempted_direct -eq 0 && "$YTDLP_ALLOW_DIRECT_FALLBACK" == "1" ]]; then
+            log "YOUTUBE: Proxy resolution failed; retrying direct (no proxy) once"
+            use_proxy=""
+            attempted_direct=1
+            continue
+        fi
+
+        break
+    done
 
     if [[ -z "$resolved_url" ]]; then
         log_error "YOUTUBE: Failed to resolve URL: $youtube_url"
@@ -2426,9 +2516,7 @@ while true; do
             log "HTTPS_PROXY: Starting streamlink pipe for YouTube HLS: ${proxy_source_url:0:80}..."
 
             # Build streamlink command with optional proxy
-            streamlink_args=(streamlink --stdout)
-            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
-            streamlink_args+=("$proxy_source_url" best)
+            set_streamlink_args "$proxy_source_url"
 
             if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
                 # Use FIFO for reliable PID capture
@@ -2451,9 +2539,7 @@ while true; do
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for HLS: $current_url"
             # Build streamlink command with optional proxy
-            streamlink_args=(streamlink --stdout)
-            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
-            streamlink_args+=("$current_url" best)
+            set_streamlink_args "$current_url"
 
             if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
                 "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
@@ -2474,9 +2560,7 @@ while true; do
             fi
             log "HTTPS_PROXY: Starting streamlink pipe for: $current_url"
             # Build streamlink command with optional proxy
-            streamlink_args=(streamlink --stdout)
-            [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
-            streamlink_args+=("$current_url" best)
+            set_streamlink_args "$current_url"
 
             if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
                 "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
