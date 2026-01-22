@@ -176,6 +176,122 @@ scale=3
 **Important:** HTTPS sources
 - Your `ffmpeg` build must support `https` input to use `https://...` stream URLs. If not, the manager logs `UNSUPPORTED_PROTOCOL` and skips those URLs.
 
+### YouTube Stream Support (v2 - Full Segment Proxy)
+
+YouTube aggressively blocks automated access. The browser resolver v2 solves this by:
+1. **Full segment proxying** - FFmpeg never contacts YouTube directly
+2. **Stealth mode** - Puppeteer-extra with anti-detection
+3. **Persistent login** - YouTube account session persists across restarts
+
+#### Quick Setup
+
+```bash
+cd /home/msa/Development/scripts/albunyaan/channels
+
+# Install dependencies
+npm install
+
+# Start the resolver service
+sudo systemctl enable youtube-resolver
+sudo systemctl start youtube-resolver
+
+# Check status
+curl http://127.0.0.1:8088/health
+```
+
+#### The YouTube Bot Detection Problem
+
+YouTube now requires sign-in to access many live streams. The error looks like:
+```
+Sign in to confirm you're not a bot
+```
+
+**Solution Options** (choose one):
+
+##### Option 1: Import Cookies from Firefox (Easiest)
+If you're logged into YouTube in Firefox on this machine:
+```bash
+./import_youtube_cookies.sh
+sudo systemctl restart youtube-resolver
+```
+
+##### Option 2: Manual Browser Login (Most Reliable)
+Requires X11 display (VNC, X11 forwarding, or desktop access):
+```bash
+# SSH with X11 forwarding
+ssh -X user@server
+
+# Run login helper
+./youtube_resolver_login.sh
+
+# A browser opens - log into YouTube
+# Then close the browser and it restarts in headless mode
+```
+
+##### Option 3: yt-dlp OAuth (Alternative)
+```bash
+# Authenticate yt-dlp with your Google account
+yt-dlp --username oauth2 --password '' --cache-dir ~/.cache/yt-dlp https://www.youtube.com/watch?v=jNQXAC9IVRw
+
+# Follow the OAuth flow in your browser
+# The token is cached for future use
+```
+
+#### Enabling the Resolver for Channels
+
+```bash
+export YOUTUBE_BROWSER_RESOLVER="http://127.0.0.1:8088"
+./restart.sh
+```
+
+Or add to your shell profile:
+```bash
+echo 'export YOUTUBE_BROWSER_RESOLVER="http://127.0.0.1:8088"' >> ~/.bashrc
+```
+
+#### How It Works
+
+1. `try_start_stream.sh` detects YouTube URLs
+2. Asks the browser resolver to open the YouTube page
+3. Browser captures the HLS manifest
+4. **All segment URLs are rewritten** to go through the local proxy
+5. When FFmpeg requests a segment, the browser fetches it with proper cookies
+6. FFmpeg only talks to localhost - never directly to YouTube
+
+#### Resolver Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Status + login state |
+| `GET /login` | Opens YouTube login (visible mode only) |
+| `GET /register?url=<yt_url>&id=<name>` | Register a stream |
+| `GET /hls/<id>/master.m3u8` | Get manifest |
+| `GET /hls/<id>/segment/<url>` | Get video segment |
+
+#### Troubleshooting YouTube
+
+```bash
+# Check resolver status
+curl http://127.0.0.1:8088/health
+
+# Should show: "loggedIn": true
+
+# View resolver logs
+journalctl -u youtube-resolver -f
+
+# Test yt-dlp directly
+timeout 30 yt-dlp -g "https://www.youtube.com/@SaudiQuranTv/live"
+```
+
+#### Common Issues
+
+| Problem | Solution |
+|---------|----------|
+| "Sign in to confirm you're not a bot" | Import cookies or do manual login |
+| "loggedIn": false | Run import_youtube_cookies.sh or youtube_resolver_login.sh |
+| Segments return 403 | Session expired - re-login to YouTube |
+| Manifest not ready | Wait 30s, YouTube page may be slow to load |
+
 ### Scale Settings (Quality)
 
 | Scale | Description | When to Use |
