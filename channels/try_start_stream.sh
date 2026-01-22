@@ -97,6 +97,7 @@ YOUTUBE_REFRESH_MARGIN="${YOUTUBE_REFRESH_MARGIN:-1800}"  # Refresh 30 min befor
 YOUTUBE_CHECK_INTERVAL="${YOUTUBE_CHECK_INTERVAL:-300}"   # Check expiry every 5 min (reduced from 60s to prevent rate limiting)
 YTDLP_TIMEOUT="${YTDLP_TIMEOUT:-30}"                      # yt-dlp timeout in seconds
 YTDLP_FORMAT="${YTDLP_FORMAT:-best}"                      # yt-dlp format selection
+YTDLP_EXTRACTOR_ARGS="${YTDLP_EXTRACTOR_ARGS:-youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416}"  # POT provider for bot bypass
 YTDLP_COOKIES="${YTDLP_COOKIES:-}"                        # Optional: path to cookies.txt for YouTube auth
 YTDLP_COOKIES_BROWSER="${YTDLP_COOKIES_BROWSER:-}"        # Optional: browser[:profile_path] for cookies
 YTDLP_PROXY="${YTDLP_PROXY:-}"                            # Optional: proxy for yt-dlp/streamlink
@@ -110,6 +111,10 @@ YTDLP_LOCK_FILE="${YTDLP_LOCK_FILE:-/tmp/ytdlp_global_${UID}.lock}"  # Global lo
 YTDLP_TIMESTAMP_FILE="${YTDLP_TIMESTAMP_FILE:-/tmp/ytdlp_last_call_${UID}}"  # Last call timestamp
 YOUTUBE_STREAM_END_RETRY="${YOUTUBE_STREAM_END_RETRY:-2}" # Retries when stream ends (reduced from 5 to prevent rate limiting)
 last_youtube_check=0
+YOUTUBE_BROWSER_RESOLVER="${YOUTUBE_BROWSER_RESOLVER:-}"   # Optional: http://127.0.0.1:8088 YouTube browser proxy
+YOUTUBE_BROWSER_RESOLVER_TIMEOUT="${YOUTUBE_BROWSER_RESOLVER_TIMEOUT:-6}"
+YOUTUBE_BROWSER_RESOLVER_COOLDOWN="${YOUTUBE_BROWSER_RESOLVER_COOLDOWN:-300}"
+last_browser_resolver_failure=0
 
 # =============================================================================
 # NEW: Per-channel rate limit protection
@@ -156,13 +161,15 @@ while getopts 'hu:d:k:n:s:b:c:' OPTION; do
             echo "Scales:"
             echo "  0 - Stream copy (default)"
             echo "  2 - Stream copy with threads"
-            echo "  3 - NVIDIA GPU encode (no scaling)"
-            echo "  4 - NVIDIA GPU encode + scale to 1080p"
+            echo "  3 - NVIDIA GPU encode (no scaling) - 3.5Mbps"
+            echo "  4 - NVIDIA GPU encode + scale to 1080p - 3.5Mbps"
             echo "  5 - CPU encode (libx264)"
             echo "  6 - CPU encode + scale to 1080p"
             echo "  7 - Stream copy with extended buffer"
             echo "  8 - CUDA passthrough"
             echo "  9 - Software decode + CPU scale + NVENC (for corrupted streams)"
+            echo " 10 - HIGH QUALITY: Software decode + NVENC (error tolerant) - 6-8Mbps VBR"
+            echo " 11 - HIGH QUALITY: Software decode + scale 1080p + NVENC - 6-8Mbps VBR"
             echo ""
             echo "YouTube URL Support:"
             echo "  Two types of YouTube live URLs are supported:"
@@ -1187,6 +1194,56 @@ tor_rotate_circuit() {
     return 1
 }
 
+resolve_youtube_via_browser_proxy() {
+    local youtube_url="$1"
+    local label="${2:-$channel_id}"
+
+    # Only run when explicitly enabled
+    if [[ -z "$YOUTUBE_BROWSER_RESOLVER" ]]; then
+        return 1
+    fi
+
+    if ! command -v curl >$DEVNULL 2>&1; then
+        log_error "YOUTUBE_BROWSER: curl not found; skipping browser resolver"
+        return 1
+    fi
+
+    local now
+    now=$(date +%s)
+    if [[ $last_browser_resolver_failure -ne 0 && $((now - last_browser_resolver_failure)) -lt $YOUTUBE_BROWSER_RESOLVER_COOLDOWN ]]; then
+        return 1
+    fi
+
+    local endpoint="${YOUTUBE_BROWSER_RESOLVER%/}/register"
+    local response
+    response=$(curl -f -G -A "$USER_AGENT" -sS --max-time "$YOUTUBE_BROWSER_RESOLVER_TIMEOUT" \
+        --data-urlencode "url=$youtube_url" \
+        --data-urlencode "id=${label:-youtube}" \
+        "$endpoint" 2>$DEVNULL) || {
+        last_browser_resolver_failure=$now
+        log_error "YOUTUBE_BROWSER: Resolver request failed; will skip for ${YOUTUBE_BROWSER_RESOLVER_COOLDOWN}s"
+        return 1
+    }
+
+    local playback
+    playback=$(printf '%s' "$response" | head -n1 | tr -d '\r')
+    if [[ "$playback" =~ ^https?:// ]]; then
+        log "YOUTUBE_BROWSER: Resolved via browser service for $label"
+        echo "$playback"
+        return 0
+    fi
+
+    playback=$(printf '%s' "$response" | sed -n 's/.*\"playback\"[[:space:]]*:[[:space:]]*\"\\?\([^"]\+\)\".*/\1/p' | head -1)
+    if [[ "$playback" =~ ^https?:// ]]; then
+        log "YOUTUBE_BROWSER: Resolved via browser service (JSON) for $label"
+        echo "$playback"
+        return 0
+    fi
+
+    log "YOUTUBE_BROWSER: Resolver responded without playback URL"
+    return 1
+}
+
 resolve_youtube_url() {
     local youtube_url="$1"
     local skip_cooldown="${2:-0}"  # Optional: skip cooldown check (for startup)
@@ -1195,6 +1252,14 @@ resolve_youtube_url() {
     local attempted_direct=0
 
     log "YOUTUBE: Resolving URL: $youtube_url"
+
+    # Try browser-backed resolver first (avoids signature churn / 403s)
+    local browser_resolved=""
+    browser_resolved=$(resolve_youtube_via_browser_proxy "$youtube_url" "${channel_id:-youtube}") || true
+    if [[ -n "$browser_resolved" ]]; then
+        echo "$browser_resolved"
+        return 0
+    fi
 
     # Check if yt-dlp is available
     if ! command -v yt-dlp >$DEVNULL 2>&1; then
@@ -1245,6 +1310,10 @@ resolve_youtube_url() {
             ytdlp_cmd+=(--cookies "$YTDLP_COOKIES")
         elif [[ ${#ytdlp_cookies_browser_args[@]} -gt 0 ]]; then
             ytdlp_cmd+=("${ytdlp_cookies_browser_args[@]}")
+        fi
+        # Add extractor-args if configured (for POT provider etc.)
+        if [[ -n "$YTDLP_EXTRACTOR_ARGS" ]]; then
+            ytdlp_cmd+=(--extractor-args "$YTDLP_EXTRACTOR_ARGS")
         fi
         ytdlp_cmd+=("$youtube_url")
         resolved_url=$(timeout "$YTDLP_TIMEOUT" "${ytdlp_cmd[@]}" 2>$DEVNULL | head -1)
@@ -2217,6 +2286,30 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
             ;;
+        10)
+            # HIGH QUALITY: Software decode + NVENC encode (tolerates corrupted RTMP streams)
+            # Uses software decoder for error tolerance, NVENC for efficient encoding
+            # Best for RTMP sources that may have occasional packet corruption
+            ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
+            ffmpeg_cmd+=( -i "$actual_input_url" )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -f hls -hls_time 6 )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ;;
+        11)
+            # HIGH QUALITY: Software decode + scale to 1080p + NVENC (tolerates corrupted streams)
+            # Uses software decoder for error tolerance, CPU scaling, NVENC for encoding
+            ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
+            ffmpeg_cmd+=( -i "$actual_input_url" )
+            ffmpeg_cmd+=( -vf "scale=1920:1080" )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -f hls -hls_time 6 )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ;;
         *)
             # Default: stream copy
             ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 6 )
@@ -2776,7 +2869,9 @@ while true; do
     fi
 
     # Determine success/failure based on runtime
-    if [[ $duration -gt 60 ]]; then
+    # FIX: Increased from 60s to 300s to prevent flaky sources from resetting
+    # retry counters with short "successful" runs (e.g., 61s, 105s)
+    if [[ $duration -gt 300 ]]; then
         # Stream was running successfully - reset all counters
         log "SUCCESS_RUN: Stream ran for ${duration}s. Resetting failure counters."
         total_cycles=0

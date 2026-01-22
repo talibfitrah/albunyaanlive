@@ -4,14 +4,19 @@
 # Channel: Sunnah
 # =============================================================================
 
-# Use Tor proxy to bypass YouTube rate limiting (allow overrides)
-export YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
+# Optional proxy for YouTube resolution; leave empty to use direct IP
+YTDLP_PROXY="${YTDLP_PROXY:-}"
+export YTDLP_PROXY
+
+# Use POT token provider for YouTube bot detection bypass
+YTDLP_EXTRACTOR_ARGS="youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
+export YTDLP_EXTRACTOR_ARGS
 
 stream_name="sunnah"
-stream_url="https://www.youtube.com/@SaudiSunnahTv/live"
+stream_url="http://vlc.news:80/964683414160/920593191620/1420"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1=""
+stream_url_backup1="https://www.youtube.com/@SaudiSunnahTv/live"
 stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/sunnah/master.m3u8"

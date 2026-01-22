@@ -3,6 +3,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# Default to local browser resolver for all YouTube URLs (safe fallback if service absent)
+export YOUTUBE_BROWSER_RESOLVER="${YOUTUBE_BROWSER_RESOLVER:-http://127.0.0.1:8088}"
+
 ./channel_almajd_aamah_revised.sh
 ./channel_almajd_kids_revised.sh
 ./channel_almajd_doc_revised.sh
