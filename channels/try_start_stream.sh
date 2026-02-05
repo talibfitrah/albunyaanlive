@@ -2328,6 +2328,30 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
             ;;
+        12)
+            # GPU STRETCH TO FILL: CUDA decode + scale_npp exact dimensions + NVENC
+            # Stretches video to exactly 1920x1080, removing any black bars
+            # Pure GPU processing with high quality NVENC settings
+            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -vf "scale_npp=w=1920:h=1080:interp_algo=lanczos" )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -f hls -hls_time 6 )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ;;
+        13)
+            # GPU SCALE + CROP: CUDA decode + scale_npp to fill + crop to remove excess
+            # Scales up to fill frame maintaining aspect ratio, then crops to exact size
+            # Uses brief GPU-CPU-GPU transfer for crop operation
+            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -vf "scale_npp=1920:1080:force_original_aspect_ratio=increase:interp_algo=lanczos,hwdownload,format=nv12,crop=1920:1080,hwupload_cuda" )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -f hls -hls_time 6 )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ;;
         *)
             # Default: stream copy
             ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 6 )
