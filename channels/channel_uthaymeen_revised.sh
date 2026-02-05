@@ -1,18 +1,18 @@
 #!/bin/bash
 
 # =============================================================================
-# Channel: Saad
+# Channel: Ibn Uthaymeen
 # =============================================================================
 
-stream_name="elkhatabi8/pencj6s26i/170860"
-stream_url="http://ts3.eagtop.vip:2082/elkhatabi8/pencj6s26i/170860"
+stream_name="uthaymeen"
+stream_url="http://vlc.news:80/658660392910/079449534451/357376"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1=""
 stream_url_backup2=""
 
-rtmp_url="/var/www/html/stream/hls/saad/master.m3u8"
-stream_id="/var/www/html/stream/hls/saad/master.m3u8"
+rtmp_url="/var/www/html/stream/hls/uthaymeen/master.m3u8"
+stream_id="/var/www/html/stream/hls/uthaymeen/master.m3u8"
 scale=3
 
 # Build backup URL string (pipe-separated)
