@@ -4,8 +4,8 @@
 # Channel: Arrahmah
 # =============================================================================
 
-stream_name="elkhatabi2/l1x6jfek5o/28183"
-stream_url="http://ts3.eagtop.vip:80/elkhatabi2/l1x6jfek5o/28183"
+stream_name="828906198094/071131245596/357372"
+stream_url="http://vlc.news:80/828906198094/071131245596/357372"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1=""

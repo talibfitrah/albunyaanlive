@@ -4,8 +4,8 @@
 # Channel: Makkah
 # =============================================================================
 
-stream_name="elkhatabi9/3brcoih0n0/28179"
-stream_url="http://ts3.eagtop.vip:80/elkhatabi9/3brcoih0n0/28179"
+stream_name="705729222787/345515312457/1421"
+stream_url="http://vlc.news:80/705729222787/345515312457/1421"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1=""
