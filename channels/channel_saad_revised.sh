@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # =============================================================================
-# Channel: Ajaweed
+# Channel: Saad
 # =============================================================================
 
-stream_name="166164109628/967788242228/1408"
-stream_url="http://vlc.news:80/166164109628/967788242228/1408"
+stream_name="ssadtv.ddns.net"
+stream_url="https://ssadtv.ddns.net/live/saad/playlist.m3u8"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1=""
 stream_url_backup2=""
 
-rtmp_url="/var/www/html/stream/hls/ajaweed/master.m3u8"
-stream_id="/var/www/html/stream/hls/ajaweed/master.m3u8"
-scale=0
+rtmp_url="/var/www/html/stream/hls/saad/master.m3u8"
+stream_id="/var/www/html/stream/hls/saad/master.m3u8"
+scale=3
 
 # Build backup URL string (pipe-separated)
 backup_urls=""
