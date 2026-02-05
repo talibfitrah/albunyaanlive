@@ -2080,7 +2080,13 @@ validate_url() {
 
     # MAJOR FIX: Use same User-Agent as ffmpeg to avoid false 4xx from UA mismatch
     # Also follow redirects (-L) to handle 301/302 properly
-    response=$(curl -A "$USER_AGENT" -L -s -o $DEVNULL -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL)
+
+    # If YTDLP_PROXY is set to Tor SOCKS proxy, use torsocks for validation
+    if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
+        response=$(torsocks curl -A "$USER_AGENT" -L -s -o $DEVNULL -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL)
+    else
+        response=$(curl -A "$USER_AGENT" -L -s -o $DEVNULL -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL)
+    fi
 
     echo "$response"
 }
@@ -2088,13 +2094,25 @@ validate_url() {
 fetch_url_body() {
     local test_url="$1"
     local timeout="${2:-10}"
-    curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+
+    # Use torsocks if proxy is configured for Tor
+    if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
+        torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+    else
+        curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+    fi
 }
 
 fetch_url_prefix() {
     local test_url="$1"
     local timeout="${2:-10}"
-    curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+
+    # Use torsocks if proxy is configured for Tor
+    if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
+        torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+    else
+        curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+    fi
 }
 
 check_hls_playlist_fresh() {

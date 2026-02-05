@@ -11,6 +11,10 @@ stream_url="http://vlc.news:9000/166063150075/508173937110/1404"
 stream_url_backup1="https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/master.m3u8"
 stream_url_backup2=""
 
+# Configure Tor proxy for seenshow.com URLs (geo-blocked)
+YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
+export YTDLP_PROXY
+
 rtmp_url="/var/www/html/stream/hls/almajd-3aamah/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-3aamah/master.m3u8"
 scale=4

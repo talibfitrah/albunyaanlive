@@ -11,6 +11,10 @@ stream_url="http://vlc.news:9000/828906198094/071131245596/1408"
 stream_url_backup1="https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/master.m3u8"
 stream_url_backup2=""
 
+# Configure Tor proxy for seenshow.com URLs (geo-blocked)
+YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
+export YTDLP_PROXY
+
 rtmp_url="/var/www/html/stream/hls/almajd-islamic-science/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-islamic-science/master.m3u8"
 scale=0

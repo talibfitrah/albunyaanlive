@@ -8,8 +8,12 @@ stream_name="elkhatabi5/39u7j5t14h/77333"
 stream_url="http://ts3.eagtop.vip:80/elkhatabi5/39u7j5t14h/77333"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/master.m3u8"
+stream_url_backup1="https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/3.m3u8"
 stream_url_backup2=""
+
+# Configure Tor proxy for seenshow.com URLs (geo-blocked)
+YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
+export YTDLP_PROXY
 
 rtmp_url="/var/www/html/stream/hls/rawdah/master.m3u8"
 stream_id="/var/www/html/stream/hls/rawdah/master.m3u8"
