@@ -21,7 +21,7 @@ stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/sunnah/master.m3u8"
 stream_id="/var/www/html/stream/hls/sunnah/master.m3u8"
-scale=3
+scale=12
 
 # Build backup URL string (pipe-separated)
 backup_urls=""
