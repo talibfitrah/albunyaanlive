@@ -11,6 +11,10 @@ stream_url="http://ts3.eagtop.vip:80/elkhatabi8/bneb5gifvk/77337"
 stream_url_backup1="https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/master.m3u8"
 stream_url_backup2=""
 
+# Configure Tor proxy for seenshow.com URLs (geo-blocked)
+YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
+export YTDLP_PROXY
+
 rtmp_url="/var/www/html/stream/hls/almajd-documentary/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-documentary/master.m3u8"
 scale=4
