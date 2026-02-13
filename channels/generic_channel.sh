@@ -173,7 +173,17 @@ printf "Command: "
 printf "%q " "${cmd[@]}"
 printf "\n"
 
-# Execute the command in background
+# Execute the command in background, then wait so systemd tracks the full lifetime
 "${cmd[@]}" &
+child_pid=$!
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Channel $channel_id launched with PID $!"
+# Forward TERM/INT from systemd to the child so try_start_stream.sh can clean up
+trap 'kill -TERM "$child_pid" 2>/dev/null' TERM
+trap 'kill -INT "$child_pid" 2>/dev/null' INT
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Channel $channel_id launched with PID $child_pid"
+
+# Wait for try_start_stream.sh to exit. Without this, generic_channel.sh exits
+# immediately and systemd restarts the service, creating overlapping instances
+# that fight over the same stream URL and lockdir.
+wait $child_pid

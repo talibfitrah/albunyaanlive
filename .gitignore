@@ -37,6 +37,19 @@ puppeteer-profile/
 *.ts
 *.m3u8
 
+# Cookies / credentials (sensitive)
+channels/provider_credentials.json
+channels/seenshow_credentials.json
+channels/.seenshow_cookies.json
+channels/*cookies.txt
+playlists/*.m3u
+
+# Auto-generated runtime cache (rebuilt by provider_sync every 30 min)
+channels/provider_catalog.json
+
+# Vendored external dependency (separate repo/workflow)
+channels/bgutil-pot-node/
+
 # GPG keys
 *.gpg
 

@@ -1,0 +1,31 @@
+[Unit]
+Description=YouTube Browser Resolver (albunyaan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels
+Environment=NODE_ENV=production
+Environment=YT_RESOLVER_PORT=8088
+Environment=YT_RESOLVER_HOST=127.0.0.1
+Environment=YT_RESOLVER_CHROME=/usr/bin/chromium-browser
+Environment=YT_RESOLVER_USER_DATA_DIR=/home/msa/.config/youtube-resolver-chrome
+Environment=YT_RESOLVER_MAX_SESSIONS=64
+Environment=YT_RESOLVER_SESSION_IDLE_SEC=21600
+# Optional bootstrap cookie file (used only when profile has no login yet):
+Environment=YT_RESOLVER_COOKIES=/home/msa/Development/scripts/albunyaan/channels/youtube_cookies.txt
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node /home/msa/Development/scripts/albunyaan/channels/youtube_browser_resolver_v2.js
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+ProtectSystem=strict
+PrivateTmp=true
+# NoNewPrivileges incompatible with snap-based Chromium (snap-confine needs cap_dac_override)
+ReadWritePaths=/home/msa/.config/youtube-resolver-chrome /home/msa/Development/scripts/albunyaan/channels /tmp
+
+[Install]
+WantedBy=multi-user.target

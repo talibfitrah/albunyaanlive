@@ -1,0 +1,19 @@
+[Unit]
+Description=YouTube POT Token Provider (bgutil)
+After=network.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+WorkingDirectory=/tmp
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/bgutil-pot server --port 4416
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

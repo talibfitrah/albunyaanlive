@@ -1,0 +1,32 @@
+[Unit]
+Description=IPTV Provider Sync Service (albunyaan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+# Override paths/settings via /etc/default/provider-sync or:
+#   systemctl edit provider-sync
+# Credential file is required and intentionally external to git history.
+EnvironmentFile=-/etc/default/provider-sync
+Environment=NODE_ENV=production
+Environment=PROVIDER_SYNC_PORT=8089
+Environment=PROVIDER_SYNC_HOST=127.0.0.1
+Environment=SYNC_INTERVAL_MS=1800000
+Environment=PROVIDER_BASE_DIR=/home/msa/Development/scripts/albunyaan/channels
+Environment=PROVIDER_CREDENTIALS_FILE=/etc/albunyaan/provider_credentials.json
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/sh -c 'exec node "${PROVIDER_BASE_DIR}/provider_sync.js"'
+WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels
+Restart=always
+RestartSec=10
+ProtectSystem=strict
+PrivateTmp=true
+# NoNewPrivileges disabled: provider_sync needs sudo for graceful_restart.sh
+NoNewPrivileges=false
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels /var/www/html/stream/hls /run/sudo
+
+[Install]
+WantedBy=multi-user.target

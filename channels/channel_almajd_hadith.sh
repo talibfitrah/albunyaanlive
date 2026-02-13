@@ -5,7 +5,7 @@
 # =============================================================================
 
 stream_name="034120793341/390247405461/1406"
-stream_url="http://vlc.news:9000/034120793341/390247405461/1406"
+stream_url="http://vlc.news:80/034120793341/390247405461/1406"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/2474"

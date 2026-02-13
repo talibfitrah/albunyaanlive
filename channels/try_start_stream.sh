@@ -10,7 +10,7 @@
 #
 # NEW Features:
 #   - [PRIMARY_FALLBACK] Auto-switch back to primary URL when it recovers
-#     * Checks primary every 5 minutes when running on backup
+#     * Checks primary every 60 minutes when running on backup (default)
 #     * Smooth transition without stream interruption
 #   - [HOT_RELOAD] Live config updates without restart
 #     * Monitors channel config file for changes (every 60s)
@@ -69,8 +69,24 @@ config_file=""
 PRIMARY_CHECK_INTERVAL="${PRIMARY_CHECK_INTERVAL:-3600}"  # Default: check primary every 60 minutes (3600 seconds)
 PRIMARY_HLS_CHECK_DELAY="${PRIMARY_HLS_CHECK_DELAY:-8}"  # Seconds between HLS playlist samples
 PRIMARY_HLS_MAX_WAIT="${PRIMARY_HLS_MAX_WAIT:-15}"       # Cap HLS sample wait to avoid long stalls
+PRIMARY_RESTORE_CONFIRMATIONS="${PRIMARY_RESTORE_CONFIRMATIONS:-2}"  # Require N successful checks before switching back
+PRIMARY_RESTORE_MEDIA_PROBE="${PRIMARY_RESTORE_MEDIA_PROBE:-1}"      # 1=probe media decode with ffprobe before restore
+PRIMARY_RESTORE_MEDIA_PROBE_TIMEOUT="${PRIMARY_RESTORE_MEDIA_PROBE_TIMEOUT:-12}"  # Seconds
+PRIMARY_HOTSWAP_ENABLE="${PRIMARY_HOTSWAP_ENABLE:-1}"    # 1=use graceful handoff on failback (no-cut)
+PRIMARY_HOTSWAP_TIMEOUT="${PRIMARY_HOTSWAP_TIMEOUT:-180}"  # Timeout for graceful handoff script
+PRIMARY_HOTSWAP_COOLDOWN="${PRIMARY_HOTSWAP_COOLDOWN:-600}"  # Min seconds between handoff attempts
+PRIMARY_HOTSWAP_SCRIPT="${PRIMARY_HOTSWAP_SCRIPT:-$SCRIPT_DIR/graceful_restart.sh}"
+URL_HOTSWAP_ENABLE="${URL_HOTSWAP_ENABLE:-1}"  # 1=use graceful handoff for failover URL switches
+URL_HOTSWAP_TIMEOUT="${URL_HOTSWAP_TIMEOUT:-180}"  # Timeout for failover handoff
+URL_HOTSWAP_COOLDOWN="${URL_HOTSWAP_COOLDOWN:-90}"  # Min seconds between failover handoff attempts
+URL_HOTSWAP_SCRIPT="${URL_HOTSWAP_SCRIPT:-$PRIMARY_HOTSWAP_SCRIPT}"
+TRY_START_INITIAL_URL_INDEX="${TRY_START_INITIAL_URL_INDEX:-${INITIAL_URL_INDEX:-}}"  # Optional startup URL index override
+TRY_START_ADOPT_LOCK="${TRY_START_ADOPT_LOCK:-0}"  # 1=adopt pre-existing lock (graceful handoff only)
 CONFIG_CHECK_INTERVAL="${CONFIG_CHECK_INTERVAL:-60}"     # Default: check config file every 60 seconds
 last_primary_check=0
+primary_restore_confirm_count=0
+last_primary_hotswap_attempt=0
+last_url_hotswap_attempt=0
 last_config_check=0
 config_file_mtime=0
 
@@ -116,6 +132,21 @@ YOUTUBE_BROWSER_RESOLVER_TIMEOUT="${YOUTUBE_BROWSER_RESOLVER_TIMEOUT:-6}"
 YOUTUBE_BROWSER_RESOLVER_COOLDOWN="${YOUTUBE_BROWSER_RESOLVER_COOLDOWN:-300}"
 last_browser_resolver_failure=0
 
+# Seenshow token resolver integration
+SEENSHOW_RESOLVER_URL="${SEENSHOW_RESOLVER_URL:-http://127.0.0.1:8090}"
+SEENSHOW_RESOLVER_TIMEOUT="${SEENSHOW_RESOLVER_TIMEOUT:-8}"
+SEENSHOW_TOKEN_MARGIN="${SEENSHOW_TOKEN_MARGIN:-21600}"   # Refresh when token has <=6h left
+SEENSHOW_RESOLVE_RETRIES="${SEENSHOW_RESOLVE_RETRIES:-2}"
+SEENSHOW_SLOT_TOUCH_INTERVAL="${SEENSHOW_SLOT_TOUCH_INTERVAL:-60}"  # Keep semaphore slot alive while streaming
+SEENSHOW_ENABLE_RESOLVER="${SEENSHOW_ENABLE_RESOLVER:-1}"
+seenshow_slot_held=0
+seenshow_last_touch=0
+
+# Aloula/KwikMotion resolver (aloula.sba.sa public API)
+ALOULA_API_BASE="${ALOULA_API_BASE:-https://aloula.faulio.com/api/v1.1}"
+ALOULA_TOKEN_MARGIN="${ALOULA_TOKEN_MARGIN:-3600}"  # Refresh when token has <=1h left (tokens last ~24h)
+ALOULA_RESOLVE_TIMEOUT="${ALOULA_RESOLVE_TIMEOUT:-10}"
+
 # =============================================================================
 # NEW: Per-channel rate limit protection
 # =============================================================================
@@ -138,7 +169,6 @@ tor_socks_unreachable_warned=0
 # url_original[i]       - Original YouTube URL (for re-resolution)
 # url_general_url[i]    - Associated general URL (for specific URLs that have a general fallback)
 # url_expire_time[i]    - Unix timestamp when resolved URL expires
-# url_stream_ended[i]   - 1 if stream ended (for specific URLs), triggers general URL re-fetch
 
 # User-Agent string (used by both ffmpeg and curl preflight for consistency)
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -187,7 +217,7 @@ while getopts 'hu:d:k:n:s:b:c:' OPTION; do
             echo "    - If channel URL is in the URL, general URL is auto-derived"
             echo ""
             echo "Features:"
-            echo "  - Auto-fallback to primary URL when it recovers (every 5 min check)"
+            echo "  - Auto-fallback to primary URL when it recovers (default: every 60 min)"
             echo "  - Hot-reload: updates backup URLs from config file without restart"
             echo "  - YouTube stream-end detection with automatic re-fetch"
             echo "  - General YouTube URLs auto-refresh when broadcast changes"
@@ -206,6 +236,9 @@ while getopts 'hu:d:k:n:s:b:c:' OPTION; do
             ;;
     esac
 done
+
+# Backwards-compatibility: -k is accepted but currently unused by this runner.
+: "${key:=}"
 
 # Validate required arguments
 if [[ -z $url || -z $destination ]]; then
@@ -237,6 +270,14 @@ fi
 # Use channel_name for display only, channel_id for filesystem operations
 if [[ -z "$channel_name" ]]; then
     channel_name="$channel_id"
+fi
+
+# Keep semaphore accounting tied to canonical live channel identity, even for
+# temporary handoff runners (e.g., .graceful_<channel_id>).
+SEENSHOW_SLOT_CHANNEL_ID="${SEENSHOW_SLOT_CHANNEL_ID:-$channel_id}"
+if [[ ! "$SEENSHOW_SLOT_CHANNEL_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "WARN: Invalid SEENSHOW_SLOT_CHANNEL_ID '$SEENSHOW_SLOT_CHANNEL_ID'; using '$channel_id'" >&2
+    SEENSHOW_SLOT_CHANNEL_ID="$channel_id"
 fi
 
 # =============================================================================
@@ -274,6 +315,7 @@ errorfile="$logfile_dir/${channel_id}.error.log"
 pidfile="/tmp/stream_${channel_id}.pid"
 lockdir="/tmp/stream_${channel_id}.lock"
 ffmpeg_pid=""
+last_ffmpeg_pid=""
 proxy_pid=""
 stream_fifo=""
 
@@ -366,13 +408,15 @@ log() {
 
 log_error() {
     log_maintenance
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local msg
+    msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$msg" >> "$errorfile"
     echo "$msg" >> "$logfile"
 }
 
 log_console() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local msg
+    msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$msg"
     log_maintenance
     echo "$msg" >> "$logfile"
@@ -439,8 +483,14 @@ needs_https_proxy() {
     local scheme
     scheme=$(get_url_scheme "$url")
 
-    # Need proxy if: URL is HTTPS and ffmpeg doesn't support HTTPS
-    [[ "$scheme" == "https" && "$FFMPEG_HAS_HTTPS" -eq 0 ]]
+    # Need proxy if URL is HTTPS and:
+    # 1) ffmpeg lacks native HTTPS support, OR
+    # 2) source is known to require browser-like/proxied fetch semantics.
+    [[ "$scheme" == "https" ]] || return 1
+    if is_seenshow_url "$url"; then
+        return 0
+    fi
+    [[ "$FFMPEG_HAS_HTTPS" -eq 0 ]]
 }
 
 # =============================================================================
@@ -569,6 +619,13 @@ cleanup_orphaned_error_files() {
 cleanup_orphaned_error_files
 
 cleanup_done=0
+preserve_runtime_markers=0
+
+mark_successful_handoff_exit() {
+    local reason="${1:-handoff}"
+    preserve_runtime_markers=1
+    log "HANDOFF_SUCCESS: Preserving pid/lock markers for replacement runner ($reason)"
+}
 
 # Cleanup function
 cleanup() {
@@ -591,30 +648,37 @@ cleanup() {
     if [[ -n "$ffmpeg_pid" ]] && kill -0 "$ffmpeg_pid" 2>$DEVNULL; then
         log "[$channel_id] Cleanup: stopping FFmpeg PID $ffmpeg_pid"
         kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
-        for i in {1..10}; do
-            if ! kill -0 "$ffmpeg_pid" 2>$DEVNULL; then
-                break
-            fi
-            sleep 1
-        done
-        if kill -0 "$ffmpeg_pid" 2>$DEVNULL; then
+        # Stop any child proxy process attached to this FFmpeg process.
+        pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+
+        if ! wait_for_pid_exit "$ffmpeg_pid" 10; then
             log "[$channel_id] Cleanup: force killing FFmpeg PID $ffmpeg_pid"
             kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+            pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+            wait_for_pid_exit "$ffmpeg_pid" 3 || true
         fi
-        # Avoid hanging on wait if the PID is stuck or not a child (e.g., pipeline edge cases).
-        if ! kill -0 "$ffmpeg_pid" 2>$DEVNULL; then
+
+        # Best-effort reap, guarded to avoid indefinite waits.
+        if ! is_process_running "$ffmpeg_pid"; then
             wait "$ffmpeg_pid" 2>$DEVNULL || true
-        elif [[ -r "/proc/$ffmpeg_pid/stat" ]]; then
-            local state
-            state=$(awk '{print $3}' "/proc/$ffmpeg_pid/stat" 2>$DEVNULL || echo "")
-            if [[ "$state" == "Z" ]]; then
-                wait "$ffmpeg_pid" 2>$DEVNULL || true
-            fi
         fi
     fi
 
-    rm -f "$pidfile"
-    rmdir "$lockdir" 2>$DEVNULL
+    # Best-effort release of any active Seenshow semaphore slot.
+    if [[ $seenshow_slot_held -eq 1 && "$SEENSHOW_ENABLE_RESOLVER" == "1" && -n "$SEENSHOW_RESOLVER_URL" ]]; then
+        if command -v curl >$DEVNULL 2>&1; then
+            curl -A "$USER_AGENT" -sS --max-time "$SEENSHOW_RESOLVER_TIMEOUT" -X POST \
+                -H "Accept: application/json" "${SEENSHOW_RESOLVER_URL%/}/release/${SEENSHOW_SLOT_CHANNEL_ID}" >$DEVNULL 2>$DEVNULL || true
+        fi
+        seenshow_slot_held=0
+    fi
+
+    if [[ $preserve_runtime_markers -eq 1 ]]; then
+        log "[$channel_id] Cleanup: preserving pid/lock markers after successful handoff"
+    else
+        rm -f "$pidfile"
+        rmdir "$lockdir" 2>$DEVNULL
+    fi
     # Cleanup any error file for this process
     rm -f "/tmp/ffmpeg_error_${channel_id}_$$.log" 2>$DEVNULL
     # Cleanup stream FIFO if it exists
@@ -636,10 +700,18 @@ on_term() {
 trap on_term TERM INT
 trap cleanup EXIT
 
-# Acquire lock (atomic using mkdir)
-if ! mkdir "$lockdir" 2>$DEVNULL; then
-    log_console "[$channel_id] Another instance is already running (lock exists). Exiting."
-    exit 0
+# Acquire lock (atomic using mkdir), unless handoff explicitly requests lock adoption.
+lock_adopted=0
+if [[ "$TRY_START_ADOPT_LOCK" == "1" && -d "$lockdir" ]]; then
+    lock_adopted=1
+    log "LOCK: Adopting existing lock directory for graceful handoff"
+fi
+
+if [[ $lock_adopted -eq 0 ]]; then
+    if ! mkdir "$lockdir" 2>$DEVNULL; then
+        log_console "[$channel_id] Another instance is already running (lock exists). Exiting."
+        exit 0
+    fi
 fi
 
 # Write PID file
@@ -653,6 +725,9 @@ prune_old_segments force
 log "=== Stream Manager Started ==="
 log "channel_id (filesystem): $channel_id"
 log "channel_name (display): $channel_name"
+if [[ "$SEENSHOW_SLOT_CHANNEL_ID" != "$channel_id" ]]; then
+    log "SEENSHOW slot identity override: $SEENSHOW_SLOT_CHANNEL_ID"
+fi
 log "destination: $destination"
 log "pidfile: $pidfile"
 log "lockdir: $lockdir"
@@ -667,7 +742,9 @@ declare -a url_youtube_type
 declare -a url_original
 declare -a url_general_url
 declare -a url_expire_time
-declare -a url_stream_ended
+declare -a url_is_seenshow
+declare -a url_seenshow_hls_path
+declare -a url_seenshow_expiry
 
 # First, build the raw URL array
 primary_url="$url"  # Store original primary for fallback checks
@@ -683,6 +760,15 @@ if [[ -n "$backup_urls" ]]; then
     done
 fi
 url_count=${#url_array[@]}
+
+requested_start_url_index=0
+if [[ -n "$TRY_START_INITIAL_URL_INDEX" ]]; then
+    if [[ "$TRY_START_INITIAL_URL_INDEX" =~ ^[0-9]+$ && "$TRY_START_INITIAL_URL_INDEX" -lt "$url_count" ]]; then
+        requested_start_url_index="$TRY_START_INITIAL_URL_INDEX"
+    else
+        log_error "START_INDEX: Ignoring invalid TRY_START_INITIAL_URL_INDEX='$TRY_START_INITIAL_URL_INDEX' (url_count=$url_count)"
+    fi
+fi
 
 # NOTE: YouTube metadata initialization moved to after function definitions (see below)
 
@@ -923,7 +1009,6 @@ build_youtube_general_url() {
 # =============================================================================
 
 ytdlp_throttle_acquire() {
-    local lock_fd=200
     local now last_call wait_time
 
     # Create lock file if it doesn't exist
@@ -932,6 +1017,7 @@ ytdlp_throttle_acquire() {
     # Acquire exclusive lock (wait up to 60 seconds)
     exec 200>"$YTDLP_LOCK_FILE"
     if ! flock -w 60 200; then
+        exec 200>&- 2>$DEVNULL || true
         log_error "YTDLP_THROTTLE: Failed to acquire lock after 60s"
         return 1
     fi
@@ -980,11 +1066,13 @@ declare -A channel_failure_count
 
 ytdlp_channel_can_call() {
     # Check if this channel is allowed to make a yt-dlp call (cooldown check)
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     local ts_file="${YTDLP_CHANNEL_TIMESTAMP_DIR}/${channel_id}"
 
     if [[ -f "$ts_file" ]]; then
-        local last_call=$(cat "$ts_file" 2>$DEVNULL || echo 0)
+        local last_call
+        last_call=$(cat "$ts_file" 2>$DEVNULL || echo 0)
         if [[ "$last_call" =~ ^[0-9]+$ ]]; then
             local elapsed=$((now - last_call))
             if [[ $elapsed -lt $YTDLP_CHANNEL_COOLDOWN ]]; then
@@ -1022,7 +1110,7 @@ ytdlp_get_failure_backoff() {
         backoff=$YTDLP_FAILURE_BACKOFF_MAX
     fi
 
-    echo $backoff
+    echo "$backoff"
 }
 
 ytdlp_record_failure() {
@@ -1030,7 +1118,8 @@ ytdlp_record_failure() {
     local current=${channel_failure_count[$channel_id]:-0}
     channel_failure_count[$channel_id]=$((current + 1))
 
-    local backoff=$(ytdlp_get_failure_backoff)
+    local backoff
+    backoff=$(ytdlp_get_failure_backoff)
     if [[ $backoff -gt 0 ]]; then
         log "YTDLP_BACKOFF: Channel $channel_id failure #${channel_failure_count[$channel_id]}, backing off ${backoff}s"
         sleep "$backoff"
@@ -1116,6 +1205,510 @@ should_use_torsocks() {
     return 0
 }
 
+is_seenshow_url() {
+    local url="$1"
+    [[ "$url" =~ ^https?://live\.seenshow\.com(/|$) ]]
+}
+
+url_decode() {
+    local encoded="$1"
+    encoded="${encoded//+/ }"
+    printf '%b' "${encoded//%/\\x}" 2>$DEVNULL || printf '%s' "$1"
+}
+
+extract_seenshow_hls_path() {
+    local url="$1"
+    # Accept both:
+    #   /hls/live/<id>/<name>/master.m3u8?hdntl=...
+    #   /hls/live/<id>/<name>/hdntl=.../3.m3u8
+    if [[ "$url" =~ ^https?://live\.seenshow\.com/hls/live/([^/?#]+/[^/?#]+)/(hdnt[ls]=[^/]+/)?[^/?#]+\.m3u8([?#].*)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+extract_seenshow_expiry() {
+    local url="$1"
+
+    if [[ "$url" =~ [\?\&]exp=([0-9]{9,}) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$url" =~ [\?\&]hdntl=([^&]+) ]]; then
+        local hdntl_raw="${BASH_REMATCH[1]}"
+        local hdntl_decoded
+        hdntl_decoded=$(url_decode "$hdntl_raw")
+        if [[ "$hdntl_decoded" =~ (^|~)exp=([0-9]{9,}) ]]; then
+            echo "${BASH_REMATCH[2]}"
+            return 0
+        fi
+    fi
+
+    if [[ "$url" =~ /hdntl=([^/]+) ]]; then
+        local hdntl_path_raw="${BASH_REMATCH[1]}"
+        local hdntl_path_decoded
+        hdntl_path_decoded=$(url_decode "$hdntl_path_raw")
+        if [[ "$hdntl_path_decoded" =~ (^|~)exp=([0-9]{9,}) ]]; then
+            echo "${BASH_REMATCH[2]}"
+            return 0
+        fi
+    fi
+
+    if [[ "$url" =~ [\?\&]hdnts=([^&]+) ]]; then
+        local hdnts_raw="${BASH_REMATCH[1]}"
+        local hdnts_decoded
+        hdnts_decoded=$(url_decode "$hdnts_raw")
+        if [[ "$hdnts_decoded" =~ (^|~)exp=([0-9]{9,}) ]]; then
+            echo "${BASH_REMATCH[2]}"
+            return 0
+        fi
+    fi
+
+    local decoded_url
+    decoded_url=$(url_decode "$url")
+    if [[ "$decoded_url" =~ (^|[\?\&~])exp=([0-9]{9,}) ]]; then
+        echo "${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    if [[ "$decoded_url" =~ exp=([0-9]{9,}) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    echo "0"
+    return 1
+}
+
+init_url_seenshow_metadata() {
+    local index="$1"
+    local url="$2"
+
+    if is_seenshow_url "$url"; then
+        url_is_seenshow[$index]=1
+        url_seenshow_hls_path[$index]=$(extract_seenshow_hls_path "$url" || true)
+        local expiry=0
+        expiry=$(extract_seenshow_expiry "$url" || echo 0)
+        [[ "$expiry" =~ ^[0-9]+$ ]] || expiry=0
+        url_seenshow_expiry[$index]="$expiry"
+    else
+        url_is_seenshow[$index]=0
+        url_seenshow_hls_path[$index]=""
+        url_seenshow_expiry[$index]=0
+    fi
+}
+
+seenshow_resolver_enabled() {
+    [[ "$SEENSHOW_ENABLE_RESOLVER" == "1" ]] || return 1
+    [[ -n "$SEENSHOW_RESOLVER_URL" ]] || return 1
+    command -v curl >$DEVNULL 2>&1 || return 1
+    return 0
+}
+
+seenshow_call_resolver() {
+    local method="$1"
+    local route="$2"
+    local endpoint="${SEENSHOW_RESOLVER_URL%/}${route}"
+    curl -A "$USER_AGENT" -sS --max-time "$SEENSHOW_RESOLVER_TIMEOUT" -X "$method" \
+        -H "Accept: application/json" "$endpoint" 2>$DEVNULL
+}
+
+seenshow_release_slot() {
+    if [[ $seenshow_slot_held -eq 0 ]]; then
+        return 0
+    fi
+
+    if seenshow_resolver_enabled; then
+        seenshow_call_resolver "POST" "/release/${SEENSHOW_SLOT_CHANNEL_ID}" >$DEVNULL || true
+    fi
+    seenshow_slot_held=0
+    seenshow_last_touch=0
+    log "SEENSHOW: Released resolver slot for ${SEENSHOW_SLOT_CHANNEL_ID} (runner: $channel_id)"
+    return 0
+}
+
+seenshow_acquire_slot_if_needed() {
+    local index="$1"
+    # Enforce resolver slot accounting for every active Seenshow stream, including
+    # Seenshow-as-primary channels. This keeps account-level concurrency bounded.
+    if [[ $seenshow_slot_held -eq 1 ]]; then
+        return 0
+    fi
+    if ! seenshow_resolver_enabled; then
+        log_error "SEENSHOW: Resolver unavailable; cannot acquire slot for URL index $index"
+        return 1
+    fi
+
+    local response
+    response=$(seenshow_call_resolver "POST" "/acquire/${SEENSHOW_SLOT_CHANNEL_ID}") || {
+        log_error "SEENSHOW: Acquire request failed for ${SEENSHOW_SLOT_CHANNEL_ID}"
+        return 1
+    }
+
+    if echo "$response" | grep -qiE '"granted"[[:space:]]*:[[:space:]]*true'; then
+        seenshow_slot_held=1
+        seenshow_last_touch=$(date +%s)
+        log "SEENSHOW: Acquired resolver slot for ${SEENSHOW_SLOT_CHANNEL_ID} (runner: $channel_id)"
+        return 0
+    fi
+
+    local reason
+    reason=$(echo "$response" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' | head -1)
+    [[ -z "$reason" ]] && reason="unknown"
+    log_error "SEENSHOW: Slot denied for ${SEENSHOW_SLOT_CHANNEL_ID} (runner: $channel_id, reason: $reason)"
+    return 1
+}
+
+seenshow_touch_slot_if_needed() {
+    if [[ $seenshow_slot_held -ne 1 ]]; then
+        return 0
+    fi
+    if ! seenshow_resolver_enabled; then
+        return 1
+    fi
+
+    local now elapsed
+    now=$(date +%s)
+    elapsed=$((now - seenshow_last_touch))
+    if [[ $elapsed -lt "$SEENSHOW_SLOT_TOUCH_INTERVAL" ]]; then
+        return 0
+    fi
+
+    local response
+    response=$(seenshow_call_resolver "POST" "/acquire/${SEENSHOW_SLOT_CHANNEL_ID}") || {
+        log_error "SEENSHOW: Slot heartbeat failed for ${SEENSHOW_SLOT_CHANNEL_ID} (request error)"
+        return 1
+    }
+
+    if echo "$response" | grep -qiE '"granted"[[:space:]]*:[[:space:]]*true'; then
+        seenshow_last_touch=$now
+        return 0
+    fi
+
+    local reason
+    reason=$(echo "$response" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' | head -1)
+    [[ -z "$reason" ]] && reason="unknown"
+    log_error "SEENSHOW: Slot heartbeat denied for ${SEENSHOW_SLOT_CHANNEL_ID} (reason: $reason)"
+    return 1
+}
+
+seenshow_token_needs_refresh() {
+    local index="$1"
+    local now
+    now=$(date +%s)
+    local expiry="${url_seenshow_expiry[$index]:-0}"
+    [[ "$expiry" =~ ^[0-9]+$ ]] || expiry=0
+
+    if [[ "${url_array[$index]}" != *"hdntl="* ]]; then
+        return 0
+    fi
+    if [[ "$expiry" -le 0 ]]; then
+        return 0
+    fi
+    if [[ $((expiry - now)) -le "$SEENSHOW_TOKEN_MARGIN" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+resolve_seenshow_url_for_index() {
+    local index="$1"
+    local hls_path="${url_seenshow_hls_path[$index]}"
+    if [[ -z "$hls_path" ]]; then
+        hls_path=$(extract_seenshow_hls_path "${url_array[$index]}" || true)
+        url_seenshow_hls_path[$index]="$hls_path"
+    fi
+    if [[ -z "$hls_path" ]]; then
+        log_error "SEENSHOW: Could not parse hls_path for URL index $index"
+        return 1
+    fi
+    if ! seenshow_resolver_enabled; then
+        log_error "SEENSHOW: Resolver disabled/unavailable for URL index $index"
+        return 1
+    fi
+
+    local response
+    response=$(seenshow_call_resolver "GET" "/resolve/${hls_path}") || {
+        log_error "SEENSHOW: Resolve request failed for path $hls_path"
+        return 1
+    }
+
+    local resolved_url
+    resolved_url=$(printf '%s' "$response" \
+        | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' \
+        | head -1 \
+        | sed 's#\\/#/#g')
+
+    if [[ ! "$resolved_url" =~ ^https?:// ]]; then
+        local err
+        err=$(printf '%s' "$response" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' | head -1)
+        [[ -z "$err" ]] && err="invalid_response"
+        log_error "SEENSHOW: Resolver returned no URL for index $index ($err)"
+        return 1
+    fi
+
+    url_array[$index]="$resolved_url"
+    init_url_seenshow_metadata "$index" "$resolved_url"
+
+    local expiry="${url_seenshow_expiry[$index]:-0}"
+    if [[ "$expiry" =~ ^[0-9]+$ && "$expiry" -gt 0 ]]; then
+        local expiry_date
+        expiry_date=$(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expiry" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
+        log "SEENSHOW: Refreshed tokenized URL for index $index (expires at $expiry_date)"
+    else
+        log "SEENSHOW: Refreshed URL for index $index (expiry unknown)"
+    fi
+    return 0
+}
+
+prepare_seenshow_url_for_index() {
+    local index="$1"
+    if [[ "${url_is_seenshow[$index]:-0}" != "1" ]]; then
+        return 0
+    fi
+
+    if ! seenshow_acquire_slot_if_needed "$index"; then
+        return 1
+    fi
+
+    if seenshow_token_needs_refresh "$index"; then
+        local attempt
+        for attempt in $(seq 1 "$SEENSHOW_RESOLVE_RETRIES"); do
+            if resolve_seenshow_url_for_index "$index"; then
+                return 0
+            fi
+            if [[ "$attempt" -lt "$SEENSHOW_RESOLVE_RETRIES" ]]; then
+                sleep 1
+            fi
+        done
+        return 1
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# Aloula/KwikMotion resolver
+# =============================================================================
+# Uses the public aloula.sba.sa CMS API to get tokenized KwikMotion stream URLs.
+# Backup URLs use aloula:<channel_id> scheme (e.g., aloula:7 for Quran TV).
+# The API returns a master playlist with short-lived token (~12s), but inside
+# are variant stream URLs with ~24h tokens. We extract the highest quality
+# variant URL and use it directly with FFmpeg.
+#
+# Channel IDs:  7 = qurantvsa (القرآن الكريم)
+#               6 = sunnatvsa (السنة النبوية)
+# =============================================================================
+
+is_aloula_url() {
+    local url="$1"
+    [[ "$url" =~ ^aloula:[0-9]+$ ]]
+}
+
+extract_aloula_channel_id() {
+    local url="$1"
+    if [[ "$url" =~ ^aloula:([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+is_kwikmotion_url() {
+    local url="$1"
+    [[ "$url" =~ ^https?://live\.kwikmotion\.com/ ]]
+}
+
+extract_kwikmotion_expiry() {
+    local url="$1"
+    # Check hdntl= path token (used in variant URLs)
+    # Uses sed instead of grep -P for portability (grep -P unavailable on BusyBox/Alpine)
+    if [[ "$url" =~ /hdntl= ]]; then
+        local hdntl_segment
+        hdntl_segment=$(printf '%s' "$url" | sed -n 's|.*/hdntl=\([^/]*\).*|\1|p' | head -1)
+        if [[ -n "$hdntl_segment" ]]; then
+            local decoded
+            decoded=$(url_decode "$hdntl_segment")
+            if [[ "$decoded" =~ (^|~)exp=([0-9]{9,}) ]]; then
+                echo "${BASH_REMATCH[2]}"
+                return 0
+            fi
+        fi
+    fi
+    # Check hdnts= query token (used in master playlist URL)
+    if [[ "$url" =~ [\?\&]hdnts= ]]; then
+        local hdnts_val
+        hdnts_val=$(printf '%s' "$url" | sed -n 's|.*[?&]hdnts=\([^&]*\).*|\1|p' | head -1)
+        if [[ -n "$hdnts_val" ]]; then
+            local decoded
+            decoded=$(url_decode "$hdnts_val")
+            if [[ "$decoded" =~ (^|~)exp=([0-9]{9,}) ]]; then
+                echo "${BASH_REMATCH[2]}"
+                return 0
+            fi
+        fi
+    fi
+    echo "0"
+    return 1
+}
+
+# Resolve an HLS variant URI against a master playlist URL.
+# Handles three URI forms per RFC 8216:
+#   1. Absolute URI (https://...) — used as-is
+#   2. Absolute path (/path/...) — joined with scheme+host from master
+#   3. Relative path (file.m3u8)  — joined with base directory of master (query stripped)
+_resolve_hls_variant_url() {
+    local master_url="$1"
+    local variant_path="$2"
+    local resolved_url
+    if [[ "$variant_path" =~ ^https?:// ]]; then
+        resolved_url="$variant_path"
+    elif [[ "$variant_path" =~ ^/ ]]; then
+        local origin
+        origin=$(printf '%s' "$master_url" | sed -E 's#^(https?://[^/]+).*#\1#')
+        resolved_url="${origin}${variant_path}"
+    else
+        local base_url
+        base_url="${master_url%%\?*}"
+        base_url="${base_url%/*}/"
+        resolved_url="${base_url}${variant_path}"
+    fi
+    printf '%s' "$resolved_url"
+}
+
+resolve_aloula_url() {
+    local aloula_channel_id="$1"
+    local api_url="${ALOULA_API_BASE}/channels/${aloula_channel_id}/player"
+
+    local response
+    response=$(curl -sS --max-time "$ALOULA_RESOLVE_TIMEOUT" \
+        -H "Accept: application/json" "$api_url" 2>$DEVNULL) || {
+        log_error "ALOULA: API request failed for channel $aloula_channel_id"
+        return 1
+    }
+
+    # Extract HLS master playlist URL — prefer jq for robust JSON parsing,
+    # fall back to sed if jq is not installed.
+    local master_url
+    if command -v jq &>$DEVNULL; then
+        master_url=$(printf '%s' "$response" | jq -r '.hls // empty' 2>$DEVNULL)
+    fi
+    if [[ -z "$master_url" ]]; then
+        master_url=$(printf '%s' "$response" \
+            | sed -n 's/.*"hls"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -1 \
+            | sed 's|\\\/|/|g')
+    fi
+    if [[ -z "$master_url" || ! "$master_url" =~ ^https?:// ]]; then
+        log_error "ALOULA: No HLS URL in API response for channel $aloula_channel_id"
+        return 1
+    fi
+
+    # Fetch master playlist to get variant stream URLs with long-lived tokens
+    local master_content
+    master_content=$(curl -sS --max-time 5 "$master_url" 2>$DEVNULL) || {
+        log_error "ALOULA: Failed to fetch master playlist for channel $aloula_channel_id"
+        return 1
+    }
+
+    # Select highest-bandwidth variant by parsing #EXT-X-STREAM-INF BANDWIDTH.
+    # Falls back to the last URI line (HLS playlists list variants in ascending
+    # bandwidth order by convention) if BANDWIDTH parsing fails.
+    local variant_path best_bw=0
+    local prev_bw=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ BANDWIDTH=([0-9]+) ]]; then
+            prev_bw="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[^#] && -n "$line" ]]; then
+            if [[ $prev_bw -ge $best_bw ]]; then
+                best_bw=$prev_bw
+                variant_path="$line"
+            fi
+            prev_bw=0
+        fi
+    done <<< "$master_content"
+    # Final fallback: first non-comment line
+    if [[ -z "$variant_path" ]]; then
+        variant_path=$(echo "$master_content" | grep -v '^#' | grep -v '^$' | head -1)
+    fi
+    if [[ -z "$variant_path" ]]; then
+        log_error "ALOULA: No variant streams in master playlist for channel $aloula_channel_id"
+        return 1
+    fi
+
+    local resolved_url
+    resolved_url=$(_resolve_hls_variant_url "$master_url" "$variant_path")
+
+    echo "$resolved_url"
+    return 0
+}
+
+resolve_aloula_url_for_index() {
+    local index="$1"
+    local original="${url_original[$index]}"
+    local aloula_ch_id
+    aloula_ch_id=$(extract_aloula_channel_id "$original") || {
+        log_error "ALOULA: Cannot extract channel ID from ${original}"
+        return 1
+    }
+
+    local resolved
+    resolved=$(resolve_aloula_url "$aloula_ch_id") || return 1
+
+    url_array[$index]="$resolved"
+
+    local expiry
+    expiry=$(extract_kwikmotion_expiry "$resolved" || echo 0)
+    [[ "$expiry" =~ ^[0-9]+$ ]] || expiry=0
+    url_expire_time[$index]="$expiry"
+
+    if [[ "$expiry" -gt 0 ]]; then
+        local expiry_date
+        expiry_date=$(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expiry" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
+        log "ALOULA: Resolved channel $aloula_ch_id for index $index → $(echo "$resolved" | head -c 80)... (expires $expiry_date)"
+    else
+        log "ALOULA: Resolved channel $aloula_ch_id for index $index (expiry unknown)"
+    fi
+    return 0
+}
+
+aloula_token_needs_refresh() {
+    local index="$1"
+    local now
+    now=$(date +%s)
+    local expiry="${url_expire_time[$index]:-0}"
+    [[ "$expiry" =~ ^[0-9]+$ ]] || expiry=0
+
+    if [[ "$expiry" -le 0 ]]; then
+        return 0  # Unknown expiry → refresh
+    fi
+    if [[ $((expiry - now)) -le "$ALOULA_TOKEN_MARGIN" ]]; then
+        return 0  # Within margin → refresh
+    fi
+    return 1  # Still fresh
+}
+
+prepare_aloula_url_for_index() {
+    local index="$1"
+    local original="${url_original[$index]}"
+    if ! is_aloula_url "$original"; then
+        return 0
+    fi
+
+    if aloula_token_needs_refresh "$index"; then
+        log "ALOULA: Token refresh needed for index $index"
+        if resolve_aloula_url_for_index "$index"; then
+            return 0
+        fi
+        log_error "ALOULA: Failed to refresh token for index $index"
+        return 1
+    fi
+
+    return 0
+}
+
 set_streamlink_args() {
     local url="$1"
 
@@ -1138,6 +1731,15 @@ set_streamlink_args() {
         streamlink_args=(streamlink --stdout)
         [[ -n "$YTDLP_PROXY" ]] && streamlink_args+=(--http-proxy "$YTDLP_PROXY")
     fi
+
+    # live.seenshow.com frequently enforces browser-like header checks.
+    # Keep these headers centralized so all seenshow fallbacks behave uniformly.
+    if is_seenshow_url "$url"; then
+        streamlink_args+=(--http-header "User-Agent=$USER_AGENT")
+        streamlink_args+=(--http-header "Referer=https://live.seenshow.com/")
+        streamlink_args+=(--http-header "Origin=https://live.seenshow.com")
+    fi
+
     streamlink_args+=("$url" best)
 }
 
@@ -1181,7 +1783,7 @@ tor_rotate_circuit() {
 
     # Try to restart Tor service
     if command -v systemctl >$DEVNULL 2>&1; then
-        if SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl restart tor >$DEVNULL 2>&1; then
+        if SUDO_ASKPASS=~/.sudo_pass.sh sudo -A sh -c 'systemctl restart tor >/dev/null 2>&1'; then
             log "TOR_ROTATE: Tor service restarted successfully"
             echo "$now" > "$TOR_ROTATE_TIMESTAMP"
             tor_reset_failure_count
@@ -1382,8 +1984,28 @@ init_url_youtube_metadata() {
     local associated_general="${3:-}"  # Optional: associated general URL for specific URLs
     local is_startup="${4:-0}"         # Optional: 1 if called during startup (for stagger)
 
-    # Initialize all metadata fields
-    url_stream_ended[$index]=0
+    # Handle aloula: scheme URLs (resolve via aloula.sba.sa API)
+    if is_aloula_url "$url"; then
+        url_is_youtube[$index]=0
+        url_youtube_type[$index]=""
+        url_original[$index]="$url"
+        url_general_url[$index]=""
+        url_is_seenshow[$index]=0
+        url_seenshow_hls_path[$index]=""
+        url_seenshow_expiry[$index]=0
+
+        local aloula_ch_id
+        aloula_ch_id=$(extract_aloula_channel_id "$url")
+        log "ALOULA: Detected aloula:${aloula_ch_id} URL at index $index"
+
+        if resolve_aloula_url_for_index "$index"; then
+            return 0
+        else
+            log_error "ALOULA: Failed initial resolution for index $index, will retry before use"
+            url_expire_time[$index]=0
+            return 1
+        fi
+    fi
 
     if is_youtube_url "$url"; then
         local yt_type
@@ -1430,6 +2052,7 @@ init_url_youtube_metadata() {
 
             # Update url_array with resolved URL
             url_array[$index]="$resolved"
+            init_url_seenshow_metadata "$index" "${url_array[$index]}"
 
             local expire_date
             expire_date=$(date -d "@$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
@@ -1438,6 +2061,7 @@ init_url_youtube_metadata() {
         else
             log_error "YOUTUBE: Failed initial resolution for index $index, keeping original URL"
             url_expire_time[$index]=0
+            init_url_seenshow_metadata "$index" "${url_array[$index]}"
             # Keep original YouTube URL - ffmpeg will fail but failover will work
             return 1
         fi
@@ -1447,6 +2071,7 @@ init_url_youtube_metadata() {
         url_original[$index]="$url"
         url_general_url[$index]=""
         url_expire_time[$index]=0
+        init_url_seenshow_metadata "$index" "$url"
     fi
     return 0
 }
@@ -1531,7 +2156,6 @@ youtube_refetch_via_general() {
             expire_time=$(extract_youtube_expiry "$resolved")
             url_expire_time[$index]="$expire_time"
             url_array[$index]="$resolved"
-            url_stream_ended[$index]=0
             url_original[$index]="$general_url"
             url_youtube_type[$index]="general"
             url_general_url[$index]="$general_url"
@@ -1602,7 +2226,8 @@ check_youtube_stream_ended_and_refetch() {
 
 youtube_url_needs_refresh() {
     local index="$1"
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
 
     # Skip if not a YouTube URL
     if [[ "${url_is_youtube[$index]}" != "1" ]]; then
@@ -1660,7 +2285,8 @@ refresh_youtube_url() {
 }
 
 check_youtube_urls_need_refresh() {
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     local elapsed=$((now - last_youtube_check))
 
     # Only check every YOUTUBE_CHECK_INTERVAL seconds
@@ -1697,7 +2323,8 @@ check_youtube_urls_need_refresh() {
 }
 
 check_segment_staleness() {
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     local elapsed=$((now - last_segment_check))
 
     # Only check every SEGMENT_CHECK_INTERVAL seconds
@@ -1707,10 +2334,8 @@ check_segment_staleness() {
 
     last_segment_check=$now
 
-    # Only trigger failover if backups exist
-    if [[ $url_count -lt 2 ]]; then
-        return 1
-    fi
+    # Even with no backups, a stale output means FFmpeg is hung or the source is dead.
+    # The caller will restart FFmpeg on the current URL when no alternates exist.
 
     local output_dir
     output_dir=$(dirname "$destination")
@@ -1756,13 +2381,264 @@ check_segment_staleness() {
     return 1
 }
 
+reset_primary_restore_confirmation() {
+    local reason="${1:-}"
+    if [[ $primary_restore_confirm_count -gt 0 ]]; then
+        if [[ -n "$reason" ]]; then
+            log "PRIMARY_CHECK: Resetting restore confirmation streak (${primary_restore_confirm_count}) - $reason"
+        else
+            log "PRIMARY_CHECK: Resetting restore confirmation streak (${primary_restore_confirm_count})"
+        fi
+    fi
+    primary_restore_confirm_count=0
+}
+
+record_primary_restore_confirmation() {
+    local reason="$1"
+
+    if [[ "$PRIMARY_RESTORE_CONFIRMATIONS" -le 1 ]]; then
+        return 0
+    fi
+
+    primary_restore_confirm_count=$((primary_restore_confirm_count + 1))
+    if [[ $primary_restore_confirm_count -lt $PRIMARY_RESTORE_CONFIRMATIONS ]]; then
+        log "PRIMARY_CHECK: Primary looks healthy ($reason), confirmation ${primary_restore_confirm_count}/${PRIMARY_RESTORE_CONFIRMATIONS}. Keeping backup active."
+        return 1
+    fi
+
+    log "PRIMARY_CHECK: Confirmation ${primary_restore_confirm_count}/${PRIMARY_RESTORE_CONFIRMATIONS} reached ($reason)."
+    return 0
+}
+
+probe_primary_media_decode() {
+    local probe_url="$1"
+
+    if [[ "$PRIMARY_RESTORE_MEDIA_PROBE" != "1" ]]; then
+        return 0
+    fi
+
+    if ! command -v ffprobe >$DEVNULL 2>&1; then
+        log "PRIMARY_CHECK: ffprobe not found; skipping media decode probe."
+        return 0
+    fi
+
+    local probe_output=""
+    if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
+        probe_output=$(timeout "$PRIMARY_RESTORE_MEDIA_PROBE_TIMEOUT" \
+            torsocks ffprobe -v error -analyzeduration 3000000 -probesize 3000000 \
+            -user_agent "$USER_AGENT" -rw_timeout 8000000 \
+            -show_entries stream=codec_type -of csv=p=0 "$probe_url" 2>$DEVNULL || true)
+    else
+        probe_output=$(timeout "$PRIMARY_RESTORE_MEDIA_PROBE_TIMEOUT" \
+            ffprobe -v error -analyzeduration 3000000 -probesize 3000000 \
+            -user_agent "$USER_AGENT" -rw_timeout 8000000 \
+            -show_entries stream=codec_type -of csv=p=0 "$probe_url" 2>$DEVNULL || true)
+    fi
+
+    if echo "$probe_output" | grep -qE '(^|[[:space:],])(video|audio)($|[[:space:],])'; then
+        log "PRIMARY_CHECK: ffprobe decode probe passed."
+        return 0
+    fi
+
+    log "PRIMARY_CHECK: ffprobe decode probe failed (no audio/video stream detected)."
+    return 1
+}
+
+can_use_primary_hotswap() {
+    [[ "$PRIMARY_HOTSWAP_ENABLE" == "1" ]] || return 1
+    [[ "$channel_id" != .graceful_* ]] || return 1
+    [[ -n "$PRIMARY_HOTSWAP_SCRIPT" ]] || return 1
+    [[ -x "$PRIMARY_HOTSWAP_SCRIPT" ]] || return 1
+    return 0
+}
+
+run_primary_hotswap_handoff() {
+    if ! can_use_primary_hotswap; then
+        return 1
+    fi
+
+    local now
+    now=$(date +%s)
+    if [[ $last_primary_hotswap_attempt -gt 0 ]]; then
+        local elapsed=$((now - last_primary_hotswap_attempt))
+        if [[ $elapsed -lt $PRIMARY_HOTSWAP_COOLDOWN ]]; then
+            log "PRIMARY_HOTSWAP: Cooldown active (${elapsed}s/${PRIMARY_HOTSWAP_COOLDOWN}s). Keeping current stream."
+            return 1
+        fi
+    fi
+    last_primary_hotswap_attempt=$now
+
+    log "PRIMARY_HOTSWAP: Starting seamless handoff via ${PRIMARY_HOTSWAP_SCRIPT} ${channel_id}"
+    local rc=1
+    # Pass caller PID so graceful_restart can avoid killing this runner before
+    # handoff outcome is known.
+    if GRACEFUL_SKIP_CALLER_KILL=1 GRACEFUL_CALLER_PID="$$" \
+        timeout "$PRIMARY_HOTSWAP_TIMEOUT" "$PRIMARY_HOTSWAP_SCRIPT" "$channel_id" >> "$logfile" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+        log "PRIMARY_HOTSWAP: Handoff completed successfully"
+        return 0
+    fi
+
+    if [[ $rc -eq 124 ]]; then
+        log_error "PRIMARY_HOTSWAP: Handoff timed out after ${PRIMARY_HOTSWAP_TIMEOUT}s"
+    else
+        log_error "PRIMARY_HOTSWAP: Handoff failed with exit code $rc"
+    fi
+    return 1
+}
+
+can_use_url_hotswap() {
+    [[ "$URL_HOTSWAP_ENABLE" == "1" ]] || return 1
+    [[ "$channel_id" != .graceful_* ]] || return 1
+    [[ $url_count -gt 1 ]] || return 1
+    [[ -n "$URL_HOTSWAP_SCRIPT" ]] || return 1
+    [[ -x "$URL_HOTSWAP_SCRIPT" ]] || return 1
+    return 0
+}
+
+build_url_hotswap_plan() {
+    local target_index="$1"
+    if [[ ! "$target_index" =~ ^[0-9]+$ || $target_index -lt 0 || $target_index -ge $url_count ]]; then
+        return 1
+    fi
+
+    url_hotswap_start_index="$target_index"
+    # Keep canonical URL order stable: primary remains index 0 and backups retain
+    # their configured ordering. We only override the startup index.
+    # Use original URLs for aloula: scheme so the new instance can self-refresh tokens.
+    url_hotswap_primary_url="${url_original[0]:-${url_array[0]}}"
+    if [[ -z "$url_hotswap_primary_url" ]]; then
+        return 1
+    fi
+
+    url_hotswap_backup_urls=""
+    local idx next_url
+    for ((idx=1; idx<url_count; idx++)); do
+        # Prefer original URL (preserves aloula: scheme and YouTube channel URLs)
+        next_url="${url_original[$idx]:-${url_array[$idx]}}"
+        [[ -n "$next_url" ]] || continue
+        url_hotswap_backup_urls="${url_hotswap_backup_urls:+${url_hotswap_backup_urls}|}${next_url}"
+    done
+
+    return 0
+}
+
+run_url_hotswap_handoff() {
+    local target_index="$1"
+    local reason="${2:-unknown}"
+
+    if ! can_use_url_hotswap; then
+        return 1
+    fi
+
+    if [[ ! "$target_index" =~ ^[0-9]+$ || $target_index -lt 0 || $target_index -ge $url_count ]]; then
+        log_error "URL_HOTSWAP: Invalid target index '$target_index' for reason '$reason'"
+        return 1
+    fi
+
+    if [[ $target_index -eq $current_url_index ]]; then
+        return 1
+    fi
+
+    local now
+    now=$(date +%s)
+    if [[ $last_url_hotswap_attempt -gt 0 ]]; then
+        local elapsed=$((now - last_url_hotswap_attempt))
+        if [[ $elapsed -lt $URL_HOTSWAP_COOLDOWN ]]; then
+            log "URL_HOTSWAP: Cooldown active (${elapsed}s/${URL_HOTSWAP_COOLDOWN}s). Skipping failover handoff."
+            return 1
+        fi
+    fi
+
+    if ! build_url_hotswap_plan "$target_index"; then
+        log_error "URL_HOTSWAP: Could not build URL handoff plan for target index $target_index"
+        return 1
+    fi
+
+    last_url_hotswap_attempt=$now
+    log "URL_HOTSWAP: Attempting seamless handoff from index $current_url_index to $target_index (reason: $reason)"
+    log "URL_HOTSWAP: Preserving primary routing order with startup index $url_hotswap_start_index"
+    log "URL_HOTSWAP: New primary: $url_hotswap_primary_url"
+    if [[ -n "$url_hotswap_backup_urls" ]]; then
+        log "URL_HOTSWAP: New backups: $url_hotswap_backup_urls"
+    fi
+
+    local rc=1
+    if GRACEFUL_SKIP_CALLER_KILL=1 GRACEFUL_CALLER_PID="$$" \
+        GRACEFUL_OVERRIDE_STREAM_URL="$url_hotswap_primary_url" \
+        GRACEFUL_OVERRIDE_BACKUP_URLS="$url_hotswap_backup_urls" \
+        GRACEFUL_OVERRIDE_START_INDEX="$url_hotswap_start_index" \
+        GRACEFUL_OVERRIDE_SCALE="$scale" \
+        GRACEFUL_OVERRIDE_CHANNEL_NAME="$channel_name" \
+        timeout "$URL_HOTSWAP_TIMEOUT" "$URL_HOTSWAP_SCRIPT" "$channel_id" >> "$logfile" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+        log "URL_HOTSWAP: Handoff completed successfully"
+        return 0
+    fi
+
+    if [[ $rc -eq 124 ]]; then
+        log_error "URL_HOTSWAP: Handoff timed out after ${URL_HOTSWAP_TIMEOUT}s"
+    else
+        log_error "URL_HOTSWAP: Handoff failed with exit code $rc"
+    fi
+    return 1
+}
+
+has_live_output_state() {
+    local output_dir
+    output_dir=$(dirname "$destination")
+
+    if [[ -s "$destination" ]]; then
+        return 0
+    fi
+
+    if find "$output_dir" -maxdepth 1 -type f -name "*.ts" -print -quit 2>$DEVNULL | grep -q .; then
+        return 0
+    fi
+
+    return 1
+}
+
+attempt_url_hotswap_and_exit_if_success() {
+    local target_index="$1"
+    local reason="$2"
+
+    if ! can_use_url_hotswap; then
+        return 1
+    fi
+
+    if [[ "$reason" != "segment_stale" ]] && ! has_live_output_state; then
+        log "URL_HOTSWAP: No live output state detected (reason: $reason). Attempting cold handoff to avoid hard switch."
+    fi
+
+    if run_url_hotswap_handoff "$target_index" "$reason"; then
+        log "URL_HOTSWAP: Handoff completed. Exiting current instance."
+        mark_successful_handoff_exit "url_hotswap:${reason}"
+        cleanup
+        exit 0
+    fi
+
+    return 1
+}
+
 check_and_fallback_to_primary() {
     # Only check if we're currently on a backup URL (not primary)
     if [[ $current_url_index -eq 0 ]]; then
         return 1  # Already on primary
     fi
 
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     local elapsed=$((now - last_primary_check))
 
     # Only check every PRIMARY_CHECK_INTERVAL seconds
@@ -1798,13 +2674,23 @@ check_and_fallback_to_primary() {
                 url_general_url[0]="$check_url"
             fi
 
-            log "PRIMARY_RESTORED: Primary YouTube stream resolved. Switching back..."
+            if ! record_primary_restore_confirmation "youtube_resolve"; then
+                return 1
+            fi
+            if ! probe_primary_media_decode "$resolved"; then
+                reset_primary_restore_confirmation "decode probe failed"
+                return 1
+            fi
+
+            log "PRIMARY_RESTORED: Primary YouTube stream confirmed (failback conditions met)."
+            reset_primary_restore_confirmation "switching to primary"
             current_url_index=0
             reset_url_retries
             total_cycles=0
             return 0
         fi
 
+        reset_primary_restore_confirmation "youtube primary unavailable"
         log "PRIMARY_CHECK: Primary YouTube URL not available. Staying on backup."
         return 1
     fi
@@ -1814,26 +2700,28 @@ check_and_fallback_to_primary() {
 
     # If FFmpeg can't read this URL scheme (e.g., https not compiled in), don't attempt fallback.
     if ! ffmpeg_supports_url "$primary_url" 0; then
+        reset_primary_restore_confirmation "unsupported primary protocol"
         log "PRIMARY_CHECK: Primary URL uses unsupported protocol for this ffmpeg build ($scheme). Staying on backup."
         return 1
     fi
 
     # Only HTTP/S sources can be preflight-checked; others must be handled by ffmpeg directly.
     if [[ "$scheme" != "http" && "$scheme" != "https" ]]; then
+        reset_primary_restore_confirmation "non-http primary"
         log "PRIMARY_CHECK: Skipping health check for non-HTTP primary ($scheme). Staying on backup."
         return 1
     fi
+
+    local health_ok=0
+    local health_reason=""
 
     # Test primary URL health (prefer HLS playlist advancement when applicable)
     local hls_check_result=1
     hls_check_result=$(check_hls_playlist_fresh "$primary_url")
 
     if [[ "$hls_check_result" -eq 0 ]]; then
-        log "PRIMARY_RESTORED: Primary HLS playlist is advancing. Switching back..."
-        current_url_index=0
-        reset_url_retries
-        total_cycles=0
-        return 0
+        health_ok=1
+        health_reason="hls_advancing"
     fi
 
     if [[ "$hls_check_result" -eq 2 ]]; then
@@ -1841,21 +2729,42 @@ check_and_fallback_to_primary() {
         primary_status=$(validate_url "$primary_url")
         log "PRIMARY_CHECK: Primary URL returned HTTP $primary_status"
 
-        if [[ "$primary_status" =~ ^2[0-9]{2}$ ]]; then
-            # Primary is healthy! Switch back to it
-            log "PRIMARY_RESTORED: Primary URL is healthy (HTTP $primary_status). Switching back..."
-            current_url_index=0
-            reset_url_retries
-            total_cycles=0
-            return 0  # Signal that we should switch
+        # Some providers use 3xx redirects to short-lived tokenized URLs.
+        # Consider 2xx/3xx as "reachable" here; we still require ffprobe decode
+        # to pass before switching.
+        if [[ "$primary_status" =~ ^[23][0-9]{2}$ ]]; then
+            health_ok=1
+            health_reason="http_${primary_status}"
+        else
+            reset_primary_restore_confirmation "primary HTTP $primary_status"
+            log "PRIMARY_CHECK: Primary still unavailable (HTTP $primary_status). Staying on backup."
+            return 1
         fi
-
-        log "PRIMARY_CHECK: Primary still unavailable (HTTP $primary_status). Staying on backup."
+    elif [[ "$hls_check_result" -ne 0 ]]; then
+        reset_primary_restore_confirmation "hls playlist stale"
+        log "PRIMARY_CHECK: Primary HLS playlist is stale. Staying on backup."
         return 1
     fi
 
-    log "PRIMARY_CHECK: Primary HLS playlist is stale. Staying on backup."
-    return 1
+    if [[ "$health_ok" -ne 1 ]]; then
+        reset_primary_restore_confirmation "health check failed"
+        return 1
+    fi
+
+    if ! record_primary_restore_confirmation "$health_reason"; then
+        return 1
+    fi
+    if ! probe_primary_media_decode "$primary_url"; then
+        reset_primary_restore_confirmation "decode probe failed"
+        return 1
+    fi
+
+    log "PRIMARY_RESTORED: Primary URL confirmed healthy (failback conditions met)."
+    reset_primary_restore_confirmation "switching to primary"
+    current_url_index=0
+    reset_url_retries
+    total_cycles=0
+    return 0
 }
 
 # =============================================================================
@@ -1896,7 +2805,8 @@ reload_config_if_changed() {
         return 1
     fi
 
-    local now=$(date +%s)
+    local now
+    now=$(date +%s)
     local elapsed=$((now - last_config_check))
 
     # Only check every CONFIG_CHECK_INTERVAL seconds
@@ -1905,7 +2815,8 @@ reload_config_if_changed() {
     fi
 
     last_config_check=$now
-    local current_mtime=$(get_file_mtime "$config_file")
+    local current_mtime
+    current_mtime=$(get_file_mtime "$config_file")
 
     # Check if file was modified
     if [[ "$current_mtime" -le "$config_file_mtime" ]]; then
@@ -1945,7 +2856,12 @@ reload_config_if_changed() {
         log "CONFIG_RELOAD: Primary URL changed! Old: ${primary_url} -> New: $new_primary"
         primary_url="$new_primary"
 
-        # Re-initialize metadata (handles YouTube detection automatically)
+        # IMPORTANT: url_array[0] is what FFmpeg actually uses when current_url_index=0.
+        # Keep it in sync with primary_url; otherwise the runner keeps streaming a stale URL.
+        url_array[0]="$new_primary"
+
+        # Re-initialize metadata (handles YouTube detection automatically).
+        # For non-YouTube URLs, this does not rewrite url_array[0], so we set it above.
         init_url_youtube_metadata 0 "$new_primary"
         log "CONFIG_RELOAD: Primary URL re-initialized. Will use on next FFmpeg restart."
     fi
@@ -1977,10 +2893,8 @@ reload_config_if_changed() {
 
         # Reset retry arrays for new URL count
         url_retry_counts=()
-        url_last_error_type=()
         for ((i=0; i<url_count; i++)); do
             url_retry_counts[$i]=0
-            url_last_error_type[$i]=""
         done
 
         # If current_url_index is now out of bounds, reset to primary
@@ -2079,15 +2993,44 @@ validate_url() {
     local response
 
     # MAJOR FIX: Use same User-Agent as ffmpeg to avoid false 4xx from UA mismatch
-    # Also follow redirects (-L) to handle 301/302 properly
+    # IMPORTANT: Avoid GET + -L for stream URLs; it can download large amounts of
+    # data and create unnecessary provider connections. Prefer a lightweight
+    # HEAD request and treat 3xx as "reachable".
 
     # If YTDLP_PROXY is set to Tor SOCKS proxy, use torsocks for validation
+    # shellcheck disable=SC2094
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
-        response=$(torsocks curl -A "$USER_AGENT" -L -s -o $DEVNULL -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL)
+        if command -v timeout >$DEVNULL 2>&1; then
+            response=$(timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+        else
+            response=$(torsocks curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+        fi
     else
-        response=$(curl -A "$USER_AGENT" -L -s -o $DEVNULL -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL)
+        if command -v timeout >$DEVNULL 2>&1; then
+            response=$(timeout $((timeout + 2)) curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+        else
+            response=$(curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+        fi
     fi
 
+    # Some servers block HEAD; fall back to a tiny ranged GET.
+    if [[ "$response" == "405" || "$response" == "000" ]]; then
+        if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
+            if command -v timeout >$DEVNULL 2>&1; then
+                response=$(timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            else
+                response=$(torsocks curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            fi
+        else
+            if command -v timeout >$DEVNULL 2>&1; then
+                response=$(timeout $((timeout + 2)) curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            else
+                response=$(curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            fi
+        fi
+    fi
+
+    [[ "$response" =~ ^[0-9]{3}$ ]] || response="000"
     echo "$response"
 }
 
@@ -2097,9 +3040,17 @@ fetch_url_body() {
 
     # Use torsocks if proxy is configured for Tor
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
-        torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+        if command -v timeout >$DEVNULL 2>&1; then
+            timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        else
+            torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        fi
     else
-        curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+        if command -v timeout >$DEVNULL 2>&1; then
+            timeout $((timeout + 2)) curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        else
+            curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        fi
     fi
 }
 
@@ -2109,9 +3060,17 @@ fetch_url_prefix() {
 
     # Use torsocks if proxy is configured for Tor
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
-        torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+        if command -v timeout >$DEVNULL 2>&1; then
+            timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        else
+            torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        fi
     else
-        curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL
+        if command -v timeout >$DEVNULL 2>&1; then
+            timeout $((timeout + 2)) curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        else
+            curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+        fi
     fi
 }
 
@@ -2136,7 +3095,7 @@ check_hls_playlist_fresh() {
         return 1
     fi
 
-    if echo "$first" | grep -q "^#EXT-X-ENDLIST"; then
+    if echo "$first" | grep -q "#EXT-X-ENDLIST"; then
         log "PRIMARY_CHECK: HLS playlist is ended (EXT-X-ENDLIST)"
         return 1
     fi
@@ -2168,7 +3127,7 @@ check_hls_playlist_fresh() {
         log "PRIMARY_CHECK: HLS playlist is invalid on re-fetch"
         return 1
     fi
-    if echo "$second" | grep -q "^#EXT-X-ENDLIST"; then
+    if echo "$second" | grep -q "#EXT-X-ENDLIST"; then
         log "PRIMARY_CHECK: HLS playlist ended on re-fetch (EXT-X-ENDLIST)"
         return 1
     fi
@@ -2208,7 +3167,7 @@ base_flags=( -user_agent "$USER_AGENT" -rw_timeout 30000000 -reconnect 1 -reconn
 # =============================================================================
 # -hls_start_number_source epoch: Continues sequence numbers across restarts
 # -hls_list_size 15: 90 seconds buffer at 6s segments
-# -hls_flags delete_segments+temp_file: Atomic writes, auto-cleanup
+# -hls_flags delete_segments+temp_file+omit_endlist: Atomic writes, auto-cleanup, never finalize playlist
 # =============================================================================
 
 hls_seamless=( -hls_start_number_source epoch -hls_list_size 15 )
@@ -2244,7 +3203,7 @@ build_ffmpeg_cmd() {
         2)
             # Stream copy with threads
             ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 10 -threads 2 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         3)
             # NVIDIA GPU encode (no scaling) - FIXED: added GOP, tune, bufsize
@@ -2253,7 +3212,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         4)
             # NVIDIA GPU encode + scale to 1080p - FIXED: added GOP, tune, bufsize
@@ -2263,7 +3222,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         5)
             # CPU encode (libx264)
@@ -2271,7 +3230,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -g 180 -keyint_min 180 )
             ffmpeg_cmd+=( -c:a aac -b:a 128k -bufsize 16M -b:v 2500k -threads 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         6)
             # CPU encode + scale to 1080p
@@ -2279,17 +3238,17 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -vf "scale=1920:1080" -c:v libx264 -preset ultrafast -tune zerolatency -g 180 -keyint_min 180 )
             ffmpeg_cmd+=( -c:a aac -b:a 128k -bufsize 16M -b:v 2500k -threads 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         7)
             # Stream copy with extended buffer - FIXED: added hls_seamless (epoch)
             ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 10 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file -bufsize 5000k "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file+omit_endlist -bufsize 5000k "$output_path" )
             ;;
         8)
             # CUDA passthrough - FIXED: added hls_seamless (epoch) and bufsize
             ffmpeg_cmd+=( -hwaccel cuda -i "$actual_input_url" -c copy -f hls -hls_time 10 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file -bufsize 7000k "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file+omit_endlist -bufsize 7000k "$output_path" )
             ;;
         9)
             # Software decode + CPU scale + NVENC encode (for problematic streams)
@@ -2302,7 +3261,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         10)
             # HIGH QUALITY: Software decode + NVENC encode (tolerates corrupted RTMP streams)
@@ -2314,7 +3273,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         11)
             # HIGH QUALITY: Software decode + scale to 1080p + NVENC (tolerates corrupted streams)
@@ -2326,7 +3285,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         12)
             # GPU STRETCH TO FILL: CUDA decode + scale_npp exact dimensions + NVENC
@@ -2338,7 +3297,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         13)
             # GPU SCALE + CROP: CUDA decode + scale_npp to fill + crop to remove excess
@@ -2350,12 +3309,12 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
             ffmpeg_cmd+=( -c:a aac -b:a 192k )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         *)
             # Default: stream copy
             ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file "$output_path" )
+            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
     esac
 }
@@ -2390,20 +3349,21 @@ fi
 #   - Maximum cycles: 5 (then wait 2 minutes before retry)
 # =============================================================================
 
-current_url_index=0
+current_url_index="$requested_start_url_index"
 total_cycles=0
 max_cycles=5
 cycle_start_time=0
 
 # Per-URL retry state
 declare -a url_retry_counts
-declare -a url_last_error_type
 for ((i=0; i<url_count; i++)); do
     url_retry_counts[$i]=0
-    url_last_error_type[$i]=""
 done
 
 log_console "Starting [$channel_id] with ${url_count} URL(s)"
+if [[ $current_url_index -ne 0 ]]; then
+    log "START_INDEX: Starting on URL index $current_url_index while preserving primary index 0 routing"
+fi
 
 # Log URL details with YouTube type info
 for i in $(seq 0 $((url_count - 1))); do
@@ -2426,7 +3386,6 @@ done
 reset_url_retries() {
     for ((i=0; i<url_count; i++)); do
         url_retry_counts[$i]=0
-        url_last_error_type[$i]=""
     done
 }
 
@@ -2447,19 +3406,27 @@ switch_to_next_url() {
     current_url_index=$(( (current_url_index + 1) % url_count ))
     log "URL_SWITCH: Switching to URL index $current_url_index (reason: $reason)"
 
+    # If we are leaving Seenshow for a non-Seenshow URL, release slot immediately.
+    if [[ "${url_is_seenshow[$previous_index]:-0}" == "1" && "${url_is_seenshow[$current_url_index]:-0}" != "1" ]]; then
+        seenshow_release_slot
+    fi
+
     if [[ $previous_index -eq 0 && $current_url_index -ne 0 ]]; then
         # Delay primary health checks after failing over to backup.
         last_primary_check=$(date +%s)
+        reset_primary_restore_confirmation "entered backup URL"
         log "PRIMARY_CHECK: Delaying primary checks for ${PRIMARY_CHECK_INTERVAL}s after failover"
     fi
 
     if [[ $current_url_index -eq 0 ]]; then
+        reset_primary_restore_confirmation "returned to primary URL"
         # Completed a full cycle through all URLs
         total_cycles=$((total_cycles + 1))
         log "CYCLE_COMPLETE: Completed URL cycle $total_cycles of $max_cycles"
 
         # Calculate time spent in this cycle
-        local cycle_end_time=$(date +%s)
+        local cycle_end_time
+        cycle_end_time=$(date +%s)
         local cycle_duration=$((cycle_end_time - cycle_start_time))
         log "Cycle duration: ${cycle_duration}s"
 
@@ -2508,6 +3475,22 @@ is_process_running() {
     return 0
 }
 
+wait_for_pid_exit() {
+    local pid="$1"
+    local timeout_seconds="${2:-10}"
+    local waited=0
+
+    while is_process_running "$pid"; do
+        if (( waited >= timeout_seconds )); then
+            return 124
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    return 0
+}
+
 # =============================================================================
 # CRITICAL FIX: Check for existing FFmpeg processes before starting new one
 # =============================================================================
@@ -2524,9 +3507,9 @@ check_existing_ffmpeg() {
     existing_pids=$(pgrep -f "ffmpeg.*/${escaped_channel_id}/master" 2>$DEVNULL || true)
 
     if [[ -n "$existing_pids" ]]; then
-        # Filter out our own FFmpeg (if any)
+        # Filter out our own FFmpeg (current and recently exited)
         for pid in $existing_pids; do
-            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$$" ]]; then
+            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$last_ffmpeg_pid" && "$pid" != "$$" ]]; then
                 log_error "DUPLICATE_DETECTED: Another FFmpeg (PID $pid) is already running for $channel_id"
                 return 1
             fi
@@ -2534,9 +3517,6 @@ check_existing_ffmpeg() {
     fi
     return 0
 }
-
-# Track if FFmpeg was killed externally vs exited normally
-ffmpeg_killed_externally=0
 
 while true; do
     # NEW: Check if config file changed and reload URLs
@@ -2547,13 +3527,42 @@ while true; do
         log "YOUTUBE: URLs refreshed before FFmpeg start"
     fi
 
-    # NEW: Check if primary URL is back online (only when on backup)
-    if check_and_fallback_to_primary; then
-        log "Switched back to primary URL. Continuing with primary..."
+    # NEW: Check if primary URL is back online (only when on backup).
+    # In hot-swap mode, defer failback decisions to the live monitoring loop so
+    # we can hand off without stopping the currently running stream first.
+    if [[ "$PRIMARY_HOTSWAP_ENABLE" != "1" || $current_url_index -eq 0 || "$channel_id" == .graceful_* ]]; then
+        if check_and_fallback_to_primary; then
+            log "Switched back to primary URL. Continuing with primary..."
+        fi
     fi
 
     current_url="${url_array[$current_url_index]}"
     current_retries=${url_retry_counts[$current_url_index]}
+
+    # Release any held slot when running a non-Seenshow URL.
+    if [[ "${url_is_seenshow[$current_url_index]:-0}" != "1" ]]; then
+        seenshow_release_slot
+    fi
+
+    # On-demand Seenshow token resolution + semaphore acquire.
+    if [[ "${url_is_seenshow[$current_url_index]:-0}" == "1" ]]; then
+        if ! prepare_seenshow_url_for_index "$current_url_index"; then
+            log_error "SEENSHOW: Failed to prepare URL index $current_url_index. Switching."
+            switch_to_next_url "seenshow_prepare_failed"
+            continue
+        fi
+        current_url="${url_array[$current_url_index]}"
+    fi
+
+    # On-demand Aloula/KwikMotion token refresh.
+    if is_aloula_url "${url_original[$current_url_index]:-}"; then
+        if ! prepare_aloula_url_for_index "$current_url_index"; then
+            log_error "ALOULA: Failed to prepare URL index $current_url_index. Switching."
+            switch_to_next_url "aloula_prepare_failed"
+            continue
+        fi
+        current_url="${url_array[$current_url_index]}"
+    fi
 
     log "ATTEMPT: URL index $current_url_index, retry $current_retries"
 
@@ -2561,22 +3570,40 @@ while true; do
     if ! ffmpeg_supports_url "$current_url" "$current_url_index"; then
         scheme=$(get_url_scheme "$current_url")
         log_error "UNSUPPORTED_PROTOCOL: ffmpeg does not support input protocol '$scheme' (URL index $current_url_index). Switching."
-        url_last_error_type[$current_url_index]="unsupported_protocol"
         switch_to_next_url "unsupported_protocol"
         continue
     fi
 
-    # Pre-flight URL validation (detect 4xx early) for HTTP/S only
+    # Pre-flight URL validation (detect 4xx early) for HTTP/S only.
+    # IMPORTANT: for HTTPS inputs that require streamlink proxying, curl preflight
+    # can return false 4xx (geo/WAF) while streamlink+tunnel still works. In that
+    # case, continue and let the proxy fetch path decide.
     scheme=$(get_url_scheme "$current_url")
     if [[ "$scheme" == "http" || "$scheme" == "https" ]]; then
-        http_status=$(validate_url "$current_url")
-        log "URL validation status: $http_status"
+        if [[ "${url_is_seenshow[$current_url_index]:-0}" == "1" ]]; then
+            # Seenshow probe requests create extra account connections. Skip curl
+            # preflight entirely and trust resolver freshness/expiry tracking.
+            log "SEENSHOW: Skipping preflight probe for URL index $current_url_index"
+        else
+            preflight_uses_https_proxy=0
+            if [[ "$scheme" == "https" ]] && needs_https_proxy "$current_url"; then
+                preflight_uses_https_proxy=1
+            fi
 
-        if is_4xx_error "$http_status"; then
-            log_error "4XX_ERROR: HTTP $http_status on URL index $current_url_index - immediate switch"
-            url_last_error_type[$current_url_index]="4xx"
-            switch_to_next_url "HTTP_${http_status}"
-            continue
+            http_status=$(validate_url "$current_url")
+            log "URL validation status: $http_status"
+
+            if is_4xx_error "$http_status"; then
+                if [[ "$preflight_uses_https_proxy" -eq 1 ]]; then
+                    log "HTTPS_PROXY: Preflight returned HTTP $http_status for URL index $current_url_index; attempting proxy fetch before failover"
+                else
+                    log_error "4XX_ERROR: HTTP $http_status on URL index $current_url_index - immediate switch"
+                    next_url_index=$(( (current_url_index + 1) % url_count ))
+                    attempt_url_hotswap_and_exit_if_success "$next_url_index" "HTTP_${http_status}" || true
+                    switch_to_next_url "HTTP_${http_status}"
+                    continue
+                fi
+            fi
         fi
     else
         log "URL validation skipped for non-HTTP scheme: $scheme"
@@ -2615,21 +3642,39 @@ while true; do
     proxy_pid=""
     stream_fifo="/dev/shm/stream_pipe_${channel_id}_$$"
     if [[ "$use_https_proxy" -eq 1 ]]; then
-        if [[ ! -d "/dev/shm" ]]; then
+        if [[ ! -d "/dev/shm" || ! -w "/dev/shm" ]]; then
             stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
-            log "HTTPS_PROXY: /dev/shm not available; using $stream_fifo"
+            log "HTTPS_PROXY: /dev/shm unavailable or not writable; using $stream_fifo"
         fi
         # Create FIFO for reliable PID capture of both proxy and FFmpeg
         rm -f "$stream_fifo" 2>$DEVNULL
-        mkfifo "$stream_fifo" 2>$DEVNULL || {
-            log_error "HTTPS_PROXY: Failed to create FIFO; falling back to pipeline"
-            stream_fifo=""
-        }
+        if ! mkfifo "$stream_fifo" 2>$DEVNULL; then
+            # /dev/shm can exist but still reject writes due sandboxing/policies.
+            # Retry in /tmp before deciding proxy startup is unsafe.
+            fallback_fifo="/tmp/stream_pipe_${channel_id}_$$"
+            if [[ "$stream_fifo" != "$fallback_fifo" ]]; then
+                log "HTTPS_PROXY: FIFO create failed at $stream_fifo; retrying $fallback_fifo"
+                stream_fifo="$fallback_fifo"
+                rm -f "$stream_fifo" 2>$DEVNULL
+                if ! mkfifo "$stream_fifo" 2>$DEVNULL; then
+                    log_error "HTTPS_PROXY: Failed to create FIFO in both /dev/shm and /tmp; safe failover to next URL"
+                    stream_fifo=""
+                fi
+            else
+                log_error "HTTPS_PROXY: Failed to create FIFO; safe failover to next URL"
+                stream_fifo=""
+            fi
+        fi
         # Hard safety: only use FIFO if it is actually a named pipe
         if [[ -n "$stream_fifo" && ! -p "$stream_fifo" ]]; then
-            log_error "HTTPS_PROXY: $stream_fifo is not a FIFO; falling back to pipeline"
+            log_error "HTTPS_PROXY: $stream_fifo is not a FIFO; safe failover to next URL"
             rm -f "$stream_fifo" 2>$DEVNULL
             stream_fifo=""
+        fi
+        if [[ -z "$stream_fifo" || ! -p "$stream_fifo" ]]; then
+            log_error "HTTPS_PROXY: Cannot safely start proxy+ffmpeg pair without FIFO. Switching URL."
+            switch_to_next_url "proxy_fifo_unavailable"
+            continue
         fi
 
         if [[ "${url_is_youtube[$current_url_index]}" == "1" ]]; then
@@ -2653,17 +3698,11 @@ while true; do
             # Build streamlink command with optional proxy
             set_streamlink_args "$proxy_source_url"
 
-            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
-                # Use FIFO for reliable PID capture
-                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
-                proxy_pid=$!
-                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            else
-                # Fallback to pipeline
-                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            fi
+            # Use FIFO for reliable PID capture
+            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            proxy_pid=$!
+            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         elif [[ "$current_url" == *.m3u8* ]]; then
             if ! command -v streamlink >$DEVNULL 2>&1; then
@@ -2676,15 +3715,10 @@ while true; do
             # Build streamlink command with optional proxy
             set_streamlink_args "$current_url"
 
-            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
-                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
-                proxy_pid=$!
-                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            else
-                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            fi
+            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            proxy_pid=$!
+            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         else
             if ! command -v streamlink >$DEVNULL 2>&1; then
@@ -2697,15 +3731,10 @@ while true; do
             # Build streamlink command with optional proxy
             set_streamlink_args "$current_url"
 
-            if [[ -n "$stream_fifo" && -p "$stream_fifo" ]]; then
-                "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
-                proxy_pid=$!
-                "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            else
-                "${streamlink_args[@]}" 2>>"$logfile" | "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
-                ffmpeg_pid=$!
-            fi
+            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            proxy_pid=$!
+            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         fi
         # Remove FIFO after both processes are started (they already have file descriptors open)
@@ -2729,24 +3758,80 @@ while true; do
         # HOT_RELOAD: pick up config edits while streaming (every 60s)
         reload_config_if_changed
 
-        # PRIMARY_FALLBACK: check primary while on backup (every 5 min)
-        if [[ -z "$stop_reason" ]] && check_and_fallback_to_primary; then
-            stop_reason="primary_restore"
-            log "PRIMARY_RESTORED: Restarting stream to use primary URL..."
+        # Keep resolver semaphore slot alive for long-running Seenshow sessions.
+        if [[ "${url_is_seenshow[$current_url_index]:-0}" == "1" && -z "$stop_reason" ]]; then
+            if ! seenshow_touch_slot_if_needed; then
+                log_error "SEENSHOW: Lost resolver slot lease for URL index $current_url_index"
+                seenshow_slot_held=0
+                seenshow_last_touch=0
 
-            # Graceful stop, then force kill as a last resort
-            kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
-            for i in {1..10}; do
-                if ! is_process_running "$ffmpeg_pid"; then
+                if seenshow_acquire_slot_if_needed "$current_url_index"; then
+                    log "SEENSHOW: Slot lease restored for URL index $current_url_index"
+                else
+                    next_url_index=$(( (current_url_index + 1) % url_count ))
+                    attempt_url_hotswap_and_exit_if_success "$next_url_index" "seenshow_slot_lost" || true
+
+                    stop_reason="seenshow_slot_lost"
+                    log_error "SEENSHOW: Unable to restore slot lease. Switching away from URL index $current_url_index"
+
+                    # Graceful stop, then force kill as last resort
+                    kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                    pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+                    for i in {1..10}; do
+                        if ! is_process_running "$ffmpeg_pid"; then
+                            break
+                        fi
+                        sleep 1
+                    done
+                    if is_process_running "$ffmpeg_pid"; then
+                        log "SEENSHOW: Force killing FFmpeg PID $ffmpeg_pid after slot loss"
+                        kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                        pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+                    fi
                     break
                 fi
-                sleep 1
-            done
-            if is_process_running "$ffmpeg_pid"; then
-                log "PRIMARY_RESTORED: Force killing FFmpeg PID $ffmpeg_pid"
-                kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
             fi
-            break
+        fi
+
+        # PRIMARY_FALLBACK: check primary while on backup (every interval).
+        # In hot-swap mode, use graceful handoff to avoid killing the current
+        # stream before the replacement path is warmed.
+        if [[ -z "$stop_reason" ]]; then
+            restore_from_index="$current_url_index"
+            if check_and_fallback_to_primary; then
+                if can_use_primary_hotswap; then
+                    log "PRIMARY_HOTSWAP: Primary confirmed. Attempting seamless handoff..."
+                    if run_primary_hotswap_handoff; then
+                        log "PRIMARY_HOTSWAP: Handoff completed. Exiting current instance."
+                        mark_successful_handoff_exit "primary_hotswap"
+                        cleanup
+                        exit 0
+                    fi
+
+                    # Keep current backup stream when handoff fails.
+                    current_url_index="$restore_from_index"
+                    log_error "PRIMARY_HOTSWAP: Handoff failed. Staying on backup URL index $current_url_index."
+                else
+                    stop_reason="primary_restore"
+                    log "PRIMARY_RESTORED: Restarting stream to use primary URL..."
+
+                    # Graceful stop, then force kill as a last resort
+                    kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                    pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+                    for i in {1..10}; do
+                        if ! is_process_running "$ffmpeg_pid"; then
+                            break
+                        fi
+                        sleep 1
+                    done
+                    if is_process_running "$ffmpeg_pid"; then
+                        log "PRIMARY_RESTORED: Force killing FFmpeg PID $ffmpeg_pid"
+                        kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                        pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+                    fi
+                    break
+                fi
+            fi
         fi
 
         # YOUTUBE_REFRESH: check if current YouTube URL needs refresh while streaming
@@ -2756,6 +3841,7 @@ while true; do
 
             # Graceful stop, same as primary_restore
             kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+            pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
             for i in {1..10}; do
                 if ! is_process_running "$ffmpeg_pid"; then
                     break
@@ -2765,17 +3851,32 @@ while true; do
             if is_process_running "$ffmpeg_pid"; then
                 log "YOUTUBE_REFRESH: Force killing FFmpeg PID $ffmpeg_pid"
                 kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
             fi
             break
         fi
 
         # SEGMENT_STALE: check if output is stale and switch to backup URL
         if [[ -z "$stop_reason" ]] && check_segment_staleness; then
-            stop_reason="segment_stale"
-            log "SEGMENT_STALE: Output stale, switching to backup URL..."
+            if [[ $url_count -lt 2 ]]; then
+                stop_reason="segment_stale_restart"
+                log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no backups configured)..."
+            else
+                next_url_index=$(( (current_url_index + 1) % url_count ))
+                if [[ "$next_url_index" -eq "$current_url_index" ]]; then
+                    stop_reason="segment_stale_restart"
+                    log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no alternate URL index)..."
+                else
+                    attempt_url_hotswap_and_exit_if_success "$next_url_index" "segment_stale" || true
+
+                    stop_reason="segment_stale"
+                    log "SEGMENT_STALE: Output stale, switching to backup URL..."
+                fi
+            fi
 
             # Graceful stop
             kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+            pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
             for i in {1..10}; do
                 if ! is_process_running "$ffmpeg_pid"; then
                     break
@@ -2785,13 +3886,39 @@ while true; do
             if is_process_running "$ffmpeg_pid"; then
                 log "SEGMENT_STALE: Force killing FFmpeg PID $ffmpeg_pid"
                 kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
             fi
             break
         fi
     done
 
-    wait "$ffmpeg_pid"
-    exit_code=$?
+    if is_process_running "$ffmpeg_pid"; then
+        wait_for_pid_exit "$ffmpeg_pid" 10 || true
+    fi
+    if is_process_running "$ffmpeg_pid"; then
+        kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+        pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+        wait_for_pid_exit "$ffmpeg_pid" 3 || true
+    fi
+    if ! is_process_running "$ffmpeg_pid"; then
+        if wait "$ffmpeg_pid" 2>$DEVNULL; then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+    else
+        exit_code=143
+    fi
+    # Clean up any lingering FFmpeg child processes to prevent false duplicate detection
+    pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+    # Clean up proxy process (streamlink/yt-dlp) — it's a sibling, not a child of FFmpeg
+    if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>$DEVNULL; then
+        kill -TERM "$proxy_pid" 2>$DEVNULL || true
+        sleep 1
+        kill -0 "$proxy_pid" 2>$DEVNULL && kill -KILL "$proxy_pid" 2>$DEVNULL || true
+    fi
+    proxy_pid=""
+    last_ffmpeg_pid="$ffmpeg_pid"
     end_time=$(date +%s)
     duration=$((end_time - start_time))
 
@@ -2825,11 +3952,33 @@ while true; do
         continue
     fi
 
+    # If we stopped FFmpeg due to stale output and there's no alternate URL to switch to, restart in-place.
+    if [[ "$stop_reason" == "segment_stale_restart" ]]; then
+        cleanup_ffmpeg_error_file "$ffmpeg_error_file"
+        log "SEGMENT_STALE: Restarting current URL due to stale output"
+        # Reset segment check timer for new run
+        last_segment_check=$(date +%s)
+        # Allow error logging again after a stale restart (helps debugging without indefinite suppression).
+        rapid_failure_count=0
+        sleep 2
+        continue
+    fi
+
     # If we stopped FFmpeg due to stale output, switch to backup URL
     if [[ "$stop_reason" == "segment_stale" ]]; then
         cleanup_ffmpeg_error_file "$ffmpeg_error_file"
         log "SEGMENT_STALE: Switching to next URL due to stale output"
         switch_to_next_url "segment_stale"
+        # Reset segment check timer for new URL
+        last_segment_check=$(date +%s)
+        sleep 2
+        continue
+    fi
+
+    if [[ "$stop_reason" == "seenshow_slot_lost" ]]; then
+        cleanup_ffmpeg_error_file "$ffmpeg_error_file"
+        log "SEENSHOW: Switching to next URL due to slot lease loss"
+        switch_to_next_url "seenshow_slot_lost"
         # Reset segment check timer for new URL
         last_segment_check=$(date +%s)
         sleep 2
@@ -2847,7 +3996,6 @@ while true; do
         # Check for HTTP errors in FFmpeg output
         if echo "$ffmpeg_errors" | grep -qE "HTTP error 4[0-9]{2}|Server returned 4[0-9]{2}"; then
             log "4XX_DETECTED: HTTP 4xx error detected in FFmpeg output"
-            url_last_error_type[$current_url_index]="4xx"
 
             # YOUTUBE_STREAM_END: Check if this is a YouTube stream that ended
             # YouTube returns 403/404 when a live stream ends
@@ -2856,6 +4004,8 @@ while true; do
                 youtube_stream_ended_detected=1
             else
                 cleanup_ffmpeg_error_file "$ffmpeg_error_file"
+                next_url_index=$(( (current_url_index + 1) % url_count ))
+                attempt_url_hotswap_and_exit_if_success "$next_url_index" "FFmpeg_4xx" || true
                 switch_to_next_url "FFmpeg_4xx"
                 continue
             fi
@@ -2905,7 +4055,6 @@ while true; do
         fi
 
         # No general URL or re-fetch failed - proceed with normal failover
-        url_last_error_type[$current_url_index]="youtube_stream_ended"
         switch_to_next_url "youtube_stream_ended"
         continue
     fi
@@ -2946,12 +4095,14 @@ while true; do
 
         if [[ $current_retries -ge 3 ]]; then
             # Exhausted retries for this URL, switch to next
+            next_url_index=$(( (current_url_index + 1) % url_count ))
+            attempt_url_hotswap_and_exit_if_success "$next_url_index" "max_retries" || true
             switch_to_next_url "max_retries"
         else
             # Exponential backoff: 2s, 4s, 8s
             backoff=$(get_backoff_delay $((current_retries - 1)))
             log "BACKOFF: Waiting ${backoff}s before retry $current_retries on URL index $current_url_index"
-            sleep $backoff
+            sleep "$backoff"
         fi
     fi
 done

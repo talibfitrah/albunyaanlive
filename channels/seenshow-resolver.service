@@ -1,0 +1,34 @@
+[Unit]
+Description=Seenshow Token Resolver (albunyaan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels
+EnvironmentFile=-/etc/default/seenshow-resolver
+Environment=NODE_ENV=production
+Environment=SEENSHOW_RESOLVER_PORT=8090
+Environment=SEENSHOW_RESOLVER_HOST=127.0.0.1
+Environment=SEENSHOW_MAX_CONCURRENT=3
+Environment=SEENSHOW_TOKEN_REFRESH_MS=86400000
+Environment=SEENSHOW_TOKEN_MARGIN_MS=21600000
+Environment=SEENSHOW_AUTH_PROXY=socks5://127.0.0.1:9050
+Environment=SEENSHOW_CHROME=/usr/bin/chromium-browser
+Environment=SEENSHOW_HEADLESS=true
+Environment=SEENSHOW_BASE_DIR=/home/msa/Development/scripts/albunyaan/channels
+Environment=SEENSHOW_CREDENTIALS_FILE=/etc/albunyaan/seenshow_credentials.json
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node /home/msa/Development/scripts/albunyaan/channels/seenshow_resolver.js
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+ProtectSystem=strict
+PrivateTmp=true
+# NoNewPrivileges incompatible with snap-based Chromium (snap-confine needs cap_dac_override)
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels /tmp
+
+[Install]
+WantedBy=multi-user.target

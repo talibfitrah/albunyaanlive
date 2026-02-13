@@ -13,10 +13,10 @@ YTDLP_EXTRACTOR_ARGS="youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
 export YTDLP_EXTRACTOR_ARGS
 
 stream_name="sunnah"
-stream_url="http://vlc.news:80/964683414160/920593191620/1420"
+stream_url="https://www.youtube.com/@SaudiSunnahTv/live"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="https://www.youtube.com/@SaudiSunnahTv/live"
+stream_url_backup1="aloula:6"
 stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/sunnah/master.m3u8"

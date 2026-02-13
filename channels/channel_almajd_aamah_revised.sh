@@ -5,10 +5,10 @@
 # =============================================================================
 
 stream_name="166063150075/508173937110/1404"
-stream_url="http://vlc.news:9000/166063150075/508173937110/1404"
+stream_url="http://vlc.news:80/166063150075/508173937110/1404"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/master.m3u8"
+stream_url_backup1="https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/3.m3u8"
 stream_url_backup2=""
 
 # Configure Tor proxy for seenshow.com URLs (geo-blocked)

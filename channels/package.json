@@ -1,0 +1,18 @@
+{
+  "name": "youtube-browser-resolver",
+  "version": "2.0.0",
+  "description": "YouTube live stream resolver with full segment proxying",
+  "main": "youtube_browser_resolver_v2.js",
+  "scripts": {
+    "start": "node youtube_browser_resolver_v2.js",
+    "start:legacy": "node youtube_browser_resolver.js",
+    "test": "node --test tests/provider_sync.unit.test.js tests/segment_cache.unit.test.js tests/resolver_utils.unit.test.js tests/resolver_request_parse.unit.test.js tests/session_slots.unit.test.js tests/page_setup.unit.test.js tests/seenshow_resolver.unit.test.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.35.0",
+    "puppeteer-core": "^24.35.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "youtubei.js": "^16.0.1"
+  }
+}

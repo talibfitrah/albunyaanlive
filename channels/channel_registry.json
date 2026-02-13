@@ -1,0 +1,314 @@
+{
+  "channels": {
+    "almajd-news": {
+      "stream_id": 1415,
+      "match_names": [
+        "Al MAJD news"
+      ],
+      "config_file": "channel_almajd_news.sh",
+      "provider_name": "Al MAJD news",
+      "preferred_credential": "851925540325",
+      "scale": 9,
+      "non_vlc_backups": [],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:05:03.226Z"
+    },
+    "hadith-almajd": {
+      "stream_id": 1406,
+      "match_names": [
+        "Al MAJD Hadith"
+      ],
+      "config_file": "channel_almajd_hadith.sh",
+      "provider_name": "Al MAJD Hadith",
+      "preferred_credential": "034120793341",
+      "scale": 0,
+      "non_vlc_backups": [
+        "http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/2474",
+        "http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/2474.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-09T22:19:52.343Z"
+    },
+    "almajd-quran": {
+      "stream_id": 1405,
+      "match_names": [
+        "Al MAJD Quran"
+      ],
+      "config_file": "channel_almajd_quran_revised.sh",
+      "provider_name": "Al MAJD Quran",
+      "preferred_credential": "504447960310",
+      "scale": 0,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120829/LIVE-002-QURAN/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:24.269Z"
+    },
+    "almajd-kids": {
+      "stream_id": 1413,
+      "match_names": [
+        "Al MAJD Kids"
+      ],
+      "config_file": "channel_almajd_kids_revised.sh",
+      "provider_name": "Al MAJD Kids",
+      "preferred_credential": "602779426000",
+      "scale": 0,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120822/LIVE-009-KIDS/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:28.658Z"
+    },
+    "almajd-3aamah": {
+      "stream_id": 1404,
+      "match_names": [
+        "Al Majd General"
+      ],
+      "config_file": "channel_almajd_aamah_revised.sh",
+      "provider_name": "Al Majd General",
+      "preferred_credential": "166063150075",
+      "scale": 4,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:33.809Z"
+    },
+    "natural": {
+      "stream_id": 1403,
+      "match_names": [
+        "Al Majd Tabeeya"
+      ],
+      "config_file": "channel_almajd_nature_revised.sh",
+      "provider_name": "Al Majd Tabeeya",
+      "preferred_credential": "301821324699",
+      "scale": 7,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120827/LIVE-007-TABEEYA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:37.017Z"
+    },
+    "daal": {
+      "stream_id": 1409,
+      "match_names": [
+        "Al MAJD DAL"
+      ],
+      "config_file": "channel_daal_revised.sh",
+      "provider_name": "Al MAJD DAL",
+      "preferred_credential": "373914605863",
+      "scale": 0,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120828/LIVE-008-DAL/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:39.962Z"
+    },
+    "maassah": {
+      "stream_id": 1414,
+      "match_names": [
+        "Al MAJD Masa"
+      ],
+      "config_file": "channel_maassah_revised.sh",
+      "provider_name": "Al MAJD Masa",
+      "preferred_credential": "143958390914",
+      "scale": 0,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120779/LIVE-013-MASA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:05:12.310Z"
+    },
+    "basmah": {
+      "stream_id": 1412,
+      "match_names": [
+        "Al MAJD Basma"
+      ],
+      "config_file": "channel_basmah_revised.sh",
+      "provider_name": "Al MAJD Basma",
+      "preferred_credential": "444180075026",
+      "scale": 3,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120817/LIVE-010-BASMA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:44.765Z"
+    },
+    "ajaweed": {
+      "stream_id": 1408,
+      "match_names": [
+        "Al MAJD Ajaweed"
+      ],
+      "config_file": "channel_ajaweed_revised.sh",
+      "provider_name": "Al MAJD Ajaweed",
+      "preferred_credential": "166164109628",
+      "scale": 0,
+      "non_vlc_backups": [],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:05:13.597Z"
+    },
+    "makkah": {
+      "stream_id": 1421,
+      "match_names": [
+        "MAKKAH TV"
+      ],
+      "config_file": "channel_quran.sh",
+      "provider_name": "MAKKAH TV",
+      "preferred_credential": "705729222787",
+      "scale": 4,
+      "non_vlc_backups": [],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:05:13.605Z"
+    },
+    "rawdah": {
+      "stream_id": 1411,
+      "match_names": [
+        "Al MAJD Rawda"
+      ],
+      "config_file": "channel_rawdah_revised.sh",
+      "provider_name": "Al MAJD Rawda",
+      "preferred_credential": "644050331081",
+      "scale": 2,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:50.601Z"
+    },
+    "sunnah": {
+      "stream_id": 1420,
+      "match_names": [
+        "SUNNAH 4k"
+      ],
+      "config_file": "channel_sunnah_revised.sh",
+      "provider_name": "SUNNAH 4k",
+      "preferred_credential": "",
+      "scale": 12,
+      "non_vlc_backups": [
+        "https://www.youtube.com/@SaudiSunnahTv/live",
+        "aloula:6"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:07:15.023Z"
+    },
+    "uthaymeen": {
+      "stream_id": 357376,
+      "match_names": [
+        "Bin Othaimeen"
+      ],
+      "config_file": "channel_uthaymeen_revised.sh",
+      "provider_name": "Bin Othaimeen",
+      "preferred_credential": "658660392910",
+      "scale": 3,
+      "non_vlc_backups": [],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:07:15.038Z"
+    },
+    "arrahmah": {
+      "stream_id": 357372,
+      "match_names": [
+        "Al Rahma"
+      ],
+      "config_file": "channel_arrahmah.sh",
+      "provider_name": "Al Rahma",
+      "preferred_credential": "828906198094",
+      "scale": 4,
+      "non_vlc_backups": [],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:07:15.046Z"
+    },
+    "almajd-islamic-science": {
+      "stream_id": 357369,
+      "match_names": [
+        "Al Majd EDU"
+      ],
+      "config_file": "channel_almajd_science_revised.sh",
+      "provider_name": "Al Majd EDU",
+      "preferred_credential": "578724520142",
+      "scale": 0,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T22:28:59.057Z"
+    },
+    "mekkah-quran": {
+      "stream_id": 1438,
+      "match_names": [
+        "SAUDI QURAN"
+      ],
+      "config_file": "channel_mecca_quran_revised.sh",
+      "provider_name": "SAUDI QURAN",
+      "preferred_credential": "",
+      "scale": 12,
+      "non_vlc_backups": [
+        "https://www.youtube.com/@SaudiQuranTv/live",
+        "aloula:7"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:09:15.086Z"
+    },
+    "nada": {
+      "stream_id": 1437,
+      "match_names": [
+        "Al Nada TV"
+      ],
+      "config_file": "channel_nada_revised.sh",
+      "provider_name": "Al Nada TV",
+      "preferred_credential": "988897949345",
+      "scale": 4,
+      "non_vlc_backups": [
+        "http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/75516",
+        "http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/75516.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-10T15:42:29.446Z"
+    },
+    "anees": {
+      "stream_id": 360333,
+      "match_names": [
+        "Al Anis TV"
+      ],
+      "config_file": "channel_anees_revised.sh",
+      "provider_name": "Al Anis TV",
+      "preferred_credential": "861810342668",
+      "scale": 3,
+      "non_vlc_backups": [
+        "http://eeijvvut.qastertv.xyz:900/TN8PTWSD/3W9C5S3B/370",
+        "https://www.youtube.com/channel/UClhc_0qfdQHMmiHRii5TOPA/live"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": null
+    },
+    "zaad": {
+      "stream_id": 1434,
+      "match_names": [
+        "ZAD TV"
+      ],
+      "config_file": "channel_zaad_revised.sh",
+      "provider_name": "ZAD TV",
+      "preferred_credential": "",
+      "scale": 10,
+      "non_vlc_backups": [
+        "rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T17:09:15.103Z"
+    },
+    "almajd-documentary": {
+      "stream_id": 1407,
+      "match_names": [
+        "Al MAJD Documentary"
+      ],
+      "config_file": "channel_almajd_doc_revised.sh",
+      "provider_name": "Al MAJD Documentary",
+      "preferred_credential": "961461374831",
+      "scale": 4,
+      "non_vlc_backups": [
+        "https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/3.m3u8"
+      ],
+      "vlc_as_backup": false,
+      "last_updated": "2026-02-12T15:23:42.004Z"
+    }
+  }
+}
