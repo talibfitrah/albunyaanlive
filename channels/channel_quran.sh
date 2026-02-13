@@ -8,7 +8,7 @@ stream_name="705729222787/345515312457/1421"
 stream_url="http://vlc.news:80/705729222787/345515312457/1421"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1=""
+stream_url_backup1="elahmad:makkahtv"
 stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/makkah/master.m3u8"
