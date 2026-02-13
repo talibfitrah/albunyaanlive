@@ -4,12 +4,20 @@
 # Channel: Mekkah Quran
 # =============================================================================
 
+# Optional proxy for YouTube resolution; leave empty to use direct IP
+YTDLP_PROXY="${YTDLP_PROXY:-}"
+export YTDLP_PROXY
+
+# Use POT token provider for YouTube bot detection bypass
+YTDLP_EXTRACTOR_ARGS="youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
+export YTDLP_EXTRACTOR_ARGS
+
 stream_name="mekkah-quran"
-stream_url="http://vlc.news:80/578724520142/157164334731/1438"
+stream_url="https://www.youtube.com/@SaudiQuranTv/live"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="http://vlc.news:80/578724520142/157164334731/1419"
-stream_url_backup2="http://vlc.news:80/034120793341/390247405461/1418"
+stream_url_backup1="aloula:7"
+stream_url_backup2=""
 
 rtmp_url="/var/www/html/stream/hls/mekkah-quran/master.m3u8"
 stream_id="/var/www/html/stream/hls/mekkah-quran/master.m3u8"

@@ -4,11 +4,11 @@
 # Channel: Almajd Islamic Science
 # =============================================================================
 
-stream_name="828906198094/071131245596/1408"
+stream_name="578724520142/157164334731/357369"
 stream_url="http://vlc.news:80/578724520142/157164334731/357369"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/master.m3u8"
+stream_url_backup1="https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/3.m3u8"
 stream_url_backup2=""
 
 # Configure Tor proxy for seenshow.com URLs (geo-blocked)

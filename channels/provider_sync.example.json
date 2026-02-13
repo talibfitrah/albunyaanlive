@@ -1,0 +1,10 @@
+{
+  "server": "vlc.news",
+  "default_port": 80,
+  "credentials": [
+    {
+      "username": "REPLACE_ME",
+      "password": "REPLACE_ME"
+    }
+  ]
+}
