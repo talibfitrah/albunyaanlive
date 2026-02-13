@@ -80,6 +80,7 @@ URL_HOTSWAP_ENABLE="${URL_HOTSWAP_ENABLE:-1}"  # 1=use graceful handoff for fail
 URL_HOTSWAP_TIMEOUT="${URL_HOTSWAP_TIMEOUT:-180}"  # Timeout for failover handoff
 URL_HOTSWAP_COOLDOWN="${URL_HOTSWAP_COOLDOWN:-90}"  # Min seconds between failover handoff attempts
 URL_HOTSWAP_SCRIPT="${URL_HOTSWAP_SCRIPT:-$PRIMARY_HOTSWAP_SCRIPT}"
+SHORT_RUN_FAST_SWITCH_THRESHOLD="${SHORT_RUN_FAST_SWITCH_THRESHOLD:-30}"  # SHORT_RUNs >30s are "costly"
 TRY_START_INITIAL_URL_INDEX="${TRY_START_INITIAL_URL_INDEX:-${INITIAL_URL_INDEX:-}}"  # Optional startup URL index override
 TRY_START_ADOPT_LOCK="${TRY_START_ADOPT_LOCK:-0}"  # 1=adopt pre-existing lock (graceful handoff only)
 CONFIG_CHECK_INTERVAL="${CONFIG_CHECK_INTERVAL:-60}"     # Default: check config file every 60 seconds
@@ -147,6 +148,11 @@ ALOULA_API_BASE="${ALOULA_API_BASE:-https://aloula.faulio.com/api/v1.1}"
 ALOULA_TOKEN_MARGIN="${ALOULA_TOKEN_MARGIN:-3600}"  # Refresh when token has <=1h left (tokens last ~24h)
 ALOULA_RESOLVE_TIMEOUT="${ALOULA_RESOLVE_TIMEOUT:-10}"
 
+# Elahmad.com resolver (encrypted stream API)
+ELAHMAD_BASE="${ELAHMAD_BASE:-https://www.elahmad.com}"
+ELAHMAD_RESOLVE_TIMEOUT="${ELAHMAD_RESOLVE_TIMEOUT:-15}"
+ELAHMAD_REFRESH_INTERVAL="${ELAHMAD_REFRESH_INTERVAL:-14400}"  # Re-resolve every 4 hours
+
 # =============================================================================
 # NEW: Per-channel rate limit protection
 # =============================================================================
@@ -172,6 +178,19 @@ tor_socks_unreachable_warned=0
 
 # User-Agent string (used by both ffmpeg and curl preflight for consistency)
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+# kwikmotion CDN blocks browser/tool UAs over plain HTTP; use curl's default UA
+KWIKMOTION_USER_AGENT="curl/7.81.0"
+
+# Returns the appropriate User-Agent for a URL — kwikmotion HTTP needs a
+# curl-like UA because their CDN blocks browser and tool UAs over plain HTTP.
+effective_user_agent() {
+    local url="$1"
+    if [[ "$url" =~ ^http://[^/]*kwikmotion\.com/ ]]; then
+        echo "$KWIKMOTION_USER_AGENT"
+    else
+        echo "$USER_AGENT"
+    fi
+}
 
 # Parse command line arguments BEFORE setting up logfile
 while getopts 'hu:d:k:n:s:b:c:' OPTION; do
@@ -745,6 +764,7 @@ declare -a url_expire_time
 declare -a url_is_seenshow
 declare -a url_seenshow_hls_path
 declare -a url_seenshow_expiry
+declare -a url_elahmad_resolve_time
 
 # First, build the raw URL array
 primary_url="$url"  # Store original primary for fallback checks
@@ -1641,6 +1661,13 @@ resolve_aloula_url() {
     local resolved_url
     resolved_url=$(_resolve_hls_variant_url "$master_url" "$variant_path")
 
+    # Downgrade HTTPS to HTTP for kwikmotion CDN — their TLS fingerprinting
+    # blocks streamlink/Python requests, but plain HTTP works fine and lets
+    # FFmpeg connect directly without an HTTPS proxy.
+    if [[ "$resolved_url" =~ ^https://live\.kwikmotion\.com/ ]]; then
+        resolved_url="${resolved_url/https:\/\//http:\/\/}"
+    fi
+
     echo "$resolved_url"
     return 0
 }
@@ -1703,6 +1730,184 @@ prepare_aloula_url_for_index() {
             return 0
         fi
         log_error "ALOULA: Failed to refresh token for index $index"
+        return 1
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# Elahmad.com resolver
+# =============================================================================
+# Uses elahmad.com's encrypted API to resolve live stream URLs.
+# Backup URLs use elahmad:<channel_id> scheme (e.g., elahmad:makkahtv).
+# The API returns AES-256-CBC encrypted stream URLs that we decrypt with openssl.
+# =============================================================================
+
+is_elahmad_url() {
+    local url="$1"
+    [[ "$url" =~ ^elahmad:[a-zA-Z0-9_-]+$ ]]
+}
+
+extract_elahmad_channel_id() {
+    local url="$1"
+    if [[ "$url" =~ ^elahmad:([a-zA-Z0-9_-]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+resolve_elahmad_url() {
+    local channel_id="$1"
+    local page_url="${ELAHMAD_BASE}/tv/mobiletv/glarb.php?id=${channel_id}"
+
+    # Step 1: Fetch the page to get CSRF token and session cookie
+    local cookie_jar
+    cookie_jar=$(mktemp /tmp/elahmad_cookies.XXXXXX)
+    local page_content
+    page_content=$(curl -sS --max-time "$ELAHMAD_RESOLVE_TIMEOUT" \
+        -c "$cookie_jar" \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+        -H "Accept: text/html,application/xhtml+xml" \
+        "$page_url" 2>$DEVNULL)
+    local curl_rc=$?
+    if [[ $curl_rc -ne 0 || -z "$page_content" ]]; then
+        log_error "ELAHMAD: Failed to fetch page for channel $channel_id (curl rc=$curl_rc)"
+        rm -f "$cookie_jar"
+        return 1
+    fi
+
+    # Extract CSRF token from meta tag
+    # The page is a single long line, so use grep -oP (Perl regex) with grep -oE fallback
+    local csrf_token
+    csrf_token=$(printf '%s' "$page_content" | grep -oP 'csrf-token"\s+content="\K[^"]+' 2>$DEVNULL | head -1)
+    if [[ -z "$csrf_token" ]]; then
+        csrf_token=$(printf '%s' "$page_content" | grep -oE 'csrf-token"[[:space:]]+content="[0-9a-f]+"' 2>$DEVNULL | head -1 | sed 's/.*content="//;s/"//')
+    fi
+    if [[ -z "$csrf_token" ]]; then
+        log_error "ELAHMAD: No CSRF token found in page for channel $channel_id"
+        rm -f "$cookie_jar"
+        return 1
+    fi
+
+    # Step 2: POST to the API endpoint with CSRF token and session cookie
+    local api_url="${ELAHMAD_BASE}/tv/result/embed_result_80.php"
+    local api_response
+    api_response=$(curl -sS --max-time "$ELAHMAD_RESOLVE_TIMEOUT" \
+        -b "$cookie_jar" \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -H "X-Requested-With: XMLHttpRequest" \
+        -H "Referer: ${page_url}" \
+        -d "id=${channel_id}&csrf_token=${csrf_token}" \
+        "$api_url" 2>$DEVNULL)
+    curl_rc=$?
+    rm -f "$cookie_jar"
+
+    if [[ $curl_rc -ne 0 || -z "$api_response" ]]; then
+        log_error "ELAHMAD: API request failed for channel $channel_id (curl rc=$curl_rc)"
+        return 1
+    fi
+
+    # Step 3: Parse JSON response — extract link_4, key, iv
+    local encrypted_link aes_key aes_iv
+    if command -v jq &>$DEVNULL; then
+        encrypted_link=$(printf '%s' "$api_response" | jq -r '.link_4 // .link_3 // .link_2 // .link_1 // empty' 2>$DEVNULL)
+        aes_key=$(printf '%s' "$api_response" | jq -r '.key // empty' 2>$DEVNULL)
+        aes_iv=$(printf '%s' "$api_response" | jq -r '.iv // empty' 2>$DEVNULL)
+    fi
+    # Fallback to sed if jq unavailable or failed — unescape JSON \/ to /
+    if [[ -z "$encrypted_link" ]]; then
+        encrypted_link=$(printf '%s' "$api_response" | sed -n 's/.*"link_4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's|\\\/|/|g')
+        [[ -z "$encrypted_link" ]] && encrypted_link=$(printf '%s' "$api_response" | sed -n 's/.*"link_3"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's|\\\/|/|g')
+        [[ -z "$encrypted_link" ]] && encrypted_link=$(printf '%s' "$api_response" | sed -n 's/.*"link_2"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's|\\\/|/|g')
+        [[ -z "$encrypted_link" ]] && encrypted_link=$(printf '%s' "$api_response" | sed -n 's/.*"link_1"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's|\\\/|/|g')
+    fi
+    if [[ -z "$aes_key" ]]; then
+        aes_key=$(printf '%s' "$api_response" | sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+    if [[ -z "$aes_iv" ]]; then
+        aes_iv=$(printf '%s' "$api_response" | sed -n 's/.*"iv"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+
+    if [[ -z "$encrypted_link" ]]; then
+        log_error "ELAHMAD: No encrypted link found in API response for channel $channel_id"
+        return 1
+    fi
+    if [[ -z "$aes_key" || -z "$aes_iv" ]]; then
+        log_error "ELAHMAD: Missing AES key/iv in API response for channel $channel_id"
+        return 1
+    fi
+
+    # Step 4: Decrypt the stream URL using openssl
+    local decrypted_url
+    decrypted_url=$(printf '%s' "$encrypted_link" | openssl enc -aes-256-cbc -d -A -base64 -K "$aes_key" -iv "$aes_iv" 2>$DEVNULL)
+    if [[ $? -ne 0 || -z "$decrypted_url" ]]; then
+        log_error "ELAHMAD: AES decryption failed for channel $channel_id"
+        return 1
+    fi
+
+    # Strip any trailing whitespace/control chars
+    decrypted_url=$(printf '%s' "$decrypted_url" | tr -d '[:cntrl:]' | sed 's/[[:space:]]*$//')
+
+    if [[ ! "$decrypted_url" =~ ^https?:// ]]; then
+        log_error "ELAHMAD: Decrypted URL is not valid HTTP(S): $decrypted_url"
+        return 1
+    fi
+
+    echo "$decrypted_url"
+    return 0
+}
+
+resolve_elahmad_url_for_index() {
+    local index="$1"
+    local original="${url_original[$index]}"
+    local elahmad_ch_id
+    elahmad_ch_id=$(extract_elahmad_channel_id "$original") || {
+        log_error "ELAHMAD: Cannot extract channel ID from ${original}"
+        return 1
+    }
+
+    local resolved
+    resolved=$(resolve_elahmad_url "$elahmad_ch_id") || return 1
+
+    url_array[$index]="$resolved"
+    url_elahmad_resolve_time[$index]=$(date +%s)
+
+    log "ELAHMAD: Resolved channel $elahmad_ch_id for index $index → $(echo "$resolved" | head -c 80)..."
+    return 0
+}
+
+elahmad_url_needs_refresh() {
+    local index="$1"
+    local now
+    now=$(date +%s)
+    local last_resolve="${url_elahmad_resolve_time[$index]:-0}"
+    [[ "$last_resolve" =~ ^[0-9]+$ ]] || last_resolve=0
+
+    if [[ "$last_resolve" -le 0 ]]; then
+        return 0  # Never resolved → refresh
+    fi
+    if [[ $((now - last_resolve)) -ge "$ELAHMAD_REFRESH_INTERVAL" ]]; then
+        return 0  # Interval elapsed → refresh
+    fi
+    return 1  # Still fresh
+}
+
+prepare_elahmad_url_for_index() {
+    local index="$1"
+    local original="${url_original[$index]}"
+    if ! is_elahmad_url "$original"; then
+        return 0
+    fi
+
+    if elahmad_url_needs_refresh "$index"; then
+        log "ELAHMAD: Refresh needed for index $index"
+        if resolve_elahmad_url_for_index "$index"; then
+            return 0
+        fi
+        log_error "ELAHMAD: Failed to refresh URL for index $index"
         return 1
     fi
 
@@ -1970,11 +2175,27 @@ extract_youtube_expiry() {
         return 0
     fi
 
+    # Browser resolver URLs: the resolver handles renewal internally.
+    # Return 0 (no expiry) so youtube_url_needs_refresh() never triggers.
+    if is_browser_resolver_url "$url"; then
+        echo "0"
+        return 0
+    fi
+
     # Fallback: assume 5 hours from now if no expire found
     local fallback=$(($(date +%s) + 18000))
     log "YOUTUBE: No expiry found in URL, assuming 5 hours from now"
     echo "$fallback"
     return 0  # Return success since we're providing a valid fallback timestamp
+}
+
+# Check if a URL is served by the browser resolver (stable proxy, no restart needed)
+is_browser_resolver_url() {
+    local url="$1"
+    [[ -n "$YOUTUBE_BROWSER_RESOLVER" ]] || return 1
+    local resolver_origin="${YOUTUBE_BROWSER_RESOLVER%/}"
+    [[ "$url" == "${resolver_origin}"/* ]] && return 0
+    return 1
 }
 
 # Initialize YouTube metadata for a URL slot
@@ -2003,6 +2224,29 @@ init_url_youtube_metadata() {
         else
             log_error "ALOULA: Failed initial resolution for index $index, will retry before use"
             url_expire_time[$index]=0
+            return 1
+        fi
+    fi
+
+    # Handle elahmad: scheme URLs (resolve via elahmad.com encrypted API)
+    if is_elahmad_url "$url"; then
+        url_is_youtube[$index]=0
+        url_youtube_type[$index]=""
+        url_original[$index]="$url"
+        url_general_url[$index]=""
+        url_is_seenshow[$index]=0
+        url_seenshow_hls_path[$index]=""
+        url_seenshow_expiry[$index]=0
+        url_expire_time[$index]=0
+
+        local elahmad_ch_id
+        elahmad_ch_id=$(extract_elahmad_channel_id "$url")
+        log "ELAHMAD: Detected elahmad:${elahmad_ch_id} URL at index $index"
+
+        if resolve_elahmad_url_for_index "$index"; then
+            return 0
+        else
+            log_error "ELAHMAD: Failed initial resolution for index $index, will retry before use"
             return 1
         fi
     fi
@@ -2055,8 +2299,12 @@ init_url_youtube_metadata() {
             init_url_seenshow_metadata "$index" "${url_array[$index]}"
 
             local expire_date
-            expire_date=$(date -d "@$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
-            log "YOUTUBE: URL index $index resolved ($yt_type), expires at $expire_date"
+            if [[ "$expire_time" -eq 0 ]]; then
+                log "YOUTUBE: URL index $index resolved ($yt_type), browser-proxied (no expiry tracking)"
+            else
+                expire_date=$(date -d "@$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
+                log "YOUTUBE: URL index $index resolved ($yt_type), expires at $expire_date"
+            fi
             return 0
         else
             log_error "YOUTUBE: Failed initial resolution for index $index, keeping original URL"
@@ -2161,8 +2409,12 @@ youtube_refetch_via_general() {
             url_general_url[$index]="$general_url"
 
             local expire_date
-            expire_date=$(date -d "@$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
-            log "YOUTUBE_REFETCH: Success! New stream resolved, expires at $expire_date"
+            if [[ "$expire_time" -eq 0 ]]; then
+                log "YOUTUBE_REFETCH: Success! New stream resolved, browser-proxied (no expiry tracking)"
+            else
+                expire_date=$(date -d "@$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$expire_time" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
+                log "YOUTUBE_REFETCH: Success! New stream resolved, expires at $expire_date"
+            fi
             return 0
         fi
 
@@ -2279,8 +2531,12 @@ refresh_youtube_url() {
     url_array[$index]="$new_resolved"
 
     local expire_date
-    expire_date=$(date -d "@$new_expire" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$new_expire" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
-    log "YOUTUBE_REFRESH: URL index $index refreshed, new expiry: $expire_date"
+    if [[ "$new_expire" -eq 0 ]]; then
+        log "YOUTUBE_REFRESH: URL index $index refreshed, browser-proxied (no expiry tracking)"
+    else
+        expire_date=$(date -d "@$new_expire" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || date -r "$new_expire" '+%Y-%m-%d %H:%M:%S' 2>$DEVNULL || echo "unknown")
+        log "YOUTUBE_REFRESH: URL index $index refreshed, new expiry: $expire_date"
+    fi
     return 0
 }
 
@@ -2314,6 +2570,14 @@ check_youtube_urls_need_refresh() {
             break  # Only refresh one backup per cycle
         fi
     done
+
+    # Log browser-resolver status once per session
+    if [[ "${url_is_youtube[$current_url_index]}" == "1" ]] && is_browser_resolver_url "${url_array[$current_url_index]}"; then
+        if [[ "${_browser_resolver_logged:-0}" -eq 0 ]]; then
+            log "YOUTUBE_REFRESH: Current URL (index $current_url_index) is browser-proxied; resolver handles renewal internally"
+            _browser_resolver_logged=1
+        fi
+    fi
 
     if [[ $current_refresh_needed -eq 1 ]]; then
         return 0  # Signal that current URL was refreshed - need FFmpeg restart
@@ -2893,8 +3157,10 @@ reload_config_if_changed() {
 
         # Reset retry arrays for new URL count
         url_retry_counts=()
+        url_costly_short_runs=()
         for ((i=0; i<url_count; i++)); do
             url_retry_counts[$i]=0
+            url_costly_short_runs[$i]=0
         done
 
         # If current_url_index is now out of bounds, reset to primary
@@ -2992,7 +3258,11 @@ validate_url() {
     local timeout=10
     local response
 
-    # MAJOR FIX: Use same User-Agent as ffmpeg to avoid false 4xx from UA mismatch
+    # Use effective_user_agent() to pick the right UA per URL (kwikmotion
+    # CDN blocks browser/tool UAs over plain HTTP).
+    local ua
+    ua=$(effective_user_agent "$test_url")
+
     # IMPORTANT: Avoid GET + -L for stream URLs; it can download large amounts of
     # data and create unnecessary provider connections. Prefer a lightweight
     # HEAD request and treat 3xx as "reachable".
@@ -3001,15 +3271,15 @@ validate_url() {
     # shellcheck disable=SC2094
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
         if command -v timeout >$DEVNULL 2>&1; then
-            response=$(timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            response=$(timeout $((timeout + 2)) torsocks curl -A "$ua" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
         else
-            response=$(torsocks curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            response=$(torsocks curl -A "$ua" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
         fi
     else
         if command -v timeout >$DEVNULL 2>&1; then
-            response=$(timeout $((timeout + 2)) curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            response=$(timeout $((timeout + 2)) curl -A "$ua" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
         else
-            response=$(curl -A "$USER_AGENT" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+            response=$(curl -A "$ua" -I -s -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
         fi
     fi
 
@@ -3017,15 +3287,15 @@ validate_url() {
     if [[ "$response" == "405" || "$response" == "000" ]]; then
         if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
             if command -v timeout >$DEVNULL 2>&1; then
-                response=$(timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+                response=$(timeout $((timeout + 2)) torsocks curl -A "$ua" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
             else
-                response=$(torsocks curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+                response=$(torsocks curl -A "$ua" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
             fi
         else
             if command -v timeout >$DEVNULL 2>&1; then
-                response=$(timeout $((timeout + 2)) curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+                response=$(timeout $((timeout + 2)) curl -A "$ua" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
             else
-                response=$(curl -A "$USER_AGENT" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
+                response=$(curl -A "$ua" -s -r 0-0 -o "$DEVNULL" -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true)
             fi
         fi
     fi
@@ -3037,19 +3307,21 @@ validate_url() {
 fetch_url_body() {
     local test_url="$1"
     local timeout="${2:-10}"
+    local ua
+    ua=$(effective_user_agent "$test_url")
 
     # Use torsocks if proxy is configured for Tor
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
         if command -v timeout >$DEVNULL 2>&1; then
-            timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            timeout $((timeout + 2)) torsocks curl -A "$ua" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         else
-            torsocks curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            torsocks curl -A "$ua" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         fi
     else
         if command -v timeout >$DEVNULL 2>&1; then
-            timeout $((timeout + 2)) curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            timeout $((timeout + 2)) curl -A "$ua" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         else
-            curl -A "$USER_AGENT" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            curl -A "$ua" -L -s --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         fi
     fi
 }
@@ -3057,19 +3329,21 @@ fetch_url_body() {
 fetch_url_prefix() {
     local test_url="$1"
     local timeout="${2:-10}"
+    local ua
+    ua=$(effective_user_agent "$test_url")
 
     # Use torsocks if proxy is configured for Tor
     if [[ -n "$YTDLP_PROXY" ]] && proxy_is_local_tor "$YTDLP_PROXY" && command -v torsocks >$DEVNULL 2>&1; then
         if command -v timeout >$DEVNULL 2>&1; then
-            timeout $((timeout + 2)) torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            timeout $((timeout + 2)) torsocks curl -A "$ua" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         else
-            torsocks curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            torsocks curl -A "$ua" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         fi
     else
         if command -v timeout >$DEVNULL 2>&1; then
-            timeout $((timeout + 2)) curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            timeout $((timeout + 2)) curl -A "$ua" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         else
-            curl -A "$USER_AGENT" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
+            curl -A "$ua" -L -s -r 0-4096 --connect-timeout "$timeout" --max-time "$timeout" "$test_url" 2>$DEVNULL || true
         fi
     fi
 }
@@ -3196,7 +3470,9 @@ build_ffmpeg_cmd() {
 
     # Only add HTTP flags for direct HTTP connections (not for pipe input)
     if [[ "$use_https_proxy" -eq 0 && ("$scheme" == "http" || "$scheme" == "https") ]]; then
-        ffmpeg_cmd+=( "${base_flags[@]}" )
+        local ua
+        ua=$(effective_user_agent "$stream_url")
+        ffmpeg_cmd+=( -user_agent "$ua" -rw_timeout 30000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
     fi
 
     case "$scale" in
@@ -3356,8 +3632,10 @@ cycle_start_time=0
 
 # Per-URL retry state
 declare -a url_retry_counts
+declare -a url_costly_short_runs
 for ((i=0; i<url_count; i++)); do
     url_retry_counts[$i]=0
+    url_costly_short_runs[$i]=0
 done
 
 log_console "Starting [$channel_id] with ${url_count} URL(s)"
@@ -3386,6 +3664,7 @@ done
 reset_url_retries() {
     for ((i=0; i<url_count; i++)); do
         url_retry_counts[$i]=0
+        url_costly_short_runs[$i]=0
     done
 }
 
@@ -3559,6 +3838,16 @@ while true; do
         if ! prepare_aloula_url_for_index "$current_url_index"; then
             log_error "ALOULA: Failed to prepare URL index $current_url_index. Switching."
             switch_to_next_url "aloula_prepare_failed"
+            continue
+        fi
+        current_url="${url_array[$current_url_index]}"
+    fi
+
+    # On-demand elahmad URL refresh.
+    if is_elahmad_url "${url_original[$current_url_index]:-}"; then
+        if ! prepare_elahmad_url_for_index "$current_url_index"; then
+            log_error "ELAHMAD: Failed to prepare URL index $current_url_index. Switching."
+            switch_to_next_url "elahmad_prepare_failed"
             continue
         fi
         current_url="${url_array[$current_url_index]}"
@@ -4046,6 +4335,7 @@ while true; do
                 log "YOUTUBE_STREAM_END: Successfully re-fetched new stream. Restarting FFmpeg..."
                 # Reset retry counters since we got a new stream
                 url_retry_counts[$current_url_index]=0
+                url_costly_short_runs[$current_url_index]=0
                 # Brief pause to let the new stream stabilize
                 sleep 3
                 continue
@@ -4091,10 +4381,26 @@ while true; do
         url_retry_counts[$current_url_index]=$((current_retries + 1))
         current_retries=${url_retry_counts[$current_url_index]}
         rapid_failure_count=$((rapid_failure_count + 1))  # Track rapid failures for error log suppression
-        log "SHORT_RUN: Duration ${duration}s. URL $current_url_index retry count: $current_retries (rapid failures: $rapid_failure_count)"
 
+        # Track costly short runs (>30s) — these waste viewer time with long freezes
+        if [[ $duration -gt $SHORT_RUN_FAST_SWITCH_THRESHOLD ]]; then
+            url_costly_short_runs[$current_url_index]=$(( ${url_costly_short_runs[$current_url_index]} + 1 ))
+            costly_count=${url_costly_short_runs[$current_url_index]}
+            log "SHORT_RUN: Duration ${duration}s (costly #${costly_count}). URL $current_url_index retry count: $current_retries (rapid failures: $rapid_failure_count)"
+        else
+            log "SHORT_RUN: Duration ${duration}s. URL $current_url_index retry count: $current_retries (rapid failures: $rapid_failure_count)"
+        fi
+
+        # Switch URL if: standard 3 retries exhausted, OR 2 costly short runs
+        should_switch=0
         if [[ $current_retries -ge 3 ]]; then
-            # Exhausted retries for this URL, switch to next
+            should_switch=1
+        elif [[ ${url_costly_short_runs[$current_url_index]} -ge 2 ]]; then
+            log "FAST_SWITCH: 2 costly SHORT_RUNs (>${SHORT_RUN_FAST_SWITCH_THRESHOLD}s each) on URL $current_url_index — switching early"
+            should_switch=1
+        fi
+
+        if [[ $should_switch -eq 1 ]]; then
             next_url_index=$(( (current_url_index + 1) % url_count ))
             attempt_url_hotswap_and_exit_if_success "$next_url_index" "max_retries" || true
             switch_to_next_url "max_retries"
