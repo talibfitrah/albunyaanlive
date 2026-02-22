@@ -151,6 +151,43 @@ const SEENSHOW_RESOLVER_TIMEOUT_MS = parseBoundedInt(
 );
 const SEENSHOW_ENABLE_RESOLVER = process.env.SEENSHOW_ENABLE_RESOLVER !== '0';
 
+// ---------------------------------------------------------------------------
+// Ayyadonline Provider Configuration
+// ---------------------------------------------------------------------------
+const AYYADONLINE_CREDENTIALS_FILE = resolvePathFromBase(
+  CHANNELS_DIR,
+  process.env.AYYADONLINE_CREDENTIALS_FILE,
+  'ayyadonline_credentials.json'
+);
+const AYYADONLINE_CATALOG_FILE = resolvePathFromBase(
+  CHANNELS_DIR,
+  process.env.AYYADONLINE_CATALOG_FILE,
+  'ayyadonline_catalog.json'
+);
+
+// Hardcoded channel→ayyadonline stream mappings (1 credential per channel).
+// Stored here because the registry sanitizer strips unknown fields.
+const AYYADONLINE_CHANNEL_MAP = {
+  'almajd-news':           { stream_id: 77453,   credential: 'farouq10226' },
+  'almajd-kids':           { stream_id: 77336,   credential: 'farouq20226' },
+  'almajd-3aamah':         { stream_id: 201243,  credential: 'farouq30226' },
+  'natural':               { stream_id: 77334,   credential: 'farouq40226' },
+  'basmah':                { stream_id: 77338,   credential: 'farouq50226' },
+  'ajaweed':               { stream_id: 1302160, credential: 'farouq60226' },
+  'makkah':                { stream_id: 28179,   credential: 'farouq70226' },
+  'rawdah':                { stream_id: 77333,   credential: 'farouq80226' },
+  'arrahmah':              { stream_id: 28183,   credential: 'farouq90226' },
+  'almajd-islamic-science':{ stream_id: 1302162, credential: 'farouq100226' },
+  'uthaymeen':             { stream_id: 170860,  credential: 'farouq120226' },
+  'maassah':               { stream_id: 13058,   credential: 'farouq13226' },
+  'daal':                  { stream_id: 1302163, credential: 'farouq150226' },
+  'sunnah':                { stream_id: 50230,   credential: 'farouq160226' },
+  'mekkah-quran':          { stream_id: 50223,   credential: 'farouq170226' },
+  'almajd-documentary':    { stream_id: 77337,   credential: 'farouq180226' },
+  'nada':                  { stream_id: 75516,   credential: 'farouq190226' },
+  'zaad':                  { stream_id: 77065,   credential: 'farouq200226' },
+};
+
 // Credentials reserved for testing/spare — never assigned to any channel.
 const RESERVED_CREDENTIALS = new Set(
   (process.env.RESERVED_CREDENTIALS || '302285257136,964683414160')
@@ -193,6 +230,15 @@ const catalogNameIndex = new Map();
 
 /** @type {{ channels: Object }} */
 let registry = { channels: {} };
+
+/** @type {{ server: string, default_port: number, credentials: Array<{username: string, password: string}> } | null} */
+let ayyadonlineConfig = null;
+
+/** @type {Map<string, { username: string, password: string }>} */
+const ayyadonlineCredentialPool = new Map();
+
+/** @type {Map<number, { stream_id: number, name: string }>} */
+const ayyadonlineCatalog = new Map();
 
 let lastSyncTime = null;
 let syncInProgress = false;
@@ -586,7 +632,13 @@ function sanitizeRegistryChannel(channelId, rawChannel) {
     ? rawChannel.last_updated
     : null;
 
-  return {
+  // Ayyadonline provider metadata (optional — only for channels mapped to ayyadonline)
+  const ayyadonlineStreamId = parsePositiveStreamId(rawChannel.ayyadonline_stream_id);
+  const ayyadonlineCredential = typeof rawChannel.ayyadonline_credential === 'string'
+    ? rawChannel.ayyadonline_credential.trim()
+    : '';
+
+  const result = {
     stream_id: streamId,
     match_names: matchNames,
     config_file: configFile,
@@ -597,6 +649,16 @@ function sanitizeRegistryChannel(channelId, rawChannel) {
     vlc_as_backup: vlcAsBackup,
     last_updated: lastUpdated
   };
+
+  // Only include ayyadonline fields when present (avoid polluting channels without mapping)
+  if (ayyadonlineStreamId) {
+    result.ayyadonline_stream_id = ayyadonlineStreamId;
+  }
+  if (ayyadonlineCredential) {
+    result.ayyadonline_credential = ayyadonlineCredential;
+  }
+
+  return result;
 }
 
 function sanitizeRegistryData(data, sourceLabel = 'registry') {
@@ -1040,6 +1102,111 @@ async function syncCatalog() {
 }
 
 // ---------------------------------------------------------------------------
+// Ayyadonline Provider Functions
+// ---------------------------------------------------------------------------
+
+function loadAyyadonlineCredentials() {
+  if (!fs.existsSync(AYYADONLINE_CREDENTIALS_FILE)) {
+    warn(`Ayyadonline credentials file not found: ${AYYADONLINE_CREDENTIALS_FILE}`);
+    return false;
+  }
+  try {
+    ayyadonlineConfig = loadProviderConfigFile(AYYADONLINE_CREDENTIALS_FILE, CHANNELS_DIR);
+    ayyadonlineCredentialPool.clear();
+    for (const cred of ayyadonlineConfig.credentials) {
+      ayyadonlineCredentialPool.set(cred.username, {
+        username: cred.username,
+        password: cred.password
+      });
+    }
+    log(`Loaded ${ayyadonlineConfig.credentials.length} ayyadonline credentials for ${ayyadonlineConfig.server}`);
+    return true;
+  } catch (e) {
+    warn(`Failed to load ayyadonline credentials: ${e.message}`);
+    return false;
+  }
+}
+
+async function syncAyyadonlineCatalog() {
+  if (!ayyadonlineConfig || ayyadonlineCredentialPool.size === 0) {
+    return false;
+  }
+  const cred = ayyadonlineCredentialPool.values().next().value;
+  if (!cred) return false;
+
+  try {
+    log(`Fetching ayyadonline catalog using credential ${cred.username}...`);
+    const url = buildPlayerApiUrl(
+      ayyadonlineConfig.server,
+      ayyadonlineConfig.default_port,
+      cred.username,
+      cred.password,
+      'get_live_streams'
+    );
+    const streams = await httpGetJson(url, 30000);
+    if (!Array.isArray(streams)) {
+      warn('Ayyadonline catalog response is not an array');
+      return false;
+    }
+
+    ayyadonlineCatalog.clear();
+    let count = 0;
+    for (const stream of streams) {
+      const streamId = parsePositiveStreamId(stream.stream_id);
+      if (!streamId) continue;
+      ayyadonlineCatalog.set(streamId, {
+        stream_id: streamId,
+        name: stream.name || ''
+      });
+      count++;
+    }
+    log(`Ayyadonline catalog synced: ${count} live streams`);
+
+    // Save cache
+    atomicWriteFileSync(
+      AYYADONLINE_CATALOG_FILE,
+      JSON.stringify([...ayyadonlineCatalog.values()], null, 2)
+    );
+    return true;
+  } catch (e) {
+    warn(`Ayyadonline catalog sync failed: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Build an ayyadonline backup URL for a channel if mapped.
+ * Reads from registry metadata first (ayyadonline_stream_id / ayyadonline_credential),
+ * then falls back to hardcoded AYYADONLINE_CHANNEL_MAP for migration.
+ * Returns the URL string or null.
+ */
+function buildAyyadonlineBackupUrl(channelId, channelEntry) {
+  if (!ayyadonlineConfig) return null;
+
+  // Prefer registry-stored metadata (data-driven)
+  let streamId = null;
+  let credentialUsername = null;
+  if (channelEntry) {
+    streamId = parsePositiveStreamId(channelEntry.ayyadonline_stream_id);
+    credentialUsername = channelEntry.ayyadonline_credential || null;
+  }
+
+  // Fallback to hardcoded map during migration
+  if (!streamId || !credentialUsername) {
+    const mapping = AYYADONLINE_CHANNEL_MAP[channelId];
+    if (!mapping) return null;
+    streamId = streamId || mapping.stream_id;
+    credentialUsername = credentialUsername || mapping.credential;
+  }
+
+  if (!streamId || !credentialUsername) return null;
+  const cred = ayyadonlineCredentialPool.get(credentialUsername);
+  if (!cred) return null;
+
+  return `http://${ayyadonlineConfig.server}:${ayyadonlineConfig.default_port}/${cred.username}/${cred.password}/${streamId}`;
+}
+
+// ---------------------------------------------------------------------------
 // Name-Based Channel Matching
 // ---------------------------------------------------------------------------
 
@@ -1465,6 +1632,7 @@ function planChannelUrls(channel, resolvedStreamId, primaryCredential, backupCre
       primaryUrl: valid[0] || '',
       backup1: valid[1] || '',
       backup2: valid[2] || '',
+      backup3: valid[3] || '',
       vlcPrimaryUrl: ''
     };
   }
@@ -1490,18 +1658,18 @@ function planChannelUrls(channel, resolvedStreamId, primaryCredential, backupCre
     for (const backupUrl of vlcBackupUrls) {
       if (backupUrl === primaryUrl) continue;
       appendUniqueUrl(backups, seenBackups, backupUrl);
-      if (backups.length >= 2) break;
+      if (backups.length >= 3) break;
     }
   } else {
     for (const backupUrl of nonVlcBackups) {
       appendUniqueUrl(backups, seenBackups, backupUrl);
-      if (backups.length >= 2) break;
+      if (backups.length >= 3) break;
     }
-    if (backups.length < 2) {
+    if (backups.length < 3) {
       for (const backupUrl of vlcBackupUrls) {
         if (backupUrl === primaryUrl) continue;
         appendUniqueUrl(backups, seenBackups, backupUrl);
-        if (backups.length >= 2) break;
+        if (backups.length >= 3) break;
       }
     }
   }
@@ -1510,6 +1678,7 @@ function planChannelUrls(channel, resolvedStreamId, primaryCredential, backupCre
     primaryUrl,
     backup1: backups[0] || '',
     backup2: backups[1] || '',
+    backup3: backups[2] || '',
     vlcPrimaryUrl
   };
 }
@@ -1552,11 +1721,21 @@ function parseRequiredShellVar(content, varName) {
   return unescapeShellDoubleQuoted(matches[0][2]);
 }
 
+function parseOptionalShellVar(content, varName) {
+  const matches = getShellVarMatches(content, varName);
+  if (matches.length === 0) return null;
+  if (matches.length !== 1) {
+    throw new Error(`Expected at most one ${varName} assignment, found ${matches.length}`);
+  }
+  return unescapeShellDoubleQuoted(matches[0][2]);
+}
+
 function parseConfigContent(content) {
   return {
     stream_url: parseRequiredShellVar(content, 'stream_url'),
     stream_url_backup1: parseRequiredShellVar(content, 'stream_url_backup1'),
-    stream_url_backup2: parseRequiredShellVar(content, 'stream_url_backup2')
+    stream_url_backup2: parseRequiredShellVar(content, 'stream_url_backup2'),
+    stream_url_backup3: parseOptionalShellVar(content, 'stream_url_backup3')
   };
 }
 
@@ -1580,13 +1759,15 @@ function replaceShellVar(content, varName, newValue) {
  * Preserves all other content. Uses atomic write.
  * Returns { primaryChanged, backupsChanged }.
  */
-function updateConfigFile(filePath, newStreamUrl, newBackup1, newBackup2) {
+function updateConfigFile(filePath, newStreamUrl, newBackup1, newBackup2, newBackup3 = '') {
   const content = fs.readFileSync(filePath, 'utf8');
   const current = parseConfigContent(content);
 
+  const hasBackup3Var = current.stream_url_backup3 !== null;
   const primaryChanged = current.stream_url !== newStreamUrl;
   const backupsChanged = current.stream_url_backup1 !== newBackup1 ||
-                         current.stream_url_backup2 !== newBackup2;
+                         current.stream_url_backup2 !== newBackup2 ||
+                         (hasBackup3Var && current.stream_url_backup3 !== newBackup3);
 
   if (!primaryChanged && !backupsChanged) {
     return { primaryChanged: false, backupsChanged: false };
@@ -1609,12 +1790,16 @@ function updateConfigFile(filePath, newStreamUrl, newBackup1, newBackup2) {
   if (backupsChanged) {
     updated = replaceShellVar(updated, 'stream_url_backup1', newBackup1);
     updated = replaceShellVar(updated, 'stream_url_backup2', newBackup2);
+    if (hasBackup3Var) {
+      updated = replaceShellVar(updated, 'stream_url_backup3', newBackup3);
+    }
   }
 
   const persisted = parseConfigContent(updated);
   if (persisted.stream_url !== newStreamUrl ||
       persisted.stream_url_backup1 !== newBackup1 ||
-      persisted.stream_url_backup2 !== newBackup2) {
+      persisted.stream_url_backup2 !== newBackup2 ||
+      (hasBackup3Var && persisted.stream_url_backup3 !== newBackup3)) {
     throw new Error(`Failed to persist URL updates in ${filePath}`);
   }
 
@@ -1665,7 +1850,7 @@ async function triggerGracefulRestart(channelId, options = {}) {
  * Apply config update and ensure primary URL changes are only kept when
  * graceful restart succeeds.
  */
-async function applyConfigUpdateAndRestartIfNeeded(configPath, channelId, primaryUrl, backup1, backup2, options = {}) {
+async function applyConfigUpdateAndRestartIfNeeded(configPath, channelId, primaryUrl, backup1, backup2, backup3 = '', options = {}) {
   // Fail closed: never write an empty primary stream URL — it would break the channel.
   if (typeof primaryUrl !== 'string' || primaryUrl.trim() === '') {
     throw new Error(`Refusing to write empty stream_url for ${channelId}`);
@@ -1675,7 +1860,7 @@ async function applyConfigUpdateAndRestartIfNeeded(configPath, channelId, primar
     : (id) => triggerGracefulRestart(id, options.restartOptions || {});
 
   const previousContent = fs.readFileSync(configPath, 'utf8');
-  const result = updateConfigFile(configPath, primaryUrl, backup1, backup2);
+  const result = updateConfigFile(configPath, primaryUrl, backup1, backup2, backup3);
 
   if (!result.primaryChanged) {
     return result;
@@ -1717,6 +1902,14 @@ async function runSync() {
     const catalogOk = await syncCatalog();
     if (!catalogOk) {
       warn('Catalog sync failed, using cached data');
+    }
+
+    // 2b. Sync ayyadonline catalog
+    if (ayyadonlineConfig) {
+      const ayyadOk = await syncAyyadonlineCatalog();
+      if (!ayyadOk) {
+        warn('Ayyadonline catalog sync failed');
+      }
     }
 
     // 3. Load/bootstrap registry
@@ -1841,9 +2034,19 @@ async function runSync() {
         // Compare clean (token-stripped) URLs to detect real base-path changes,
         // not just token expiry differences.
         const cleanedBackups = seenshowResult.backups.map(stripSeenshowToken);
+
+        // Append ayyadonline backup URL if mapped (and not already present)
+        const ayyadonlineUrl = buildAyyadonlineBackupUrl(channelId, ch);
+        if (ayyadonlineUrl) {
+          const alreadyPresent = cleanedBackups.some(u => u === ayyadonlineUrl);
+          if (!alreadyPresent) {
+            cleanedBackups.push(ayyadonlineUrl);
+          }
+        }
+
         const nonVlcBackupsChanged = !arraysEqual(ch.non_vlc_backups, cleanedBackups);
         if (nonVlcBackupsChanged) {
-          log(`Refreshed Seenshow backup URLs for ${channelId}`);
+          log(`Updated non-vlc backup URLs for ${channelId}`);
         }
 
         // Pick credential for primary URL (1:1 policy — no backup credentials)
@@ -1884,7 +2087,7 @@ async function runSync() {
           bestCred,
           []
         );
-        const { primaryUrl, backup1, backup2 } = plannedUrls;
+        const { primaryUrl, backup1, backup2, backup3 } = plannedUrls;
 
         const streamIdChanged = resolvedStreamId !== ch.stream_id;
         const providerNameChanged = resolvedProviderName !== ch.provider_name;
@@ -1899,7 +2102,8 @@ async function runSync() {
           channelId,
           primaryUrl,
           backup1,
-          backup2
+          backup2,
+          backup3
         );
 
         if (result.primaryChanged) {
@@ -2058,7 +2262,7 @@ function handleResolve(req, res, channelId) {
     provider_name: ch.provider_name,
     primary_url: responseUrls[0],
     backup_urls: responseUrls.slice(1, 5),
-    non_vlc_backups: ch.non_vlc_backups || [],
+    non_vlc_backups: (ch.non_vlc_backups || []).map(redactUrlCredentials),
     total_available: urls.length
   };
 
@@ -2130,6 +2334,7 @@ async function main() {
 
   // Load configuration
   loadCredentials();
+  loadAyyadonlineCredentials();
   loadCatalogCache();
   loadRegistry();
 
@@ -2255,5 +2460,7 @@ module.exports = {
   validateProviderConfigShape,
   RESERVED_CREDENTIALS,
   getBestCredential,
+  buildAyyadonlineBackupUrl,
+  parseOptionalShellVar,
   _testSetCredentialPool,
 };

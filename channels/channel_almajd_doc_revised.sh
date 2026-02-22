@@ -14,6 +14,7 @@ stream_url="http://vlc.news:80/961461374831/515847104503/1407"
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/3.m3u8"
 stream_url_backup2=""
+stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/almajd-documentary/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-documentary/master.m3u8"
@@ -23,5 +24,6 @@ scale=4
 backup_urls=""
 [[ -n "$stream_url_backup1" ]] && backup_urls="$stream_url_backup1"
 [[ -n "$stream_url_backup2" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup2"
+[[ -n "$stream_url_backup3" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup3"
 
 ./generic_channel.sh "$stream_name" "$stream_id" "$stream_url" "$rtmp_url" "$scale" "$backup_urls"

@@ -208,17 +208,14 @@ while getopts 'hu:d:k:n:s:b:c:' OPTION; do
             echo "  -c FILE      Config file for hot-reload (optional)"
             echo ""
             echo "Scales:"
-            echo "  0 - Stream copy (default)"
-            echo "  2 - Stream copy with threads"
-            echo "  3 - NVIDIA GPU encode (no scaling) - 3.5Mbps"
-            echo "  4 - NVIDIA GPU encode + scale to 1080p - 3.5Mbps"
-            echo "  5 - CPU encode (libx264)"
-            echo "  6 - CPU encode + scale to 1080p"
-            echo "  7 - Stream copy with extended buffer"
-            echo "  8 - CUDA passthrough"
-            echo "  9 - Software decode + CPU scale + NVENC (for corrupted streams)"
-            echo " 10 - HIGH QUALITY: Software decode + NVENC (error tolerant) - 6-8Mbps VBR"
-            echo " 11 - HIGH QUALITY: Software decode + scale 1080p + NVENC - 6-8Mbps VBR"
+            echo "  0 - Stream copy (default) — no processing, remux only"
+            echo "  4 - GPU: CUDA decode + scale to 1080p + NVENC encode (3.5Mbps)"
+            echo "  9 - GPU tolerant: Software decode + GPU scale + NVENC (for corrupted/RTMP)"
+            echo "      Falls back to libx264 CPU pipeline when GPU is unavailable"
+            echo " 12 - GPU stretch: CUDA decode + stretch-fill 1080p + NVENC (6-8Mbps VBR)"
+            echo ""
+            echo "Legacy aliases (mapped to above):"
+            echo "  2,7,8 → 0 (copy)   3 → 4 (gpu)   5,6,10,11 → 9 (tolerant)   13 → 12 (stretch)"
             echo ""
             echo "YouTube URL Support:"
             echo "  Two types of YouTube live URLs are supported:"
@@ -472,9 +469,15 @@ require_encoder() {
 }
 
 require_ffmpeg
-if [[ "$scale" == "5" || "$scale" == "6" ]]; then
-    require_encoder "libx264"
-fi
+# Scale 9 (and aliases 5,6,10,11) falls back to libx264 when GPU is unavailable.
+# Check availability at startup so we fail fast instead of mid-stream.
+case "$scale" in
+    9|5|6|10|11)
+        if ! nvidia-smi >$DEVNULL 2>&1; then
+            require_encoder "libx264"
+        fi
+        ;;
+esac
 
 # Cache supported FFmpeg input protocols once (used to fast-fail unsupported URL schemes like https
 # when ffmpeg is built without TLS support).
@@ -640,6 +643,13 @@ cleanup_orphaned_error_files
 cleanup_done=0
 preserve_runtime_markers=0
 
+# Early no-op stubs for functions referenced in cleanup()/trap paths.
+# Full implementations are defined later, after all dependencies are available.
+# This prevents "command not found" when cleanup fires before the full defs load
+# (e.g., duplicate-lock early exit).
+slate_ffmpeg_pid=""
+stop_slate_stream() { :; }
+
 mark_successful_handoff_exit() {
     local reason="${1:-handoff}"
     preserve_runtime_markers=1
@@ -652,6 +662,9 @@ cleanup() {
         return
     fi
     cleanup_done=1
+
+    # Stop slate placeholder if running
+    stop_slate_stream
 
     # Stop proxy process (streamlink/yt-dlp) first to avoid pipeline waits
     if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>$DEVNULL; then
@@ -3109,10 +3122,13 @@ reload_config_if_changed() {
         backups_defined=true
         local b1
         local b2
+        local b3
         b1=$(parse_config_value "$config_file" "stream_url_backup1")
         b2=$(parse_config_value "$config_file" "stream_url_backup2")
+        b3=$(parse_config_value "$config_file" "stream_url_backup3")
         [[ -n "$b1" ]] && new_backups="$b1"
         [[ -n "$b2" ]] && new_backups="${new_backups:+$new_backups|}$b2"
+        [[ -n "$b3" ]] && new_backups="${new_backups:+$new_backups|}$b3"
     fi
 
     # If primary URL changed, re-initialize metadata (works for both YouTube and regular URLs)
@@ -3447,6 +3463,67 @@ base_flags=( -user_agent "$USER_AGENT" -rw_timeout 30000000 -reconnect 1 -reconn
 hls_seamless=( -hls_start_number_source epoch -hls_list_size 15 )
 
 # =============================================================================
+# Slate failover: placeholder stream during URL transitions
+# =============================================================================
+
+SLATE_VIDEO="/var/www/html/stream/hls/slate/slate_loop.mp4"
+slate_ffmpeg_pid=""
+
+start_slate_stream() {
+    local output="$1"
+    [[ ! -f "$SLATE_VIDEO" ]] && { log "SLATE: No slate video found at $SLATE_VIDEO"; return 1; }
+    [[ -n "$slate_ffmpeg_pid" ]] && kill -0 "$slate_ffmpeg_pid" 2>$DEVNULL && return 0
+
+    log "SLATE: Starting placeholder stream..."
+    ffmpeg -re -stream_loop -1 -i "$SLATE_VIDEO" \
+      -c copy -map 0:v:0 -map 0:a:0 \
+      -f hls -hls_time 6 -hls_list_size 15 \
+      -hls_start_number_source epoch \
+      -hls_flags delete_segments+temp_file+omit_endlist \
+      "$output" </dev/null >$DEVNULL 2>&1 &
+    slate_ffmpeg_pid=$!
+    log "SLATE: Placeholder started (PID $slate_ffmpeg_pid)"
+}
+
+stop_slate_stream() {
+    [[ -z "$slate_ffmpeg_pid" ]] && return
+    kill -TERM "$slate_ffmpeg_pid" 2>$DEVNULL || true
+    wait "$slate_ffmpeg_pid" 2>$DEVNULL || true
+    slate_ffmpeg_pid=""
+    log "SLATE: Placeholder stopped"
+}
+
+inject_discontinuity_tag() {
+    local playlist="$1"
+    [[ ! -f "$playlist" ]] && return
+    # Add #EXT-X-DISCONTINUITY before the first segment entry to tell
+    # players to reset their decoders after slate/stream transition.
+    local tmp="${playlist}.disc_tmp"
+    awk '
+        /^#EXTINF:/ && !done { print "#EXT-X-DISCONTINUITY"; done=1 }
+        { print }
+    ' "$playlist" > "$tmp" && mv -f "$tmp" "$playlist"
+}
+
+# =============================================================================
+# CPU guard: kill runaway FFmpeg processes
+# =============================================================================
+
+check_ffmpeg_cpu_usage() {
+    [[ -z "$ffmpeg_pid" ]] && return 0
+    local cpu
+    cpu=$(ps -p "$ffmpeg_pid" -o %cpu= 2>$DEVNULL | tr -d ' ')
+    [[ -z "$cpu" ]] && return 0
+    local cpu_int=${cpu%.*}
+    if [[ $cpu_int -gt 200 ]]; then
+        log "CPU_GUARD: FFmpeg PID $ffmpeg_pid using ${cpu}% CPU — killing to prevent system overload"
+        kill -TERM "$ffmpeg_pid" 2>$DEVNULL
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # Build FFmpeg command based on scale
 # =============================================================================
 
@@ -3476,120 +3553,58 @@ build_ffmpeg_cmd() {
     fi
 
     case "$scale" in
-        2)
-            # Stream copy with threads
-            ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 10 -threads 2 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        3)
-            # NVIDIA GPU encode (no scaling) - FIXED: added GOP, tune, bufsize
+        4|3)
+            # GPU: CUDA decode + scale to 1080p + NVENC encode
+            # Standard re-encode mode for sources needing normalization
+            # (scale 3 aliased here — always scale to ensure consistent 1080p)
             ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -g 180 -keyint_min 180 -bf 0 )
-            ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        4)
-            # NVIDIA GPU encode + scale to 1080p - FIXED: added GOP, tune, bufsize
-            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             ffmpeg_cmd+=( -vf "scale_npp=1920:1080" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -g 180 -keyint_min 180 -bf 0 )
-            ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 0 )
+            ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
-        5)
-            # CPU encode (libx264)
-            ffmpeg_cmd+=( -i "$actual_input_url" )
-            ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -g 180 -keyint_min 180 )
-            ffmpeg_cmd+=( -c:a aac -b:a 128k -bufsize 16M -b:v 2500k -threads 2 )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        6)
-            # CPU encode + scale to 1080p
-            ffmpeg_cmd+=( -i "$actual_input_url" )
-            ffmpeg_cmd+=( -vf "scale=1920:1080" -c:v libx264 -preset ultrafast -tune zerolatency -g 180 -keyint_min 180 )
-            ffmpeg_cmd+=( -c:a aac -b:a 128k -bufsize 16M -b:v 2500k -threads 2 )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        7)
-            # Stream copy with extended buffer - FIXED: added hls_seamless (epoch)
-            ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 10 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file+omit_endlist -bufsize 5000k "$output_path" )
-            ;;
-        8)
-            # CUDA passthrough - FIXED: added hls_seamless (epoch) and bufsize
-            ffmpeg_cmd+=( -hwaccel cuda -i "$actual_input_url" -c copy -f hls -hls_time 10 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+program_date_time+temp_file+omit_endlist -bufsize 7000k "$output_path" )
-            ;;
-        9)
-            # Software decode + CPU scale + NVENC encode (for problematic streams)
-            # Uses software decoder which tolerates corrupted H.264 packets better than h264_cuvid
-            # Added error recovery flags to handle severely corrupted streams
+        9|5|6|10|11)
+            # GPU tolerant: Software decode (error tolerant) + GPU scale + NVENC encode
+            # For corrupted/RTMP sources where h264_cuvid fails
+            # Falls back to full CPU pipeline if GPU is unavailable
+            # (scales 5,6,10,11 aliased here)
             ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
             ffmpeg_cmd+=( -i "$actual_input_url" )
-            ffmpeg_cmd+=( -vf "scale=1920:1080" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -g 180 -keyint_min 180 -bf 0 )
-            ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
+            if nvidia-smi >$DEVNULL 2>&1; then
+                ffmpeg_cmd+=( -vf "format=nv12,hwupload_cuda,scale_npp=1920:1080" )
+                ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 0 )
+                ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
+            else
+                log "SCALE9: GPU unavailable, falling back to full CPU pipeline"
+                ffmpeg_cmd+=( -vf "scale=1920:1080" )
+                ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -profile:v high -level 4.1 -g 180 -keyint_min 180 )
+                ffmpeg_cmd+=( -b:v 2500k -maxrate 3000k -bufsize 6000k -threads 4 )
+            fi
+            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
-        10)
-            # HIGH QUALITY: Software decode + NVENC encode (tolerates corrupted RTMP streams)
-            # Uses software decoder for error tolerance, NVENC for efficient encoding
-            # Best for RTMP sources that may have occasional packet corruption
-            ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
-            ffmpeg_cmd+=( -i "$actual_input_url" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
-            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        11)
-            # HIGH QUALITY: Software decode + scale to 1080p + NVENC (tolerates corrupted streams)
-            # Uses software decoder for error tolerance, CPU scaling, NVENC for encoding
-            ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
-            ffmpeg_cmd+=( -i "$actual_input_url" )
-            ffmpeg_cmd+=( -vf "scale=1920:1080" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
-            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        12)
-            # GPU STRETCH TO FILL: CUDA decode + scale_npp exact dimensions + NVENC
-            # Stretches video to exactly 1920x1080, removing any black bars
-            # Pure GPU processing with high quality NVENC settings
+        12|13)
+            # GPU stretch: CUDA decode + stretch-fill to 1920x1080 + NVENC encode
+            # For sources with non-16:9 aspect ratios (black bar removal)
+            # (scale 13 aliased here)
             ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             ffmpeg_cmd+=( -vf "scale_npp=w=1920:h=1080:interp_algo=lanczos" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
-            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
-            ;;
-        13)
-            # GPU SCALE + CROP: CUDA decode + scale_npp to fill + crop to remove excess
-            # Scales up to fill frame maintaining aspect ratio, then crops to exact size
-            # Uses brief GPU-CPU-GPU transfer for crop operation
-            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
-            ffmpeg_cmd+=( -vf "scale_npp=1920:1080:force_original_aspect_ratio=increase:interp_algo=lanczos,hwdownload,format=nv12,crop=1920:1080,hwupload_cuda" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -g 180 -keyint_min 180 -bf 2 )
-            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k -threads 4 )
+            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         *)
-            # Default: stream copy
-            ffmpeg_cmd+=( -re -i "$actual_input_url" -c copy -f hls -hls_time 6 )
+            # Copy: Stream copy, no processing (scales 0, 2, 7, 8 and default)
+            # Select first video + first audio only to avoid multi-track issues
+            ffmpeg_cmd+=( -re -i "$actual_input_url" -map 0:v:0 -map 0:a:0? -c copy -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
     esac
@@ -3907,6 +3922,13 @@ while true; do
         exit 0
     fi
 
+    # Stop slate before starting real stream
+    slate_was_active=0
+    if [[ -n "$slate_ffmpeg_pid" ]]; then
+        slate_was_active=1
+        stop_slate_stream
+    fi
+
     # Build and execute FFmpeg command
     ffmpeg_cmd=()
     build_ffmpeg_cmd "$current_url" "$destination"
@@ -3929,6 +3951,8 @@ while true; do
 
     # Run FFmpeg in background so we can hot-reload config and check primary health
     proxy_pid=""
+    proxy_watchdog_strikes=0
+    proxy_cputime_prev=""
     stream_fifo="/dev/shm/stream_pipe_${channel_id}_$$"
     if [[ "$use_https_proxy" -eq 1 ]]; then
         if [[ ! -d "/dev/shm" || ! -w "/dev/shm" ]]; then
@@ -4038,6 +4062,56 @@ while true; do
     while is_process_running "$ffmpeg_pid"; do
         sleep 1
 
+        # SLATE→REAL DISCONTINUITY: After the first real segment appears,
+        # inject #EXT-X-DISCONTINUITY so players reset decoders.
+        if [[ $slate_was_active -eq 1 ]]; then
+            # Check if FFmpeg has produced at least one .ts segment
+            dest_dir=$(dirname "$destination")
+            if ls "$dest_dir"/*.ts 1>$DEVNULL 2>&1; then
+                inject_discontinuity_tag "$destination"
+                slate_was_active=0
+                log "SLATE: Injected discontinuity tag after slate→real transition"
+            fi
+        fi
+
+        # PROXY_WATCHDOG: Detect hung streamlink/proxy processes.
+        # If the proxy dies while FFmpeg is running, FFmpeg will get EOF on the
+        # FIFO and exit on its own. But if the proxy hangs (e.g. stuck on
+        # network I/O via torsocks), it consumes CPU forever. Kill FFmpeg so
+        # the outer loop can retry with a fresh proxy.
+        if [[ -n "$proxy_pid" ]]; then
+            if ! kill -0 "$proxy_pid" 2>$DEVNULL; then
+                log "PROXY_WATCHDOG: Proxy PID $proxy_pid exited while FFmpeg still running; FFmpeg will get EOF"
+                proxy_pid=""
+            else
+                # Measure instantaneous CPU using /proc/stat (jiffies delta over ~1s).
+                # ps %cpu is a lifetime average and won't catch recently-hung processes.
+                proxy_cputime_now=$(awk '{print $14+$15}' "/proc/$proxy_pid/stat" 2>$DEVNULL)
+                if [[ -n "$proxy_cputime_now" ]]; then
+                    if [[ -n "$proxy_cputime_prev" ]]; then
+                        cpu_delta=$(( proxy_cputime_now - proxy_cputime_prev ))
+                        # ~100 jiffies/sec on most kernels; delta >90 in 1s ≈ >90% CPU
+                        if [[ "$cpu_delta" -ge 90 ]]; then
+                            proxy_watchdog_strikes=$(( proxy_watchdog_strikes + 1 ))
+                            if [[ "$proxy_watchdog_strikes" -ge 60 ]]; then
+                                log_error "PROXY_WATCHDOG: Proxy PID $proxy_pid stuck at high CPU for 60+ seconds. Killing."
+                                kill -KILL "$proxy_pid" 2>$DEVNULL || true
+                                proxy_pid=""
+                                proxy_watchdog_strikes=0
+                                proxy_cputime_prev=""
+                                stop_reason="proxy_hung"
+                                kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                                break
+                            fi
+                        else
+                            proxy_watchdog_strikes=0
+                        fi
+                    fi
+                    proxy_cputime_prev="$proxy_cputime_now"
+                fi
+            fi
+        fi
+
         # ERROR_LOG_SIZE_LIMIT: Prevent unbounded error log growth
         truncate_error_log_if_needed "$ffmpeg_error_file"
 
@@ -4145,6 +4219,14 @@ while true; do
             break
         fi
 
+        # CPU_GUARD: kill runaway FFmpeg to prevent system overload
+        if [[ -z "$stop_reason" ]]; then
+            if ! check_ffmpeg_cpu_usage; then
+                stop_reason="cpu_guard"
+                break
+            fi
+        fi
+
         # SEGMENT_STALE: check if output is stale and switch to backup URL
         if [[ -z "$stop_reason" ]] && check_segment_staleness; then
             if [[ $url_count -lt 2 ]]; then
@@ -4204,12 +4286,20 @@ while true; do
     if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>$DEVNULL; then
         kill -TERM "$proxy_pid" 2>$DEVNULL || true
         sleep 1
-        kill -0 "$proxy_pid" 2>$DEVNULL && kill -KILL "$proxy_pid" 2>$DEVNULL || true
+        if kill -0 "$proxy_pid" 2>$DEVNULL; then
+            kill -KILL "$proxy_pid" 2>$DEVNULL || true
+        fi
     fi
     proxy_pid=""
     last_ffmpeg_pid="$ffmpeg_pid"
     end_time=$(date +%s)
     duration=$((end_time - start_time))
+
+    # Start slate placeholder to keep HLS alive during failover
+    if start_slate_stream "$destination"; then
+        # Inject discontinuity so players reset decoders after real→slate transition
+        inject_discontinuity_tag "$destination"
+    fi
 
     # ==========================================================================
     # CRITICAL FIX: Detect external kill (e.g., by health_monitor)
@@ -4238,6 +4328,24 @@ while true; do
         cleanup_ffmpeg_error_file "$ffmpeg_error_file"
         # Brief pause before restart with new URL
         sleep 1
+        continue
+    fi
+
+    # If we killed FFmpeg because the proxy/streamlink process hung, switch URL
+    if [[ "$stop_reason" == "proxy_hung" ]]; then
+        cleanup_ffmpeg_error_file "$ffmpeg_error_file"
+        log "PROXY_WATCHDOG: Switching to next URL after hung proxy"
+        switch_to_next_url "proxy_hung"
+        sleep 2
+        continue
+    fi
+
+    # If CPU guard killed FFmpeg, switch to next URL (may need different scale mode)
+    if [[ "$stop_reason" == "cpu_guard" ]]; then
+        cleanup_ffmpeg_error_file "$ffmpeg_error_file"
+        log "CPU_GUARD: Switching to next URL after CPU overload"
+        switch_to_next_url "cpu_guard"
+        sleep 3
         continue
     fi
 

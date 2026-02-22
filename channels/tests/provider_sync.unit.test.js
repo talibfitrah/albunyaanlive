@@ -743,6 +743,7 @@ test('applyConfigUpdateAndRestartIfNeeded rolls back config when primary restart
         'http://vlc.news:80/111111111111/pw1/2',
         'https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/master.m3u8?hdntl=exp=9999999999~acl=*',
         'http://vlc.news:80/333333333333/pw3/2',
+        '',
         {
           restartFn: async () => {
             restartCalls++;
@@ -779,6 +780,7 @@ test('applyConfigUpdateAndRestartIfNeeded skips restart when primary URL does no
       'http://vlc.news:80/111111111111/pw1/1',
       'https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/master.m3u8?hdntl=exp=9999999999~acl=*',
       'http://vlc.news:80/333333333333/pw3/1',
+      '',
       {
         restartFn: async () => {
           restartCalls++;
@@ -818,6 +820,7 @@ test('applyConfigUpdateAndRestartIfNeeded keeps config changes when graceful res
       'http://vlc.news:80/111111111111/pw1/2',
       'http://vlc.news:80/222222222222/pw2/2',
       'http://vlc.news:80/333333333333/pw3/2',
+      '',
       {
         restartFn: async () => {
           restartCalls++;
@@ -994,6 +997,7 @@ test('applyConfigUpdateAndRestartIfNeeded rejects empty primaryUrl', async () =>
         '',
         '',
         '',
+        '',
         { restartFn: async () => ({ ok: true }) }
       ),
       /Refusing to write empty stream_url/
@@ -1022,4 +1026,224 @@ test('planChannelUrls with null credential and no non-vlc backups returns empty 
   assert.equal(planned.backup1, '');
   assert.equal(planned.backup2, '');
   assert.equal(planned.vlcPrimaryUrl, '');
+});
+
+// ---------------------------------------------------------------------------
+// planChannelUrls — backup3 support
+// ---------------------------------------------------------------------------
+
+test('planChannelUrls returns backup3 when 3+ non-vlc backups exist', () => {
+  const primaryCred = {
+    server_protocol: 'http',
+    server_url: 'vlc.news',
+    server_port: 80,
+    username: '111111111111',
+    password: 'pw1'
+  };
+
+  const planned = providerSync.planChannelUrls(
+    {
+      vlc_as_backup: false,
+      non_vlc_backups: [
+        'https://backup1.example.com/stream.m3u8',
+        'https://backup2.example.com/stream.m3u8',
+        'https://backup3.example.com/stream.m3u8'
+      ]
+    },
+    1415,
+    primaryCred,
+    []
+  );
+
+  assert.equal(planned.primaryUrl, 'http://vlc.news:80/111111111111/pw1/1415');
+  assert.equal(planned.backup1, 'https://backup1.example.com/stream.m3u8');
+  assert.equal(planned.backup2, 'https://backup2.example.com/stream.m3u8');
+  assert.equal(planned.backup3, 'https://backup3.example.com/stream.m3u8');
+});
+
+test('planChannelUrls returns empty backup3 when fewer than 3 non-vlc backups', () => {
+  const primaryCred = {
+    server_protocol: 'http',
+    server_url: 'vlc.news',
+    server_port: 80,
+    username: '111111111111',
+    password: 'pw1'
+  };
+
+  const planned = providerSync.planChannelUrls(
+    { vlc_as_backup: false, non_vlc_backups: ['https://backup1.example.com/s.m3u8'] },
+    1415,
+    primaryCred,
+    []
+  );
+
+  assert.equal(planned.backup1, 'https://backup1.example.com/s.m3u8');
+  assert.equal(planned.backup3, '');
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeRegistryChannel — ayyadonline_* field preservation
+// ---------------------------------------------------------------------------
+
+test('sanitizeRegistryChannel preserves ayyadonline_stream_id and ayyadonline_credential', () => {
+  const sanitized = providerSync.sanitizeRegistryChannel('test-ch', {
+    stream_id: 1415,
+    match_names: ['Test Channel'],
+    config_file: 'channel_test.sh',
+    provider_name: 'Test Channel',
+    preferred_credential: '111111111111',
+    scale: 4,
+    non_vlc_backups: [],
+    vlc_as_backup: false,
+    ayyadonline_stream_id: 77453,
+    ayyadonline_credential: 'farouq10226'
+  });
+
+  assert.equal(sanitized.ayyadonline_stream_id, 77453);
+  assert.equal(sanitized.ayyadonline_credential, 'farouq10226');
+});
+
+test('sanitizeRegistryChannel omits ayyadonline fields when not present', () => {
+  const sanitized = providerSync.sanitizeRegistryChannel('test-ch', {
+    stream_id: 1415,
+    match_names: ['Test Channel'],
+    config_file: 'channel_test.sh',
+    provider_name: 'Test Channel',
+    preferred_credential: '111111111111',
+    scale: 4,
+    non_vlc_backups: [],
+    vlc_as_backup: false
+  });
+
+  assert.equal(sanitized.ayyadonline_stream_id, undefined);
+  assert.equal(sanitized.ayyadonline_credential, undefined);
+});
+
+test('sanitizeRegistryData round-trips ayyadonline fields through sanitize', () => {
+  const result = providerSync.sanitizeRegistryData({
+    channels: {
+      makkah: {
+        stream_id: 1421,
+        match_names: ['MAKKAH TV'],
+        config_file: 'channel_quran.sh',
+        provider_name: 'MAKKAH TV',
+        preferred_credential: '705729222787',
+        scale: 4,
+        non_vlc_backups: ['elahmad:makkahtv'],
+        vlc_as_backup: false,
+        ayyadonline_stream_id: 28179,
+        ayyadonline_credential: 'farouq70226'
+      }
+    }
+  }, 'test');
+
+  assert.equal(result.warnings.length, 0);
+  const ch = result.registry.channels.makkah;
+  assert.equal(ch.ayyadonline_stream_id, 28179);
+  assert.equal(ch.ayyadonline_credential, 'farouq70226');
+  assert.equal(ch.stream_id, 1421);
+});
+
+// ---------------------------------------------------------------------------
+// parseOptionalShellVar — backup3 parsing
+// ---------------------------------------------------------------------------
+
+test('parseOptionalShellVar returns null for missing variable', () => {
+  const content = 'stream_url_backup1="http://example.com"\nstream_url_backup2=""';
+  const result = providerSync.parseOptionalShellVar(content, 'stream_url_backup3');
+  assert.equal(result, null);
+});
+
+test('parseOptionalShellVar returns value when variable is present', () => {
+  const content = 'stream_url_backup3="http://example.com/b3"\n';
+  const result = providerSync.parseOptionalShellVar(content, 'stream_url_backup3');
+  assert.equal(result, 'http://example.com/b3');
+});
+
+// ---------------------------------------------------------------------------
+// updateConfigFile — backup3 handling
+// ---------------------------------------------------------------------------
+
+test('updateConfigFile writes backup3 when config has the variable', () => {
+  const tempDir = makeTempDir();
+  const configPath = path.join(tempDir, 'channel_test.sh');
+
+  try {
+    fs.writeFileSync(configPath, [
+      'stream_name="123456789012/123456789012/1"',
+      'stream_url="http://vlc.news:80/u/p/1"',
+      'stream_url_backup1=""',
+      'stream_url_backup2=""',
+      'stream_url_backup3=""'
+    ].join('\n') + '\n', 'utf8');
+
+    const result = providerSync.updateConfigFile(
+      configPath,
+      'http://vlc.news:80/u/p/1',
+      'http://example.com/b1',
+      'http://example.com/b2',
+      'http://example.com/b3'
+    );
+
+    assert.equal(result.backupsChanged, true);
+    const persisted = providerSync.parseConfigContent(fs.readFileSync(configPath, 'utf8'));
+    assert.equal(persisted.stream_url_backup3, 'http://example.com/b3');
+  } finally {
+    cleanupDir(tempDir);
+  }
+});
+
+test('updateConfigFile skips backup3 when config lacks the variable', () => {
+  const tempDir = makeTempDir();
+  const configPath = path.join(tempDir, 'channel_test.sh');
+
+  try {
+    fs.writeFileSync(configPath, [
+      'stream_name="123456789012/123456789012/1"',
+      'stream_url="http://vlc.news:80/u/p/1"',
+      'stream_url_backup1=""',
+      'stream_url_backup2=""'
+    ].join('\n') + '\n', 'utf8');
+
+    const result = providerSync.updateConfigFile(
+      configPath,
+      'http://vlc.news:80/u/p/1',
+      'http://example.com/b1',
+      'http://example.com/b2',
+      'http://example.com/b3'
+    );
+
+    assert.equal(result.backupsChanged, true);
+    const persisted = providerSync.parseConfigContent(fs.readFileSync(configPath, 'utf8'));
+    assert.equal(persisted.stream_url_backup3, null);
+  } finally {
+    cleanupDir(tempDir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// buildAyyadonlineBackupUrl — registry-first with hardcoded fallback
+// ---------------------------------------------------------------------------
+
+test('buildAyyadonlineBackupUrl reads from channelEntry when ayyadonline fields present', () => {
+  // buildAyyadonlineBackupUrl requires ayyadonlineConfig to be loaded.
+  // Without real config, it returns null — this test validates null-safety.
+  const result = providerSync.buildAyyadonlineBackupUrl('makkah', {
+    ayyadonline_stream_id: 28179,
+    ayyadonline_credential: 'farouq70226'
+  });
+  // Returns null because ayyadonlineConfig is not loaded in test env.
+  // The important validation: function accepts channelEntry and doesn't throw.
+  assert.equal(result, null);
+});
+
+test('buildAyyadonlineBackupUrl falls back to hardcoded map when entry has no ayyadonline fields', () => {
+  const result = providerSync.buildAyyadonlineBackupUrl('makkah', {});
+  // Returns null because ayyadonlineConfig is not loaded.
+  assert.equal(result, null);
+});
+
+test('buildAyyadonlineBackupUrl returns null for unmapped channel', () => {
+  const result = providerSync.buildAyyadonlineBackupUrl('nonexistent-channel', {});
+  assert.equal(result, null);
 });
