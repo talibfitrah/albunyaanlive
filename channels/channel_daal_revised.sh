@@ -10,6 +10,7 @@ stream_url="http://vlc.news:80/373914605863/721271717458/1409"
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://live.seenshow.com/hls/live/2120828/LIVE-008-DAL/3.m3u8"
 stream_url_backup2=""
+stream_url_backup3=""
 
 # Configure Tor proxy for seenshow.com URLs (geo-blocked)
 YTDLP_PROXY="${YTDLP_PROXY:-socks5://127.0.0.1:9050}"
@@ -23,5 +24,6 @@ scale=0
 backup_urls=""
 [[ -n "$stream_url_backup1" ]] && backup_urls="$stream_url_backup1"
 [[ -n "$stream_url_backup2" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup2"
+[[ -n "$stream_url_backup3" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup3"
 
 ./generic_channel.sh "$stream_name" "$stream_id" "$stream_url" "$rtmp_url" "$scale" "$backup_urls"

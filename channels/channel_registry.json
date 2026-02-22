@@ -82,12 +82,12 @@
       "config_file": "channel_almajd_nature_revised.sh",
       "provider_name": "Al Majd Tabeeya",
       "preferred_credential": "301821324699",
-      "scale": 7,
+      "scale": 0,
       "non_vlc_backups": [
         "https://live.seenshow.com/hls/live/2120827/LIVE-007-TABEEYA/3.m3u8"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:37.017Z"
+      "last_updated": "2026-02-18T23:30:42.518Z"
     },
     "daal": {
       "stream_id": 1409,
@@ -127,7 +127,7 @@
       "config_file": "channel_basmah_revised.sh",
       "provider_name": "Al MAJD Basma",
       "preferred_credential": "444180075026",
-      "scale": 3,
+      "scale": 4,
       "non_vlc_backups": [
         "https://live.seenshow.com/hls/live/2120817/LIVE-010-BASMA/3.m3u8"
       ],
@@ -156,9 +156,11 @@
       "provider_name": "MAKKAH TV",
       "preferred_credential": "705729222787",
       "scale": 4,
-      "non_vlc_backups": [],
+      "non_vlc_backups": [
+        "elahmad:makkahtv"
+      ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-13T12:00:39.085Z"
+      "last_updated": "2026-02-13T16:00:39.258Z"
     },
     "rawdah": {
       "stream_id": 1411,
@@ -168,7 +170,7 @@
       "config_file": "channel_rawdah_revised.sh",
       "provider_name": "Al MAJD Rawda",
       "preferred_credential": "644050331081",
-      "scale": 2,
+      "scale": 0,
       "non_vlc_backups": [
         "https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/3.m3u8"
       ],
@@ -199,7 +201,7 @@
       "config_file": "channel_uthaymeen_revised.sh",
       "provider_name": "Bin Othaimeen",
       "preferred_credential": "658660392910",
-      "scale": 3,
+      "scale": 4,
       "non_vlc_backups": [],
       "vlc_as_backup": false,
       "last_updated": "2026-02-12T17:07:15.038Z"
@@ -258,8 +260,7 @@
       "preferred_credential": "988897949345",
       "scale": 4,
       "non_vlc_backups": [
-        "http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/75516",
-        "http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/75516.m3u8"
+        "http://eg.ayyadonline.net:80/farouq190226/k977aq53gw/75516"
       ],
       "vlc_as_backup": false,
       "last_updated": "2026-02-10T15:42:29.446Z"
@@ -272,7 +273,7 @@
       "config_file": "channel_anees_revised.sh",
       "provider_name": "Al Anis TV",
       "preferred_credential": "861810342668",
-      "scale": 3,
+      "scale": 4,
       "non_vlc_backups": [
         "http://eeijvvut.qastertv.xyz:900/TN8PTWSD/3W9C5S3B/370",
         "https://www.youtube.com/channel/UClhc_0qfdQHMmiHRii5TOPA/live"
@@ -288,9 +289,10 @@
       "config_file": "channel_zaad_revised.sh",
       "provider_name": "ZAD TV",
       "preferred_credential": "",
-      "scale": 10,
+      "scale": 9,
       "non_vlc_backups": [
-        "rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
+        "rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0",
+        "https://www.youtube.com/@ZadTVchannel/live"
       ],
       "vlc_as_backup": false,
       "last_updated": "2026-02-12T17:09:15.103Z"

@@ -30,6 +30,7 @@ stream_url="https://www.youtube.com/@ZadTVchannel/live"
 # Backup URLs - can mix YouTube and regular HLS URLs
 stream_url_backup1=""
 stream_url_backup2=""
+stream_url_backup3=""
 
 # Output destination (HLS playlist path)
 # Note: stream_id duplicates hls_output for generic_channel.sh compatibility
@@ -43,5 +44,6 @@ scale=9
 backup_urls=""
 [[ -n "$stream_url_backup1" ]] && backup_urls="$stream_url_backup1"
 [[ -n "$stream_url_backup2" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup2"
+[[ -n "$stream_url_backup3" ]] && backup_urls="${backup_urls:+$backup_urls|}$stream_url_backup3"
 
 ./generic_channel.sh "$stream_name" "$stream_id" "$stream_url" "$hls_output" "$scale" "$backup_urls"
