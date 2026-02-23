@@ -97,8 +97,8 @@ config_file_mtime=0
 # When FFmpeg is running but not producing segments (source hung), detect this
 # and proactively switch to backup URL instead of waiting for FFmpeg to die.
 # =============================================================================
-SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-60}"      # Switch to backup if no segments for 60s
-SEGMENT_CHECK_INTERVAL="${SEGMENT_CHECK_INTERVAL:-10}"        # Check segment freshness every 10s
+SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-45}"      # Switch to backup if no segments for 45s
+SEGMENT_CHECK_INTERVAL="${SEGMENT_CHECK_INTERVAL:-5}"         # Check segment freshness every 5s
 last_segment_check=0
 stream_start_time=0
 # Segment cleanup safeguards to prevent disk growth (running channels too)
@@ -614,6 +614,40 @@ prune_old_segments() {
     fi
 }
 
+# Disk space guard — prevents silent FFmpeg failures when partition fills up.
+# Returns 0 if OK, 1 if critical (should pause streaming).
+DISK_CHECK_INTERVAL="${DISK_CHECK_INTERVAL:-60}"  # Check every 60s
+last_disk_check=0
+check_disk_space() {
+    local now
+    now=$(date +%s)
+    local elapsed=$((now - last_disk_check))
+    if [[ "$elapsed" -lt "$DISK_CHECK_INTERVAL" ]]; then
+        return 0
+    fi
+    last_disk_check=$now
+
+    local output_dir
+    output_dir=$(dirname "$destination")
+    local usage_pct
+    usage_pct=$(df --output=pcent "$output_dir" 2>$DEVNULL | tail -1 | tr -d ' %')
+    [[ -z "$usage_pct" ]] && return 0
+
+    if [[ "$usage_pct" -ge 95 ]]; then
+        log "DISK_GUARD: CRITICAL — ${usage_pct}% disk usage. Force-pruning all channels."
+        # Emergency: prune ALL HLS directories, not just ours
+        # Constrain to the expected HLS base to prevent accidental deletion elsewhere
+        local hls_base="/var/www/html/stream/hls"
+        [[ -d "$hls_base" ]] || hls_base=$(dirname "$output_dir")
+        find "$hls_base" -name "*.ts" -type f -mmin +10 -delete 2>$DEVNULL
+        return 1
+    elif [[ "$usage_pct" -ge 90 ]]; then
+        log "DISK_GUARD: WARNING — ${usage_pct}% disk usage. Aggressive segment pruning."
+        prune_old_segments force
+    fi
+    return 0
+}
+
 # Cleanup orphaned ffmpeg error files from /tmp on startup
 # These can accumulate when processes are killed externally
 cleanup_orphaned_error_files() {
@@ -739,10 +773,60 @@ if [[ "$TRY_START_ADOPT_LOCK" == "1" && -d "$lockdir" ]]; then
     log "LOCK: Adopting existing lock directory for graceful handoff"
 fi
 
+# is_stale_owner checks if a PID actually belongs to a try_start_stream process
+# for THIS channel.  After a reboot the PID may have been recycled to an unrelated
+# process, so a plain kill -0 check is not enough.
+is_stale_owner() {
+    local pid="$1"
+    # PID not running at all → stale
+    kill -0 "$pid" 2>$DEVNULL || return 0
+    # PID is running — verify it is actually try_start_stream for this channel.
+    # /proc/<pid>/cmdline is NUL-delimited; tr converts to spaces for grep -F (fixed-string).
+    local cmd
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>$DEVNULL) || return 0
+    if echo "$cmd" | grep -qF "try_start_stream" && echo "$cmd" | grep -qF "$channel_id"; then
+        return 1  # legitimate owner
+    fi
+    return 0  # PID recycled to something else → stale
+}
+
 if [[ $lock_adopted -eq 0 ]]; then
     if ! mkdir "$lockdir" 2>$DEVNULL; then
-        log_console "[$channel_id] Another instance is already running (lock exists). Exiting."
-        exit 0
+        # Lock exists — check if the owner is still alive and legitimate.
+        # Handles: SIGKILL leaving stale locks, reboot with ext4 /tmp (PID recycling),
+        # and crash between mkdir and pidfile write.
+        stale_lock=0
+        if [[ -f "$pidfile" ]]; then
+            stale_pid=$(cat "$pidfile" 2>$DEVNULL)
+            if [[ -n "$stale_pid" ]] && is_stale_owner "$stale_pid"; then
+                log_console "[$channel_id] Stale lock detected (PID $stale_pid is dead or recycled). Reclaiming."
+                stale_lock=1
+            else
+                log_console "[$channel_id] Another instance is already running (PID ${stale_pid:-unknown}). Exiting."
+                exit 0
+            fi
+        else
+            # No pidfile but lock exists — process crashed between mkdir and pidfile write.
+            # Check if any try_start_stream for this channel is actually running.
+            # Escape channel_id for use in regex (pgrep -f uses extended regex).
+            local escaped_cid
+            escaped_cid=$(printf '%s' "$channel_id" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
+            if ! pgrep -f "try_start_stream.*${escaped_cid}" 2>$DEVNULL | grep -v "^$$\$" | grep -q .; then
+                log_console "[$channel_id] Stale lock detected (no pidfile, no matching process). Reclaiming."
+                stale_lock=1
+            else
+                log_console "[$channel_id] Another instance is already running (lock exists, process found). Exiting."
+                exit 0
+            fi
+        fi
+        if [[ $stale_lock -eq 1 ]]; then
+            rmdir "$lockdir" 2>$DEVNULL
+            rm -f "$pidfile" 2>$DEVNULL
+            if ! mkdir "$lockdir" 2>$DEVNULL; then
+                log_console "[$channel_id] Lock reclaim race lost. Another instance started. Exiting."
+                exit 0
+            fi
+        fi
     fi
 fi
 
@@ -4117,6 +4201,9 @@ while true; do
 
         # SEGMENT_CLEANUP: keep HLS output bounded even if delete_segments fails
         prune_old_segments
+
+        # DISK_GUARD: check partition usage and emergency-prune if needed
+        check_disk_space
 
         # HOT_RELOAD: pick up config edits while streaming (every 60s)
         reload_config_if_changed

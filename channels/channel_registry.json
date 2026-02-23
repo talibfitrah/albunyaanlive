@@ -9,9 +9,11 @@
       "provider_name": "Al MAJD news",
       "preferred_credential": "851925540325",
       "scale": 9,
-      "non_vlc_backups": [],
+      "non_vlc_backups": [
+        "http://eg.ayyadonline.net:80/farouq10226/rgbi4lg4si/77453"
+      ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:05:03.226Z"
+      "last_updated": "2026-02-22T20:03:31.825Z"
     },
     "hadith-almajd": {
       "stream_id": 1406,
@@ -54,10 +56,11 @@
       "preferred_credential": "602779426000",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120822/LIVE-009-KIDS/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120822/LIVE-009-KIDS/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq20226/p3u0zbtd5g/77336"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:28.658Z"
+      "last_updated": "2026-02-22T20:03:31.818Z"
     },
     "almajd-3aamah": {
       "stream_id": 1404,
@@ -69,10 +72,11 @@
       "preferred_credential": "166063150075",
       "scale": 4,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120825/LIVE-001-ALMAJD/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq30226/v7ol4yjret/201243"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:33.809Z"
+      "last_updated": "2026-02-22T20:03:01.747Z"
     },
     "natural": {
       "stream_id": 1403,
@@ -84,10 +88,11 @@
       "preferred_credential": "301821324699",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120827/LIVE-007-TABEEYA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120827/LIVE-007-TABEEYA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq40226/psvs6vyebv/77334"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-18T23:30:42.518Z"
+      "last_updated": "2026-02-22T20:04:21.950Z"
     },
     "daal": {
       "stream_id": 1409,
@@ -99,10 +104,11 @@
       "preferred_credential": "373914605863",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120828/LIVE-008-DAL/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120828/LIVE-008-DAL/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq150226/h09ewdpvos/1302163"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:39.962Z"
+      "last_updated": "2026-02-22T20:04:01.889Z"
     },
     "maassah": {
       "stream_id": 1414,
@@ -114,10 +120,11 @@
       "preferred_credential": "143958390914",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120779/LIVE-013-MASA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120779/LIVE-013-MASA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq13226/vv3qmkms2w/13058"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:05:12.310Z"
+      "last_updated": "2026-02-22T20:04:11.905Z"
     },
     "basmah": {
       "stream_id": 1412,
@@ -129,10 +136,11 @@
       "preferred_credential": "444180075026",
       "scale": 4,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120817/LIVE-010-BASMA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120817/LIVE-010-BASMA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq50226/0fbyqin6jo/77338"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:44.765Z"
+      "last_updated": "2026-02-22T20:03:51.862Z"
     },
     "ajaweed": {
       "stream_id": 1408,
@@ -143,9 +151,11 @@
       "provider_name": "Al MAJD Ajaweed",
       "preferred_credential": "166164109628",
       "scale": 0,
-      "non_vlc_backups": [],
+      "non_vlc_backups": [
+        "http://eg.ayyadonline.net:80/farouq60226/eqegh1wakb/1302160"
+      ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:05:13.597Z"
+      "last_updated": "2026-02-22T20:02:51.718Z"
     },
     "makkah": {
       "stream_id": 1421,
@@ -157,10 +167,11 @@
       "preferred_credential": "705729222787",
       "scale": 4,
       "non_vlc_backups": [
-        "elahmad:makkahtv"
+        "elahmad:makkahtv",
+        "http://eg.ayyadonline.net:80/farouq70226/g7mt67ciwg/28179"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-13T16:00:39.258Z"
+      "last_updated": "2026-02-22T20:04:11.913Z"
     },
     "rawdah": {
       "stream_id": 1411,
@@ -172,10 +183,11 @@
       "preferred_credential": "644050331081",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120823/LIVE-011-RAWDA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq80226/o7dom2miwm/77333"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:50.601Z"
+      "last_updated": "2026-02-22T20:04:31.978Z"
     },
     "sunnah": {
       "stream_id": 1420,
@@ -188,10 +200,11 @@
       "scale": 12,
       "non_vlc_backups": [
         "https://www.youtube.com/@SaudiSunnahTv/live",
-        "aloula:6"
+        "aloula:6",
+        "http://eg.ayyadonline.net:80/farouq160226/46wqc9ajio/50230"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:07:15.023Z"
+      "last_updated": "2026-02-22T20:04:31.992Z"
     },
     "uthaymeen": {
       "stream_id": 357376,
@@ -202,9 +215,11 @@
       "provider_name": "Bin Othaimeen",
       "preferred_credential": "658660392910",
       "scale": 4,
-      "non_vlc_backups": [],
+      "non_vlc_backups": [
+        "http://eg.ayyadonline.net:80/farouq120226/xghg0kfpp8/170860"
+      ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:07:15.038Z"
+      "last_updated": "2026-02-22T20:04:32.000Z"
     },
     "arrahmah": {
       "stream_id": 357372,
@@ -215,9 +230,11 @@
       "provider_name": "Al Rahma",
       "preferred_credential": "828906198094",
       "scale": 4,
-      "non_vlc_backups": [],
+      "non_vlc_backups": [
+        "http://eg.ayyadonline.net:80/farouq90226/5ah23gx7vk/28183"
+      ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:07:15.046Z"
+      "last_updated": "2026-02-22T20:03:41.836Z"
     },
     "almajd-islamic-science": {
       "stream_id": 357369,
@@ -229,10 +246,11 @@
       "preferred_credential": "578724520142",
       "scale": 0,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120830/LIVE-004-ELMIA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq100226/9pfz609zql/1302162"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:59.057Z"
+      "last_updated": "2026-02-22T20:03:21.802Z"
     },
     "mekkah-quran": {
       "stream_id": 1438,
@@ -245,10 +263,11 @@
       "scale": 12,
       "non_vlc_backups": [
         "https://www.youtube.com/@SaudiQuranTv/live",
-        "aloula:7"
+        "aloula:7",
+        "http://eg.ayyadonline.net:80/farouq170226/mwzdm1g4l1/50223"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:09:15.086Z"
+      "last_updated": "2026-02-22T20:04:11.928Z"
     },
     "nada": {
       "stream_id": 1437,
@@ -292,10 +311,11 @@
       "scale": 9,
       "non_vlc_backups": [
         "rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0",
-        "https://www.youtube.com/@ZadTVchannel/live"
+        "https://www.youtube.com/@ZadTVchannel/live",
+        "http://eg.ayyadonline.net:80/farouq200226/tqidc6qejy/77065"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T17:09:15.103Z"
+      "last_updated": "2026-02-22T20:04:32.008Z"
     },
     "almajd-documentary": {
       "stream_id": 1407,
@@ -307,10 +327,11 @@
       "preferred_credential": "961461374831",
       "scale": 4,
       "non_vlc_backups": [
-        "https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/3.m3u8"
+        "https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/3.m3u8",
+        "http://eg.ayyadonline.net:80/farouq180226/r6vn4pcug5/77337"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T15:23:42.004Z"
+      "last_updated": "2026-02-22T20:03:11.774Z"
     }
   }
 }

@@ -327,10 +327,14 @@ function sleep(ms) {
 
 function redactUrlCredentials(url) {
   if (!url || typeof url !== 'string') return url;
-  return url.replace(
+  // Redact Xtream-style path credentials: http://host:port/user/pass/stream_id
+  let redacted = url.replace(
     /^(https?:\/\/[^/]+\/)[^/]+\/[^/]+\/([^/?#]+)([/?#].*)?$/i,
     (_match, prefix, streamId, suffix = '') => `${prefix}***/***/${streamId}${suffix}`
   );
+  // Redact query-parameter credentials: ?username=X&password=Y
+  redacted = redacted.replace(/([?&])(username|password)=[^&#]*/gi, '$1$2=***');
+  return redacted;
 }
 
 function redactSecretForApi(_secret) {
@@ -2109,6 +2113,8 @@ async function runSync() {
         if (result.primaryChanged) {
           updatedPrimary++;
           log(`PRIMARY URL CHANGED for ${channelId}: ${redactUrlCredentials(primaryUrl)}`);
+          // Stagger restarts to avoid overwhelming the provider with concurrent connections
+          await sleep(3000);
         }
 
         if (result.backupsChanged) {

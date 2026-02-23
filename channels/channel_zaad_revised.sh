@@ -9,7 +9,7 @@ stream_url="rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://www.youtube.com/@ZadTVchannel/live"
-stream_url_backup2=""
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq200226/tqidc6qejy/77065"
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/zaad/master.m3u8"

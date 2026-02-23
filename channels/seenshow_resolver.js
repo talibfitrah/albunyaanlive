@@ -96,6 +96,9 @@ const TOKEN_EXTRACT_TIMEOUT = 30000;
 const SLOT_AUTO_RELEASE_MS = 1800000; // 30min — auto-release leaked slots
 const LOGIN_RETRY_DELAY = 10000;
 const MAX_LOGIN_RETRIES = 3;
+const BROWSER_MAX_AGE_MS = parseBoundedInt(
+  process.env.SEENSHOW_BROWSER_MAX_AGE_MS, 21600000, 3600000, 172800000
+); // 6h default — recycle Chrome to prevent memory leaks
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -299,7 +302,37 @@ async function restoreCookiesToPage(page) {
 // Browser management
 // ---------------------------------------------------------------------------
 
+let browserLaunchTime = 0;
+
+async function recycleBrowserIfStale() {
+  if (!browser || !browser.isConnected()) return;
+  const age = Date.now() - browserLaunchTime;
+  if (age < BROWSER_MAX_AGE_MS) return;
+  log(`Recycling browser (age: ${Math.round(age / 3600000)}h, max: ${Math.round(BROWSER_MAX_AGE_MS / 3600000)}h)`);
+  try {
+    // Save cookies before closing
+    const pages = await browser.pages();
+    if (pages.length > 0) {
+      const cookies = await pages[0].cookies();
+      if (cookies.length > 0) {
+        saveCookies(cookies);
+      }
+    }
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('close timeout')), 5000);
+      browser.close().then(() => { clearTimeout(timer); resolve(); }, reject);
+    });
+  } catch (e) {
+    warn(`Browser recycle close error: ${e.message}`);
+    try { browser.process()?.kill('SIGKILL'); } catch (_) { /* ignore */ }
+  }
+  browser = null;
+  browserLaunchPromise = null;
+  authenticated = false;
+}
+
 async function ensureBrowser() {
+  await recycleBrowserIfStale();
   if (browser && browser.isConnected()) return browser;
 
   if (browserLaunchPromise) return browserLaunchPromise;
@@ -349,6 +382,7 @@ async function ensureBrowser() {
       authenticated = false;
     });
 
+    browserLaunchTime = Date.now();
     log('Browser launched');
     return browser;
   })();

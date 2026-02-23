@@ -8,7 +8,7 @@ stream_name="851925540325/933449753495/1415"
 stream_url="http://vlc.news:80/851925540325/933449753495/1415"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1=""
+stream_url_backup1="http://eg.ayyadonline.net:80/farouq10226/rgbi4lg4si/77453"
 stream_url_backup2=""
 stream_url_backup3=""
 
