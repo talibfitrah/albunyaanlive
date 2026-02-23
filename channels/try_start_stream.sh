@@ -3623,7 +3623,15 @@ build_ffmpeg_cmd() {
         use_https_proxy=1
         actual_input_url="pipe:0"
         log "HTTPS_PROXY: Will use proxy for HTTPS stream (ffmpeg lacks TLS support)"
+        # CUVID hardware decoder (scales 4,3,12,13) cannot handle pipe input — the
+        # decoder requires seekable/probeable input.  Use a local override so the
+        # global $scale is preserved for future retries on non-HTTPS URLs.
+        if [[ "$scale" -eq 4 || "$scale" -eq 3 || "$scale" -eq 12 || "$scale" -eq 13 ]]; then
+            log "HTTPS_PROXY: Downgrading scale $scale → 9 (software decode) for pipe input"
+            local effective_scale=9
+        fi
     fi
+    local effective_scale="${effective_scale:-$scale}"
 
     ffmpeg_cmd=( ffmpeg -loglevel error )
     local scheme
@@ -3636,7 +3644,7 @@ build_ffmpeg_cmd() {
         ffmpeg_cmd+=( -user_agent "$ua" -rw_timeout 30000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 )
     fi
 
-    case "$scale" in
+    case "$effective_scale" in
         4|3)
             # GPU: CUDA decode + scale to 1080p + NVENC encode
             # Standard re-encode mode for sources needing normalization
@@ -3644,7 +3652,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             ffmpeg_cmd+=( -vf "scale_npp=1920:1080" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 0 )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
             ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
             ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )
@@ -3660,12 +3668,12 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             if nvidia-smi >$DEVNULL 2>&1; then
                 ffmpeg_cmd+=( -vf "format=nv12,hwupload_cuda,scale_npp=1920:1080" )
-                ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 0 )
+                ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
                 ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
             else
                 log "SCALE9: GPU unavailable, falling back to full CPU pipeline"
                 ffmpeg_cmd+=( -vf "scale=1920:1080" )
-                ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -profile:v high -level 4.1 -g 180 -keyint_min 180 )
+                ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -profile:v high -level:v auto -g 180 -keyint_min 180 )
                 ffmpeg_cmd+=( -b:v 2500k -maxrate 3000k -bufsize 6000k -threads 4 )
             fi
             ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
@@ -3679,7 +3687,7 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             ffmpeg_cmd+=( -vf "scale_npp=w=1920:h=1080:interp_algo=lanczos" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level 4.1 -g 180 -keyint_min 180 -bf 2 )
+            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 2 )
             ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k -threads 4 )
             ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
             ffmpeg_cmd+=( -f hls -hls_time 6 )

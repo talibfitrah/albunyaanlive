@@ -18,7 +18,7 @@ export YTDLP_PROXY
 
 rtmp_url="/var/www/html/stream/hls/almajd-quran/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-quran/master.m3u8"
-scale=0
+scale=9
 
 # Build backup URL string (pipe-separated)
 backup_urls=""
