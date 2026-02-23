@@ -17,7 +17,7 @@ stream_url="https://www.youtube.com/@SaudiQuranTv/live"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="aloula:7"
-stream_url_backup2=""
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq170226/mwzdm1g4l1/50223"
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/mekkah-quran/master.m3u8"

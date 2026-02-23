@@ -342,11 +342,15 @@ is_channel_running() {
     local pidfile="/tmp/stream_${channel_id}.pid"
     local lockdir="/tmp/stream_${channel_id}.lock"
 
-    # Method 1: Check pidfile (most reliable)
+    # Method 1: Check pidfile + validate PID ownership via /proc/cmdline
+    # (handles PID recycling after reboot on ext4 /tmp)
     if [[ -f "$pidfile" ]]; then
         local pid=$(cat "$pidfile" 2>$DEVNULL)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>$DEVNULL; then
-            return 0  # Running
+            if is_expected_parent_pid "$pid" "$channel_id"; then
+                return 0  # Running — PID confirmed as try_start_stream for this channel
+            fi
+            # PID alive but not ours — recycled, fall through to other checks
         fi
     fi
 
@@ -419,8 +423,11 @@ restart_channel() {
         fi
     fi
 
-    # Remove lock and pid files (generic_channel.sh or try_start_stream.sh will recreate)
-    rmdir "/tmp/stream_${channel_id}.lock" 2>$DEVNULL || sudo_run rmdir "/tmp/stream_${channel_id}.lock" 2>$DEVNULL || true
+    # Remove only the pidfile. Leave the lock directory in place — the new
+    # try_start_stream.sh instance will detect the stale lock (no valid pidfile,
+    # no matching process) and reclaim it atomically.  Deleting the lock here
+    # opens a race window where a *third* instance could grab the lock between
+    # our delete and the new script's mkdir.
     rm -f "/tmp/stream_${channel_id}.pid" 2>$DEVNULL || sudo_run rm -f "/tmp/stream_${channel_id}.pid" 2>$DEVNULL || true
 
     sleep 2

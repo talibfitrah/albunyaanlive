@@ -17,7 +17,7 @@ stream_url="https://www.youtube.com/@SaudiSunnahTv/live"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="aloula:6"
-stream_url_backup2=""
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq160226/46wqc9ajio/50230"
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/sunnah/master.m3u8"

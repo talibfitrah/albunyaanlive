@@ -9,7 +9,7 @@ stream_url="http://vlc.news:80/143958390914/114461032166/1414"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://live.seenshow.com/hls/live/2120779/LIVE-013-MASA/3.m3u8"
-stream_url_backup2=""
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq13226/vv3qmkms2w/13058"
 stream_url_backup3=""
 
 # Configure Tor proxy for seenshow.com URLs (geo-blocked)

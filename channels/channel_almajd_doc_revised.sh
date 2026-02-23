@@ -13,7 +13,7 @@ stream_url="http://vlc.news:80/961461374831/515847104503/1407"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://live.seenshow.com/hls/live/2120826/LIVE-006-WASEQYA/3.m3u8"
-stream_url_backup2=""
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq180226/r6vn4pcug5/77337"
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/almajd-documentary/master.m3u8"
