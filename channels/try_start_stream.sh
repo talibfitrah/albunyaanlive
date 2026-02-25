@@ -97,7 +97,16 @@ config_file_mtime=0
 # When FFmpeg is running but not producing segments (source hung), detect this
 # and proactively switch to backup URL instead of waiting for FFmpeg to die.
 # =============================================================================
-SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-45}"      # Switch to backup if no segments for 45s
+SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-90}"      # Non-FIFO stale threshold (FIFO mode uses FEEDER_STALE_THRESHOLD instead)
+
+# =============================================================================
+# Always-FIFO architecture: route all sources through a persistent FIFO so
+# feeder processes can be killed/replaced without touching the HLS encoder.
+# =============================================================================
+ALWAYS_FIFO="${ALWAYS_FIFO:-1}"                                # Route all sources through FIFO (0 to disable)
+FEEDER_STALE_THRESHOLD="${FEEDER_STALE_THRESHOLD:-90}"         # Kill feeder after 90s stale output
+FEEDER_MAX_RESTARTS="${FEEDER_MAX_RESTARTS:-10}"               # Per-URL feeder restarts before switching URL
+FEEDER_MAX_RESTART_BACKOFF="${FEEDER_MAX_RESTART_BACKOFF:-30}" # Max backoff seconds between feeder restarts
 SEGMENT_CHECK_INTERVAL="${SEGMENT_CHECK_INTERVAL:-5}"         # Check segment freshness every 5s
 last_segment_check=0
 stream_start_time=0
@@ -334,6 +343,13 @@ ffmpeg_pid=""
 last_ffmpeg_pid=""
 proxy_pid=""
 stream_fifo=""
+
+# Always-FIFO feeder state
+feeder_pid=""
+feeder_is_slate=0
+feeder_restart_count=0
+feeder_last_restart_time=0
+fifo_write_fd=""
 
 # Log size limits to prevent disk exhaustion
 LOG_FILE_MAX_MB="${LOG_FILE_MAX_MB:-50}"
@@ -699,6 +715,15 @@ cleanup() {
 
     # Stop slate placeholder if running
     stop_slate_stream
+
+    # Kill feeder process first (stop writes to FIFO)
+    kill_feeder 2>/dev/null || true
+
+    # Then close held FIFO write FD (allows encoder to get EOF)
+    if [[ -n "$fifo_write_fd" ]]; then
+        exec {fifo_write_fd}>&- 2>/dev/null || true
+        fifo_write_fd=""
+    fi
 
     # Stop proxy process (streamlink/yt-dlp) first to avoid pipeline waits
     if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>$DEVNULL; then
@@ -2695,6 +2720,12 @@ check_segment_staleness() {
 
     last_segment_check=$now
 
+    # Under ALWAYS_FIFO, use feeder-specific stale threshold (operator tunable)
+    local stale_threshold="$SEGMENT_STALE_THRESHOLD"
+    if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+        stale_threshold="$FEEDER_STALE_THRESHOLD"
+    fi
+
     # Even with no backups, a stale output means FFmpeg is hung or the source is dead.
     # The caller will restart FFmpeg on the current URL when no alternates exist.
 
@@ -2710,8 +2741,8 @@ check_segment_staleness() {
     if [[ -z "$newest_segment" ]]; then
         if [[ $stream_start_time -gt 0 ]]; then
             local age=$((now - stream_start_time))
-            if [[ $age -gt $SEGMENT_STALE_THRESHOLD ]]; then
-                log "SEGMENT_STALE: No segments created for ${age}s (threshold: ${SEGMENT_STALE_THRESHOLD}s)"
+            if [[ $age -gt $stale_threshold ]]; then
+                log "SEGMENT_STALE: No segments created for ${age}s (threshold: ${stale_threshold}s)"
                 return 0
             fi
         fi
@@ -2726,16 +2757,16 @@ check_segment_staleness() {
 
     if [[ $stream_start_time -gt 0 && $segment_mtime -lt $stream_start_time ]]; then
         local age_since_start=$((now - stream_start_time))
-        if [[ $age_since_start -gt $SEGMENT_STALE_THRESHOLD ]]; then
-            log "SEGMENT_STALE: No new segments since start (${age_since_start}s, threshold: ${SEGMENT_STALE_THRESHOLD}s)"
+        if [[ $age_since_start -gt $stale_threshold ]]; then
+            log "SEGMENT_STALE: No new segments since start (${age_since_start}s, threshold: ${stale_threshold}s)"
             return 0
         fi
         return 1
     fi
 
     local segment_age=$((now - segment_mtime))
-    if [[ $segment_age -gt $SEGMENT_STALE_THRESHOLD ]]; then
-        log "SEGMENT_STALE: Latest segment age ${segment_age}s (threshold: ${SEGMENT_STALE_THRESHOLD}s)"
+    if [[ $segment_age -gt $stale_threshold ]]; then
+        log "SEGMENT_STALE: Latest segment age ${segment_age}s (threshold: ${stale_threshold}s)"
         return 0
     fi
 
@@ -3544,7 +3575,7 @@ base_flags=( -user_agent "$USER_AGENT" -rw_timeout 30000000 -reconnect 1 -reconn
 # -hls_flags delete_segments+temp_file+omit_endlist: Atomic writes, auto-cleanup, never finalize playlist
 # =============================================================================
 
-hls_seamless=( -hls_start_number_source epoch -hls_list_size 15 )
+hls_seamless=( -hls_start_number_source epoch -hls_list_size 20 )
 
 # =============================================================================
 # Slate failover: placeholder stream during URL transitions
@@ -3590,6 +3621,172 @@ inject_discontinuity_tag() {
 }
 
 # =============================================================================
+# Always-FIFO feeder functions
+# =============================================================================
+# These functions manage lightweight feeder processes that write to a persistent
+# FIFO. The HLS encoder reads from the FIFO and is never killed for source
+# issues — only the feeder is killed and replaced.
+# =============================================================================
+
+# start_http_feeder — Lightweight FFmpeg copy-mode feeder for HTTP/RTMP sources
+start_http_feeder() {
+    local source_url="$1" fifo_path="$2"
+    local feeder_cmd=( ffmpeg -loglevel error )
+    local scheme
+    scheme=$(get_url_scheme "$source_url")
+    if [[ "$scheme" == "http" || "$scheme" == "https" ]]; then
+        local ua
+        ua=$(effective_user_agent "$source_url")
+        feeder_cmd+=( -user_agent "$ua" -rw_timeout 30000000 )
+        feeder_cmd+=( -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 30 )
+    fi
+    feeder_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
+    feeder_cmd+=( -i "$source_url" -c copy -f mpegts pipe:1 )
+    local feeder_cmd_pretty
+    printf -v feeder_cmd_pretty "%q " "${feeder_cmd[@]}"
+    "${feeder_cmd[@]}" > "$fifo_path" 2>>"$logfile" &
+    feeder_pid=$!
+    feeder_is_slate=0
+    log "FEEDER: Started HTTP feeder PID $feeder_pid: $feeder_cmd_pretty"
+}
+
+# start_slate_feeder — Loops slate video into the FIFO to keep HLS alive
+start_slate_feeder() {
+    local fifo_path="$1"
+    [[ ! -f "$SLATE_VIDEO" ]] && { log "FEEDER_SLATE: No slate video at $SLATE_VIDEO"; return 1; }
+    ffmpeg -loglevel error -re -stream_loop -1 -i "$SLATE_VIDEO" \
+        -c copy -f mpegts pipe:1 \
+        > "$fifo_path" 2>>"$logfile" &
+    feeder_pid=$!
+    feeder_is_slate=1
+    slate_was_active=1
+    log "FEEDER_SLATE: Started slate feeder PID $feeder_pid"
+}
+
+# kill_feeder — Stop feeder process and its children without touching encoder
+kill_feeder() {
+    [[ -z "$feeder_pid" ]] && return
+    kill -0 "$feeder_pid" 2>$DEVNULL || { feeder_pid=""; return; }
+    kill -TERM "$feeder_pid" 2>$DEVNULL || true
+    pkill -TERM -P "$feeder_pid" 2>$DEVNULL || true
+    local i
+    for i in {1..5}; do
+        kill -0 "$feeder_pid" 2>$DEVNULL || break
+        sleep 1
+    done
+    if kill -0 "$feeder_pid" 2>$DEVNULL; then
+        kill -KILL "$feeder_pid" 2>$DEVNULL || true
+        pkill -KILL -P "$feeder_pid" 2>$DEVNULL || true
+    fi
+    feeder_pid=""
+    feeder_is_slate=0
+}
+
+# start_feeder_for_current_url — Dispatch to correct feeder type for current URL
+start_feeder_for_current_url() {
+    local url="${url_array[$current_url_index]}"
+    if [[ "${url_is_youtube[$current_url_index]}" == "1" ]] || needs_https_proxy "$url"; then
+        # Use streamlink for HTTPS/YouTube sources (same as existing proxy path)
+        if ! command -v streamlink >$DEVNULL 2>&1; then
+            log_error "FEEDER: streamlink not found for ${url:0:80}; falling back to HTTP feeder"
+            start_http_feeder "$url" "$stream_fifo"
+            feeder_last_restart_time=$(date +%s)
+            return
+        fi
+        set_streamlink_args "$url"
+        "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+        feeder_pid=$!
+        feeder_is_slate=0
+        log "FEEDER: Started streamlink feeder PID $feeder_pid for ${url:0:80}"
+    else
+        start_http_feeder "$url" "$stream_fifo"
+    fi
+    feeder_last_restart_time=$(date +%s)
+}
+
+# switch_feeder_to_next_url — Source switch without killing encoder
+# Optional arg $1 = recursion depth (default 0). Guards against infinite loops
+# when all provider URLs fail their prepare step.
+switch_feeder_to_next_url() {
+    local depth="${1:-0}"
+    if [[ $depth -ge $url_count ]]; then
+        log_error "FEEDER_SWITCH: All $url_count URLs failed prepare. Injecting slate."
+        start_slate_feeder "$stream_fifo" || true
+        return
+    fi
+
+    kill_feeder
+    local previous_index="$current_url_index"
+    current_url_index=$(( (current_url_index + 1) % url_count ))
+    log "FEEDER_SWITCH: Switching feeder to URL index $current_url_index"
+
+    # If we are leaving Seenshow for a non-Seenshow URL, release slot immediately.
+    if [[ "${url_is_seenshow[$previous_index]:-0}" == "1" && "${url_is_seenshow[$current_url_index]:-0}" != "1" ]]; then
+        seenshow_release_slot
+    fi
+
+    # Full cycle detection — inject slate if all URLs exhausted
+    if [[ $current_url_index -eq 0 ]]; then
+        total_cycles=$((total_cycles + 1))
+        log "FEEDER_CYCLE: Completed URL cycle $total_cycles of $max_cycles"
+        if [[ $total_cycles -ge $max_cycles ]]; then
+            log "FEEDER_CYCLE: All URLs exhausted after $max_cycles cycles. Injecting slate for 120s."
+            start_slate_feeder "$stream_fifo" || true
+            sleep 120
+            # Kill slate and retry real sources from primary
+            kill_feeder
+            total_cycles=0
+            feeder_restart_count=0
+            current_url_index=0
+            current_url="${url_array[0]}"
+        fi
+    fi
+
+    current_url="${url_array[$current_url_index]}"
+
+    # Prepare provider-specific URLs (slot acquire, token refresh) before starting feeder.
+    # In the non-FIFO path, the outer while loop handles this; in FIFO mode we must do it here.
+    if [[ "${url_is_seenshow[$current_url_index]:-0}" == "1" ]]; then
+        if ! prepare_seenshow_url_for_index "$current_url_index"; then
+            log_error "FEEDER_SWITCH: Seenshow prepare failed for URL index $current_url_index. Skipping."
+            feeder_restart_count=0
+            switch_feeder_to_next_url $((depth + 1))
+            return
+        fi
+        current_url="${url_array[$current_url_index]}"
+    elif is_aloula_url "${url_original[$current_url_index]:-}"; then
+        if ! prepare_aloula_url_for_index "$current_url_index"; then
+            log_error "FEEDER_SWITCH: Aloula prepare failed for URL index $current_url_index. Skipping."
+            feeder_restart_count=0
+            switch_feeder_to_next_url $((depth + 1))
+            return
+        fi
+        current_url="${url_array[$current_url_index]}"
+    elif is_elahmad_url "${url_original[$current_url_index]:-}"; then
+        if ! prepare_elahmad_url_for_index "$current_url_index"; then
+            log_error "FEEDER_SWITCH: Elahmad prepare failed for URL index $current_url_index. Skipping."
+            feeder_restart_count=0
+            switch_feeder_to_next_url $((depth + 1))
+            return
+        fi
+        current_url="${url_array[$current_url_index]}"
+    fi
+
+    start_feeder_for_current_url
+    feeder_restart_count=0
+}
+
+# calculate_feeder_backoff — Exponential backoff for feeder restarts
+calculate_feeder_backoff() {
+    local delay=1 i
+    for ((i=0; i<feeder_restart_count && i<5; i++)); do
+        delay=$((delay * 2))
+    done
+    [[ $delay -gt $FEEDER_MAX_RESTART_BACKOFF ]] && delay=$FEEDER_MAX_RESTART_BACKOFF
+    echo "$delay"
+}
+
+# =============================================================================
 # CPU guard: kill runaway FFmpeg processes
 # =============================================================================
 
@@ -3615,11 +3812,19 @@ build_ffmpeg_cmd() {
     local stream_url="$1"
     local output_path="$2"
 
-    # Check if we need HTTPS proxy (yt-dlp pipe)
+    # Check if we need HTTPS proxy (yt-dlp pipe) or ALWAYS_FIFO pipe
     use_https_proxy=0
     actual_input_url="$stream_url"
 
-    if needs_https_proxy "$stream_url"; then
+    if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+        # ALWAYS_FIFO: force pipe:0 input for all source types
+        use_https_proxy=1
+        actual_input_url="pipe:0"
+        if [[ "$scale" -eq 4 || "$scale" -eq 3 || "$scale" -eq 12 || "$scale" -eq 13 ]]; then
+            log "ALWAYS_FIFO: Downgrading scale $scale -> 9 (software decode) for pipe input"
+            local effective_scale=9
+        fi
+    elif needs_https_proxy "$stream_url"; then
         use_https_proxy=1
         actual_input_url="pipe:0"
         log "HTTPS_PROXY: Will use proxy for HTTPS stream (ffmpeg lacks TLS support)"
@@ -3696,7 +3901,13 @@ build_ffmpeg_cmd() {
         *)
             # Copy: Stream copy, no processing (scales 0, 2, 7, 8 and default)
             # Select first video + first audio only to avoid multi-track issues
-            ffmpeg_cmd+=( -re -i "$actual_input_url" -map 0:v:0 -map 0:a:0? -c copy -f hls -hls_time 6 )
+            if [[ "$use_https_proxy" -eq 1 ]]; then
+                # Pipe input: no -re (data arrives at source rate), add error tolerance
+                ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
+                ffmpeg_cmd+=( -i "$actual_input_url" -map 0:v:0 -map 0:a:0? -c copy -f hls -hls_time 6 )
+            else
+                ffmpeg_cmd+=( -re -i "$actual_input_url" -map 0:v:0 -map 0:a:0? -c copy -f hls -hls_time 6 )
+            fi
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
     esac
@@ -3893,9 +4104,9 @@ check_existing_ffmpeg() {
     existing_pids=$(pgrep -f "ffmpeg.*/${escaped_channel_id}/master" 2>$DEVNULL || true)
 
     if [[ -n "$existing_pids" ]]; then
-        # Filter out our own FFmpeg (current and recently exited)
+        # Filter out our own FFmpeg (current, recently exited, and slate placeholder)
         for pid in $existing_pids; do
-            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$last_ffmpeg_pid" && "$pid" != "$$" ]]; then
+            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$last_ffmpeg_pid" && "$pid" != "$$" && "$pid" != "$slate_ffmpeg_pid" ]]; then
                 log_error "DUPLICATE_DETECTED: Another FFmpeg (PID $pid) is already running for $channel_id"
                 return 1
             fi
@@ -4046,7 +4257,55 @@ while true; do
     proxy_watchdog_strikes=0
     proxy_cputime_prev=""
     stream_fifo="/dev/shm/stream_pipe_${channel_id}_$$"
-    if [[ "$use_https_proxy" -eq 1 ]]; then
+    if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+        # =================================================================
+        # ALWAYS_FIFO: Persistent FIFO with held-open write FD
+        # The feeder writes to the FIFO; the encoder reads from it.
+        # A held-open FD prevents EOF when the feeder dies — the encoder
+        # just blocks briefly until a new feeder starts writing.
+        # =================================================================
+        if [[ ! -d "/dev/shm" || ! -w "/dev/shm" ]]; then
+            stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
+            log "ALWAYS_FIFO: /dev/shm unavailable; using $stream_fifo"
+        fi
+        rm -f "$stream_fifo" 2>$DEVNULL
+        if ! mkfifo "$stream_fifo" 2>$DEVNULL; then
+            fallback_fifo="/tmp/stream_pipe_${channel_id}_$$"
+            if [[ "$stream_fifo" != "$fallback_fifo" ]]; then
+                log "ALWAYS_FIFO: FIFO create failed at $stream_fifo; retrying $fallback_fifo"
+                stream_fifo="$fallback_fifo"
+                rm -f "$stream_fifo" 2>$DEVNULL
+                mkfifo "$stream_fifo" 2>$DEVNULL || stream_fifo=""
+            else
+                stream_fifo=""
+            fi
+        fi
+        if [[ -z "$stream_fifo" || ! -p "$stream_fifo" ]]; then
+            log_error "ALWAYS_FIFO: Failed to create FIFO. Switching URL."
+            switch_to_next_url "fifo_failed"
+            continue
+        fi
+
+        # Hold FIFO open (read-write) so neither side blocks on open, and
+        # FFmpeg doesn't get EOF when the feeder dies.
+        if ! exec {fifo_write_fd}<>"$stream_fifo"; then
+            log_error "ALWAYS_FIFO: Failed to open keepalive FD on FIFO. Switching URL."
+            rm -f "$stream_fifo" 2>$DEVNULL
+            stream_fifo=""
+            switch_to_next_url "fifo_fd_open_failed"
+            continue
+        fi
+
+        # Start encoder (reads from FIFO, runs for hours/days)
+        "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+        ffmpeg_pid=$!
+
+        # Start initial feeder (writes to FIFO)
+        feeder_restart_count=0
+        start_feeder_for_current_url
+
+        log "ALWAYS_FIFO: Encoder PID=$ffmpeg_pid, Feeder PID=$feeder_pid (FD $fifo_write_fd held open)"
+    elif [[ "$use_https_proxy" -eq 1 ]]; then
         if [[ ! -d "/dev/shm" || ! -w "/dev/shm" ]]; then
             stream_fifo="/tmp/stream_pipe_${channel_id}_$$"
             log "HTTPS_PROXY: /dev/shm unavailable or not writable; using $stream_fifo"
@@ -4166,12 +4425,34 @@ while true; do
             fi
         fi
 
+        # FEEDER_MONITOR (ALWAYS_FIFO): Detect dead feeder and restart it.
+        # The encoder stays alive — only the feeder is restarted.
+        if [[ "$ALWAYS_FIFO" -eq 1 && -n "$feeder_pid" ]] && ! kill -0 "$feeder_pid" 2>$DEVNULL; then
+            wait "$feeder_pid" 2>$DEVNULL || true
+            feeder_uptime=0
+            if [[ $feeder_last_restart_time -gt 0 ]]; then
+                feeder_uptime=$(( $(date +%s) - feeder_last_restart_time ))
+            fi
+            log "FEEDER_MONITOR: Feeder PID $feeder_pid exited after ${feeder_uptime}s — restarting on same URL"
+            feeder_pid=""
+            feeder_restart_count=$((feeder_restart_count + 1))
+            if [[ $feeder_restart_count -ge $FEEDER_MAX_RESTARTS ]]; then
+                log "FEEDER_MONITOR: Max restarts ($FEEDER_MAX_RESTARTS) on current URL. Switching."
+                switch_feeder_to_next_url
+            else
+                backoff=$(calculate_feeder_backoff)
+                [[ $backoff -gt 1 ]] && log "FEEDER_MONITOR: Backoff ${backoff}s before restart"
+                sleep "$backoff"
+                start_feeder_for_current_url
+            fi
+        fi
+
         # PROXY_WATCHDOG: Detect hung streamlink/proxy processes.
         # If the proxy dies while FFmpeg is running, FFmpeg will get EOF on the
         # FIFO and exit on its own. But if the proxy hangs (e.g. stuck on
         # network I/O via torsocks), it consumes CPU forever. Kill FFmpeg so
         # the outer loop can retry with a fresh proxy.
-        if [[ -n "$proxy_pid" ]]; then
+        if [[ "$ALWAYS_FIFO" -ne 1 && -n "$proxy_pid" ]]; then
             if ! kill -0 "$proxy_pid" 2>$DEVNULL; then
                 log "PROXY_WATCHDOG: Proxy PID $proxy_pid exited while FFmpeg still running; FFmpeg will get EOF"
                 proxy_pid=""
@@ -4226,27 +4507,34 @@ while true; do
                 if seenshow_acquire_slot_if_needed "$current_url_index"; then
                     log "SEENSHOW: Slot lease restored for URL index $current_url_index"
                 else
-                    next_url_index=$(( (current_url_index + 1) % url_count ))
-                    attempt_url_hotswap_and_exit_if_success "$next_url_index" "seenshow_slot_lost" || true
+                    if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+                        # ALWAYS_FIFO: switch feeder to next URL, encoder stays alive
+                        log_error "SEENSHOW: Slot lost. Switching feeder to next URL (encoder stays alive)"
+                        switch_feeder_to_next_url
+                        # DO NOT break
+                    else
+                        next_url_index=$(( (current_url_index + 1) % url_count ))
+                        attempt_url_hotswap_and_exit_if_success "$next_url_index" "seenshow_slot_lost" || true
 
-                    stop_reason="seenshow_slot_lost"
-                    log_error "SEENSHOW: Unable to restore slot lease. Switching away from URL index $current_url_index"
+                        stop_reason="seenshow_slot_lost"
+                        log_error "SEENSHOW: Unable to restore slot lease. Switching away from URL index $current_url_index"
 
-                    # Graceful stop, then force kill as last resort
-                    kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
-                    pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
-                    for i in {1..10}; do
-                        if ! is_process_running "$ffmpeg_pid"; then
-                            break
+                        # Graceful stop, then force kill as last resort
+                        kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                        pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+                        for i in {1..10}; do
+                            if ! is_process_running "$ffmpeg_pid"; then
+                                break
+                            fi
+                            sleep 1
+                        done
+                        if is_process_running "$ffmpeg_pid"; then
+                            log "SEENSHOW: Force killing FFmpeg PID $ffmpeg_pid after slot loss"
+                            kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                            pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
                         fi
-                        sleep 1
-                    done
-                    if is_process_running "$ffmpeg_pid"; then
-                        log "SEENSHOW: Force killing FFmpeg PID $ffmpeg_pid after slot loss"
-                        kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
-                        pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+                        break
                     fi
-                    break
                 fi
             fi
         fi
@@ -4257,7 +4545,18 @@ while true; do
         if [[ -z "$stop_reason" ]]; then
             restore_from_index="$current_url_index"
             if check_and_fallback_to_primary; then
-                if can_use_primary_hotswap; then
+                if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+                    # ALWAYS_FIFO: swap feeder to primary URL without touching encoder
+                    log "PRIMARY_RESTORED: Switching feeder to primary (encoder stays alive)"
+                    kill_feeder
+                    current_url_index=0
+                    current_url="${url_array[0]}"
+                    start_feeder_for_current_url
+                    feeder_restart_count=0
+                    total_cycles=0
+                    reset_primary_restore_confirmation "fifo_primary_restored"
+                    # DO NOT break — encoder keeps running
+                elif can_use_primary_hotswap; then
                     log "PRIMARY_HOTSWAP: Primary confirmed. Attempting seamless handoff..."
                     if run_primary_hotswap_handoff; then
                         log "PRIMARY_HOTSWAP: Handoff completed. Exiting current instance."
@@ -4294,24 +4593,33 @@ while true; do
 
         # YOUTUBE_REFRESH: check if current YouTube URL needs refresh while streaming
         if [[ -z "$stop_reason" ]] && check_youtube_urls_need_refresh; then
-            stop_reason="youtube_refresh"
-            log "YOUTUBE_REFRESH: Restarting stream with refreshed URL..."
+            if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+                # ALWAYS_FIFO: swap feeder with refreshed URL, encoder stays alive
+                log "YOUTUBE_REFRESH: Swapping feeder with refreshed URL (encoder stays alive)"
+                kill_feeder
+                start_feeder_for_current_url
+                feeder_restart_count=0
+                # DO NOT break — encoder keeps running
+            else
+                stop_reason="youtube_refresh"
+                log "YOUTUBE_REFRESH: Restarting stream with refreshed URL..."
 
-            # Graceful stop, same as primary_restore
-            kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
-            pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
-            for i in {1..10}; do
-                if ! is_process_running "$ffmpeg_pid"; then
-                    break
+                # Graceful stop, same as primary_restore
+                kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+                for i in {1..10}; do
+                    if ! is_process_running "$ffmpeg_pid"; then
+                        break
+                    fi
+                    sleep 1
+                done
+                if is_process_running "$ffmpeg_pid"; then
+                    log "YOUTUBE_REFRESH: Force killing FFmpeg PID $ffmpeg_pid"
+                    kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                    pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
                 fi
-                sleep 1
-            done
-            if is_process_running "$ffmpeg_pid"; then
-                log "YOUTUBE_REFRESH: Force killing FFmpeg PID $ffmpeg_pid"
-                kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
-                pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+                break
             fi
-            break
         fi
 
         # CPU_GUARD: kill runaway FFmpeg to prevent system overload
@@ -4324,37 +4632,56 @@ while true; do
 
         # SEGMENT_STALE: check if output is stale and switch to backup URL
         if [[ -z "$stop_reason" ]] && check_segment_staleness; then
-            if [[ $url_count -lt 2 ]]; then
-                stop_reason="segment_stale_restart"
-                log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no backups configured)..."
-            else
-                next_url_index=$(( (current_url_index + 1) % url_count ))
-                if [[ "$next_url_index" -eq "$current_url_index" ]]; then
-                    stop_reason="segment_stale_restart"
-                    log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no alternate URL index)..."
+            if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
+                # ALWAYS_FIFO: replace feeder, encoder stays alive
+                log "SEGMENT_STALE: Replacing feeder (encoder stays alive)"
+                kill_feeder
+                if [[ $feeder_restart_count -ge $FEEDER_MAX_RESTARTS ]]; then
+                    log "SEGMENT_STALE: Max feeder restarts ($FEEDER_MAX_RESTARTS). Switching URL."
+                    feeder_restart_count=0
+                    switch_feeder_to_next_url
                 else
-                    attempt_url_hotswap_and_exit_if_success "$next_url_index" "segment_stale" || true
-
-                    stop_reason="segment_stale"
-                    log "SEGMENT_STALE: Output stale, switching to backup URL..."
+                    backoff=$(calculate_feeder_backoff)
+                    [[ $backoff -gt 1 ]] && log "SEGMENT_STALE: Backoff ${backoff}s before feeder restart"
+                    sleep "$backoff"
+                    start_feeder_for_current_url
+                    feeder_restart_count=$((feeder_restart_count + 1))
                 fi
-            fi
+                last_segment_check=$(date +%s)
+                # DO NOT break — encoder keeps running
+            else
+                if [[ $url_count -lt 2 ]]; then
+                    stop_reason="segment_stale_restart"
+                    log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no backups configured)..."
+                else
+                    next_url_index=$(( (current_url_index + 1) % url_count ))
+                    if [[ "$next_url_index" -eq "$current_url_index" ]]; then
+                        stop_reason="segment_stale_restart"
+                        log "SEGMENT_STALE: Output stale, restarting FFmpeg on current URL (no alternate URL index)..."
+                    else
+                        attempt_url_hotswap_and_exit_if_success "$next_url_index" "segment_stale" || true
 
-            # Graceful stop
-            kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
-            pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
-            for i in {1..10}; do
-                if ! is_process_running "$ffmpeg_pid"; then
-                    break
+                        stop_reason="segment_stale"
+                        log "SEGMENT_STALE: Output stale, switching to backup URL..."
+                    fi
                 fi
-                sleep 1
-            done
-            if is_process_running "$ffmpeg_pid"; then
-                log "SEGMENT_STALE: Force killing FFmpeg PID $ffmpeg_pid"
-                kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
-                pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+
+                # Graceful stop
+                kill -TERM "$ffmpeg_pid" 2>$DEVNULL || true
+                pkill -TERM -P "$ffmpeg_pid" 2>$DEVNULL || true
+                for i in {1..10}; do
+                    if ! is_process_running "$ffmpeg_pid"; then
+                        break
+                    fi
+                    sleep 1
+                done
+                if is_process_running "$ffmpeg_pid"; then
+                    log "SEGMENT_STALE: Force killing FFmpeg PID $ffmpeg_pid"
+                    kill -KILL "$ffmpeg_pid" 2>$DEVNULL || true
+                    pkill -KILL -P "$ffmpeg_pid" 2>$DEVNULL || true
+                fi
+                break
             fi
-            break
         fi
     done
 
@@ -4386,6 +4713,17 @@ while true; do
         fi
     fi
     proxy_pid=""
+    # Clean up feeder process and held-open FIFO FD (Always-FIFO)
+    kill_feeder 2>$DEVNULL || true
+    if [[ -n "$fifo_write_fd" ]]; then
+        exec {fifo_write_fd}>&- 2>/dev/null || true
+        fifo_write_fd=""
+    fi
+    # Clean up FIFO path
+    if [[ -n "$stream_fifo" ]]; then
+        rm -f "$stream_fifo" 2>$DEVNULL
+        stream_fifo=""
+    fi
     last_ffmpeg_pid="$ffmpeg_pid"
     end_time=$(date +%s)
     duration=$((end_time - start_time))

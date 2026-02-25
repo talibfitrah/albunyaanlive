@@ -46,6 +46,7 @@ playlists/*.m3u
 
 # Auto-generated runtime cache (rebuilt by provider_sync every 30 min)
 channels/provider_catalog.json
+channels/*_catalog.json
 
 # Vendored external dependency (separate repo/workflow)
 channels/bgutil-pot-node/
