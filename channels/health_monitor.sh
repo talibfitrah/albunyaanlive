@@ -85,17 +85,18 @@ fi
 #
 # Fixed Issues:
 #   - [BLOCKER] Uses channel_id (HLS directory name) for process detection
-#   - [MINOR] Updated thresholds: 15s segment stale, 30s playlist stale
+#   - [MINOR] Updated thresholds: 300s segment stale, 300s playlist stale (feeder recovery window)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HLS_BASE_DIR="/var/www/html/stream/hls"
 RESTART_TRACKING_DIR="/tmp/stream_health_${UID}"
-MAX_RESTARTS_PER_HOUR=5
+MAX_RESTARTS_PER_HOUR=15
 
-# MINOR FIX: Updated thresholds per spec (was 30/60, now 15/30)
-SEGMENT_STALE_THRESHOLD=15   # seconds - segment freshness check
-PLAYLIST_STALE_THRESHOLD=30  # seconds - playlist freshness check
+# Raised thresholds: let try_start_stream.sh manage its own feeder recovery.
+# Health monitor only intervenes for truly dead channels (5 min stale).
+SEGMENT_STALE_THRESHOLD=300  # seconds - segment freshness check (5 min)
+PLAYLIST_STALE_THRESHOLD=300 # seconds - playlist freshness check (5 min)
 
 # Choose a writable log directory (fallback to /tmp if repo logs are not writable)
 resolve_log_dir() {
@@ -501,6 +502,25 @@ check_channel_health() {
 
     # Auto-restart if needed
     if [[ $needs_restart -eq 1 ]]; then
+        # If the parent try_start_stream.sh process is alive (pidfile exists + PID valid),
+        # skip restart — let the FIFO feeder architecture manage source recovery internally.
+        # Only intervene if the parent is truly dead.
+        local pidfile="/tmp/stream_${channel_id}.pid"
+        if [[ "$status" != "STOPPED" && -f "$pidfile" ]]; then
+            local parent_pid
+            parent_pid=$(cat "$pidfile" 2>/dev/null)
+            if [[ -n "$parent_pid" ]] && kill -0 "$parent_pid" 2>/dev/null; then
+                # Verify the PID actually belongs to try_start_stream for this channel
+                # (guards against PID recycling after reboot)
+                local pid_cmdline=""
+                pid_cmdline=$(tr '\0' ' ' < "/proc/$parent_pid/cmdline" 2>/dev/null || true)
+                if [[ "$pid_cmdline" == *try_start_stream* && "$pid_cmdline" == *"$channel_id"* ]]; then
+                    log "Channel $channel_id: $status but parent PID $parent_pid alive — skipping restart (feeder recovery in progress)"
+                    return 0
+                fi
+            fi
+        fi
+
         local restart_count=$(get_restart_count "$channel_id")
 
         if [[ $restart_count -ge $MAX_RESTARTS_PER_HOUR ]]; then

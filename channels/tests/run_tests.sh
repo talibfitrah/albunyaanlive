@@ -257,6 +257,33 @@ if ! has_pattern "while is_process_running" "$ROOT_DIR/try_start_stream.sh"; the
     fail "ffmpeg monitor loop missing in try_start_stream.sh (hot-reload won't run during long sessions)"
 fi
 
+# Ensure ALWAYS_FIFO architecture components exist
+if ! has_pattern 'ALWAYS_FIFO=.*-[01]' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "ALWAYS_FIFO config variable missing in try_start_stream.sh"
+fi
+if ! has_pattern "FEEDER_STALE_THRESHOLD" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "FEEDER_STALE_THRESHOLD config variable missing in try_start_stream.sh"
+fi
+if ! has_pattern "start_feeder_for_current_url" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "start_feeder_for_current_url function missing in try_start_stream.sh"
+fi
+if ! has_pattern "kill_feeder" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "kill_feeder function missing in try_start_stream.sh"
+fi
+if ! has_pattern "FEEDER_MONITOR:" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "FEEDER_MONITOR log marker missing in try_start_stream.sh"
+fi
+if ! has_pattern "switch_feeder_to_next_url" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "switch_feeder_to_next_url function missing in try_start_stream.sh"
+fi
+# Ensure slate recovery does not become permanent
+# Verify switch_feeder_to_next_url kills slate and restarts real feeder after cycle exhaustion.
+# The pattern is: inside the max_cycles block, kill_feeder must appear, followed by
+# start_feeder_for_current_url (on separate lines). Use awk to verify ordering.
+if ! awk '/total_cycles -ge \$max_cycles/{found=1} found && /kill_feeder/{kf=1} kf && /start_feeder_for_current_url/{ok=1; exit} END{exit !ok}' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "switch_feeder_to_next_url must kill slate and restart real feeder after cycle exhaustion"
+fi
+
 # Guard against duplicate audio options in a single command block
 prev=""
 while IFS= read -r line; do
@@ -696,7 +723,7 @@ EOF
     rm -f "/tmp/stream_${channel_id}.pid" "/tmp/stream_.graceful_${channel_id}.pid" 2>"$DEVNULL" || true
     rmdir "/tmp/stream_${channel_id}.lock" "/tmp/stream_.graceful_${channel_id}.lock" 2>"$DEVNULL" || true
 
-    if ! PATH="$bin_dir:$PATH" STATE_DIR="$state_dir" \
+    if ! PATH="$bin_dir:$PATH" STATE_DIR="$state_dir" ALWAYS_FIFO=0 \
         GRACEFUL_HLS_BASE_DIR="$hls_base" GRACEFUL_REQUIRED_SEGMENTS=1 GRACEFUL_MAX_WAIT_SECONDS=20 \
         GRACEFUL_OVERRIDE_STREAM_URL="http://primary.example/live.m3u8" \
         "$ROOT_DIR/graceful_restart.sh" "$channel_id" > "$run_log" 2>&1; then
@@ -849,7 +876,7 @@ EOF
 
     # Run try_start_stream with short intervals
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 PRIMARY_RESTORE_MEDIA_PROBE=0 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -c "$config_file" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -c "$config_file" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1059,7 +1086,7 @@ EOF
     rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$bad_backup_url|$good_backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$bad_backup_url|$good_backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1223,7 +1250,7 @@ EOF
     rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$seenshow_url|$backup2_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$seenshow_url|$backup2_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1374,7 +1401,7 @@ EOF
     rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=2 CONFIG_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$bad_backup_url|$good_backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$bad_backup_url|$good_backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1489,7 +1516,7 @@ EOF
     rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=120 CONFIG_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1603,7 +1630,7 @@ EOF
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         SEENSHOW_SLOT_CHANNEL_ID="$slot_owner" \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1736,7 +1763,7 @@ EOF
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         URL_HOTSWAP_ENABLE=0 SEENSHOW_SLOT_TOUCH_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1862,7 +1889,7 @@ EOF
         PRIMARY_RESTORE_CONFIRMATIONS=1 PRIMARY_RESTORE_MEDIA_PROBE=0 \
         PRIMARY_HOTSWAP_ENABLE=1 PRIMARY_HOTSWAP_SCRIPT="$bin_dir/hotswap_ok.sh" \
         PRIMARY_HOTSWAP_TIMEOUT=15 PRIMARY_HOTSWAP_COOLDOWN=120 URL_HOTSWAP_ENABLE=0 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -1987,7 +2014,7 @@ EOF
         PRIMARY_RESTORE_CONFIRMATIONS=1 PRIMARY_RESTORE_MEDIA_PROBE=0 \
         PRIMARY_HOTSWAP_ENABLE=1 PRIMARY_HOTSWAP_SCRIPT="$bin_dir/hotswap_fail.sh" \
         PRIMARY_HOTSWAP_TIMEOUT=15 PRIMARY_HOTSWAP_COOLDOWN=600 URL_HOTSWAP_ENABLE=0 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2107,7 +2134,7 @@ EOF
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 PRIMARY_RESTORE_MEDIA_PROBE=0 \
         SEGMENT_STALE_THRESHOLD=2 SEGMENT_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url_1" -d "$dest" -c "$config_file" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url_1" -d "$dest" -c "$config_file" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2234,7 +2261,7 @@ EOF
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         PRIMARY_HOTSWAP_ENABLE=0 URL_HOTSWAP_ENABLE=1 URL_HOTSWAP_SCRIPT="$bin_dir/segment_hotswap_ok.sh" \
         URL_HOTSWAP_TIMEOUT=15 URL_HOTSWAP_COOLDOWN=120 SEGMENT_STALE_THRESHOLD=2 SEGMENT_CHECK_INTERVAL=1 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2372,7 +2399,7 @@ EOF
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         PRIMARY_HOTSWAP_ENABLE=0 URL_HOTSWAP_ENABLE=1 URL_HOTSWAP_SCRIPT="$bin_dir/http_hotswap_ok.sh" \
         URL_HOTSWAP_TIMEOUT=15 URL_HOTSWAP_COOLDOWN=120 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2502,7 +2529,7 @@ EOF
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         PRIMARY_HOTSWAP_ENABLE=0 URL_HOTSWAP_ENABLE=1 URL_HOTSWAP_SCRIPT="$bin_dir/maxretry_hotswap_ok.sh" \
         URL_HOTSWAP_TIMEOUT=15 URL_HOTSWAP_COOLDOWN=120 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2619,7 +2646,7 @@ EOF
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" PRIMARY_CHECK_INTERVAL=600 CONFIG_CHECK_INTERVAL=1 \
         PRIMARY_HOTSWAP_ENABLE=0 URL_HOTSWAP_ENABLE=1 URL_HOTSWAP_SCRIPT="$bin_dir/maxretry_hotswap_nolive.sh" \
         URL_HOTSWAP_TIMEOUT=15 URL_HOTSWAP_COOLDOWN=120 \
-        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -b "$backup_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2695,7 +2722,7 @@ EOF
     rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
 
     STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" \
-        "$ROOT_DIR/try_start_stream.sh" -u "$file_url" -d "$dest" -n "$channel_id" &
+        ALWAYS_FIFO=0 "$ROOT_DIR/try_start_stream.sh" -u "$file_url" -d "$dest" -n "$channel_id" &
     local runner_pid=$!
 
     local log_file=""
@@ -2732,8 +2759,368 @@ EOF
     rm -rf "$tmp_dir" 2>"$DEVNULL" || true
 }
 
+integration_always_fifo_nonblocking_startup() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    local bin_dir="$tmp_dir/bin"
+    local state_dir="$tmp_dir/state"
+    mkdir -p "$bin_dir" "$state_dir"
+
+    # Stub curl: always return 200
+    cat > "$bin_dir/curl" <<'STUBEOF'
+#!/bin/bash
+printf "200"
+STUBEOF
+    chmod +x "$bin_dir/curl"
+
+    # Stub ffmpeg: when invoked as encoder (pipe:0), record argv and loop.
+    # When invoked as feeder (-c copy -f mpegts), write to stdout and loop.
+    cat > "$bin_dir/ffmpeg" <<'STUBEOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-encoders" ]]; then
+    cat <<OUT
+Encoders:
+ V.S..D mpeg2video           MPEG-2 video
+ A....D aac                  AAC (Advanced Audio Coding)
+OUT
+    exit 0
+fi
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-protocols" ]]; then
+    cat <<OUT
+Supported file protocols:
+Input:
+  file
+  http
+Output:
+  file
+OUT
+    exit 0
+fi
+
+state_dir="${STATE_DIR:-/tmp}"
+
+# Detect feeder mode: -c copy -f mpegts pipe:1
+is_feeder=0
+for arg in "$@"; do
+    if [[ "$arg" == "mpegts" ]]; then
+        is_feeder=1
+        break
+    fi
+done
+
+if [[ $is_feeder -eq 1 ]]; then
+    # Feeder stub: signal readiness
+    touch "$state_dir/feeder_started"
+    trap 'exit 0' TERM INT
+    while true; do sleep 1; done
+fi
+
+# Encoder stub: record args, produce a segment, loop
+args_file="$state_dir/fifo_ffmpeg_args"
+if [[ ! -f "$args_file" ]]; then
+    for arg in "$@"; do
+        printf '%s\n' "$arg"
+    done > "$args_file"
+fi
+
+# Produce a dummy segment to prevent stale detection
+dest="${@: -1}"
+dest_dir="$(dirname "$dest")"
+mkdir -p "$dest_dir"
+touch "$dest_dir/seg_0001.ts"
+cat > "$dest" <<OUT
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:100
+seg_0001.ts
+OUT
+
+touch "$state_dir/encoder_started"
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+STUBEOF
+    chmod +x "$bin_dir/ffmpeg"
+
+    # Stub streamlink (not needed for HTTP source but must exist)
+    cat > "$bin_dir/streamlink" <<'STUBEOF'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+STUBEOF
+    chmod +x "$bin_dir/streamlink"
+
+    # nvidia-smi stub (return success for GPU detect)
+    cat > "$bin_dir/nvidia-smi" <<'STUBEOF'
+#!/bin/bash
+exit 0
+STUBEOF
+    chmod +x "$bin_dir/nvidia-smi"
+
+    local channel_id="test_fifo_${RANDOM}${RANDOM}"
+    local dest_dir="$tmp_dir/$channel_id"
+    mkdir -p "$dest_dir"
+    local dest="$dest_dir/master.m3u8"
+
+    local primary_url="http://primary.example/stream.m3u8"
+
+    local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
+    local fallback_log
+    fallback_log="$(fallback_log_path_for_channel "$channel_id")"
+    local legacy_fallback_log
+    legacy_fallback_log="$(legacy_fallback_log_path_for_channel "$channel_id")"
+    rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
+
+    # Launch with ALWAYS_FIFO=1 explicitly
+    STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" ALWAYS_FIFO=1 \
+        PRIMARY_CHECK_INTERVAL=9999 CONFIG_CHECK_INTERVAL=9999 \
+        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
+    local runner_pid=$!
+
+    # Wait for both encoder and feeder to start (proves non-blocking startup)
+    local timeout=15
+    local waited=0
+    while (( waited < timeout )); do
+        if [[ -f "$state_dir/encoder_started" && -f "$state_dir/feeder_started" ]]; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [[ ! -f "$state_dir/encoder_started" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "ALWAYS_FIFO: encoder did not start within ${timeout}s (FIFO deadlock?)"
+    fi
+    if [[ ! -f "$state_dir/feeder_started" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "ALWAYS_FIFO: feeder did not start within ${timeout}s"
+    fi
+
+    # Verify encoder received pipe:0 as input
+    local args_file="$state_dir/fifo_ffmpeg_args"
+    if [[ -f "$args_file" ]]; then
+        if ! grep -Fq "pipe:0" "$args_file"; then
+            stop_runner_process "$runner_pid"
+            rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+            fail "ALWAYS_FIFO: encoder args missing pipe:0 input"
+        fi
+    else
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "ALWAYS_FIFO: encoder args file not created"
+    fi
+
+    # Verify log shows ALWAYS_FIFO startup
+    local log_file=""
+    log_file="$(wait_for_log_file_any_location "$preferred_log" "$fallback_log" "$legacy_fallback_log" 5)" || true
+    if [[ -n "$log_file" ]]; then
+        if ! grep -Fq "ALWAYS_FIFO: Encoder PID=" "$log_file"; then
+            stop_runner_process "$runner_pid"
+            rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+            fail "ALWAYS_FIFO: expected startup log line not found"
+        fi
+    fi
+
+    stop_runner_process "$runner_pid"
+    rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+}
+
+integration_always_fifo_feeder_restart_encoder_survives() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    local bin_dir="$tmp_dir/bin"
+    local state_dir="$tmp_dir/state"
+    mkdir -p "$bin_dir" "$state_dir"
+
+    # Stub curl: always return 200
+    cat > "$bin_dir/curl" <<'STUBEOF'
+#!/bin/bash
+printf "200"
+STUBEOF
+    chmod +x "$bin_dir/curl"
+
+    # Stub ffmpeg: encoder writes segments + loops; feeder exits after 2s (simulates source death)
+    cat > "$bin_dir/ffmpeg" <<'STUBEOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-encoders" ]]; then
+    cat <<OUT
+Encoders:
+ V.S..D mpeg2video           MPEG-2 video
+ A....D aac                  AAC (Advanced Audio Coding)
+OUT
+    exit 0
+fi
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-protocols" ]]; then
+    cat <<OUT
+Supported file protocols:
+Input:
+  file
+  http
+Output:
+  file
+OUT
+    exit 0
+fi
+
+state_dir="${STATE_DIR:-/tmp}"
+
+# Detect feeder mode: -c copy -f mpegts pipe:1
+is_feeder=0
+for arg in "$@"; do
+    if [[ "$arg" == "mpegts" ]]; then
+        is_feeder=1
+        break
+    fi
+done
+
+if [[ $is_feeder -eq 1 ]]; then
+    # Feeder: count starts, then exit after 2s to simulate source death
+    count_file="$state_dir/feeder_start_count"
+    count=0
+    [[ -f "$count_file" ]] && count=$(cat "$count_file" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    touch "$state_dir/feeder_started_${count}"
+    if [[ $count -eq 1 ]]; then
+        # First feeder: die after 2s to trigger FEEDER_MONITOR
+        sleep 2
+        exit 1
+    fi
+    # Second feeder: stay alive (proves restart worked)
+    touch "$state_dir/feeder_restarted"
+    trap 'exit 0' TERM INT
+    while true; do sleep 1; done
+fi
+
+# Encoder stub: produce dummy segment, record PID, loop
+dest="${@: -1}"
+dest_dir="$(dirname "$dest")"
+mkdir -p "$dest_dir"
+
+# Keep producing segments so stale detection doesn't fire
+while true; do
+    touch "$dest_dir/seg_0001.ts"
+    cat > "$dest" <<OUT
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:100
+seg_0001.ts
+OUT
+    echo "$$" > "$state_dir/encoder_pid"
+    touch "$state_dir/encoder_started"
+    trap 'exit 0' TERM INT
+    sleep 2
+done
+STUBEOF
+    chmod +x "$bin_dir/ffmpeg"
+
+    cat > "$bin_dir/streamlink" <<'STUBEOF'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+STUBEOF
+    chmod +x "$bin_dir/streamlink"
+
+    cat > "$bin_dir/nvidia-smi" <<'STUBEOF'
+#!/bin/bash
+exit 0
+STUBEOF
+    chmod +x "$bin_dir/nvidia-smi"
+
+    local channel_id="test_fifo_restart_${RANDOM}${RANDOM}"
+    local dest_dir="$tmp_dir/$channel_id"
+    mkdir -p "$dest_dir"
+    local dest="$dest_dir/master.m3u8"
+    local primary_url="http://primary.example/stream.m3u8"
+
+    local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
+    local fallback_log
+    fallback_log="$(fallback_log_path_for_channel "$channel_id")"
+    local legacy_fallback_log
+    legacy_fallback_log="$(legacy_fallback_log_path_for_channel "$channel_id")"
+    rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
+
+    STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" ALWAYS_FIFO=1 \
+        PRIMARY_CHECK_INTERVAL=9999 CONFIG_CHECK_INTERVAL=9999 \
+        SEGMENT_CHECK_INTERVAL=1 FEEDER_STALE_THRESHOLD=300 \
+        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
+    local runner_pid=$!
+
+    # Wait for encoder to start
+    local timeout=10 waited=0
+    while (( waited < timeout )); do
+        [[ -f "$state_dir/encoder_started" ]] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [[ ! -f "$state_dir/encoder_started" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "FIFO_RESTART: encoder did not start"
+    fi
+    local encoder_pid
+    encoder_pid=$(cat "$state_dir/encoder_pid" 2>/dev/null || echo "")
+
+    # Wait for feeder to restart after dying (proves FEEDER_MONITOR works)
+    timeout=15; waited=0
+    while (( waited < timeout )); do
+        [[ -f "$state_dir/feeder_restarted" ]] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [[ ! -f "$state_dir/feeder_restarted" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "FIFO_RESTART: feeder did not restart after dying (FEEDER_MONITOR broken)"
+    fi
+
+    # Verify the SAME encoder is still running (not restarted)
+    if [[ -n "$encoder_pid" ]]; then
+        local current_encoder_pid
+        current_encoder_pid=$(cat "$state_dir/encoder_pid" 2>/dev/null || echo "")
+        if [[ "$encoder_pid" != "$current_encoder_pid" ]]; then
+            stop_runner_process "$runner_pid"
+            rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+            fail "FIFO_RESTART: encoder PID changed ($encoder_pid -> $current_encoder_pid) — should survive feeder death"
+        fi
+    fi
+
+    # Verify feeder started twice
+    local feeder_count
+    feeder_count=$(cat "$state_dir/feeder_start_count" 2>/dev/null || echo 0)
+    if [[ "$feeder_count" -lt 2 ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "FIFO_RESTART: expected at least 2 feeder starts, got $feeder_count"
+    fi
+
+    # Check log for FEEDER_MONITOR message
+    local log_file=""
+    log_file="$(wait_for_log_file_any_location "$preferred_log" "$fallback_log" "$legacy_fallback_log" 5)" || true
+    if [[ -n "$log_file" ]] && ! grep -Fq "FEEDER_MONITOR:" "$log_file"; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "FIFO_RESTART: FEEDER_MONITOR log message not found"
+    fi
+
+    stop_runner_process "$runner_pid"
+    rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+}
+
 integration_primary_fallback_and_hot_reload
 integration_graceful_restart_real_handoff_smoke
+integration_always_fifo_nonblocking_startup
+integration_always_fifo_feeder_restart_encoder_survives
 integration_skips_unsupported_protocol_urls
 integration_https_seenshow_forces_proxy_even_with_native_https
 integration_https_proxy_fifo_failure_fails_safe
