@@ -90,6 +90,8 @@ last_primary_hotswap_attempt=0
 last_url_hotswap_attempt=0
 last_config_check=0
 config_file_mtime=0
+filter_crash_count=0
+force_copy_mode=0
 
 # =============================================================================
 # NEW: Segment staleness detection for automatic backup URL failover
@@ -4028,26 +4030,36 @@ build_ffmpeg_cmd() {
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         9|5|6|10|11)
-            # GPU tolerant: Software decode (error tolerant) + GPU scale + NVENC encode
-            # For corrupted/RTMP sources where h264_cuvid fails
-            # Falls back to full CPU pipeline if GPU is unavailable
+            # GPU tolerant: Software decode (error tolerant) + CPU scale + NVENC encode
+            # CPU-side scale handles any pixel format, then hwupload to GPU for NVENC.
+            # Falls back to stream copy if GPU is unavailable or repeatedly crashes.
             # (scales 5,6,10,11 aliased here)
             ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
             ffmpeg_cmd+=( -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
-            if nvidia-smi >$DEVNULL 2>&1; then
-                ffmpeg_cmd+=( -vf "format=nv12,hwupload_cuda,scale_npp=1920:1080" )
+            if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
+                # Safety net: GPU pipeline failed repeatedly — fall back to stream copy
+                # (no re-encoding, no CPU cost) instead of libx264 which would overload CPU
+                log "SCALE9: Forced COPY mode due to repeated GPU filter crashes (filter_crash_count=$filter_crash_count). No re-encoding."
+                ffmpeg_cmd+=( -c copy )
+                ffmpeg_cmd+=( -f hls -hls_time 6 )
+                ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
+            elif nvidia-smi >$DEVNULL 2>&1; then
+                # Resilient GPU pipeline: CPU-side scale handles any input pixel format,
+                # then normalize to nv12 and upload to GPU for NVENC encoding.
+                # This avoids scale_npp crashes when source format changes mid-stream.
+                ffmpeg_cmd+=( -vf "scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda" )
                 ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
                 ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
+                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+                ffmpeg_cmd+=( -f hls -hls_time 6 )
+                ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             else
-                log "SCALE9: GPU unavailable, falling back to full CPU pipeline"
-                ffmpeg_cmd+=( -vf "scale=1920:1080" )
-                ffmpeg_cmd+=( -c:v libx264 -preset ultrafast -tune zerolatency -profile:v high -level:v auto -g 180 -keyint_min 180 )
-                ffmpeg_cmd+=( -b:v 2500k -maxrate 3000k -bufsize 6000k -threads 4 )
+                log "SCALE9: GPU unavailable, falling back to stream copy (no re-encoding)"
+                ffmpeg_cmd+=( -c copy )
+                ffmpeg_cmd+=( -f hls -hls_time 6 )
+                ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             fi
-            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
-            ffmpeg_cmd+=( -f hls -hls_time 6 )
-            ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
         12|13)
             # GPU stretch: CUDA decode + stretch-fill to 1920x1080 + NVENC encode
@@ -4995,6 +5007,16 @@ while true; do
         ffmpeg_errors=$(cat "$ffmpeg_error_file")
         log_error "FFmpeg stderr: $ffmpeg_errors"
 
+        # Check for GPU filter crash (filter graph format negotiation failure)
+        if echo "$ffmpeg_errors" | grep -qiE "Impossible to convert between the formats|Cannot find a matching format"; then
+            filter_crash_count=$((filter_crash_count + 1))
+            log "FILTER_CRASH: GPU filter graph failed (count=$filter_crash_count). Source format change crashed filter chain."
+            if [[ $filter_crash_count -ge 2 ]]; then
+                log "FILTER_CRASH: Repeated GPU filter failures ($filter_crash_count). Forcing copy mode (no re-encoding)."
+                force_copy_mode=1
+            fi
+        fi
+
         # Check for HTTP errors in FFmpeg output
         if echo "$ffmpeg_errors" | grep -qE "HTTP error 4[0-9]{2}|Server returned 4[0-9]{2}"; then
             log "4XX_DETECTED: HTTP 4xx error detected in FFmpeg output"
@@ -5070,6 +5092,8 @@ while true; do
         log "SUCCESS_RUN: Stream ran for ${duration}s. Resetting failure counters."
         total_cycles=0
         rapid_failure_count=0  # Reset rapid failure count on success
+        filter_crash_count=0
+        force_copy_mode=0
         reset_url_retries
         cycle_start_time=$(date +%s)
 
