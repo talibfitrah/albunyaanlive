@@ -106,7 +106,7 @@ SEGMENT_STALE_THRESHOLD="${SEGMENT_STALE_THRESHOLD:-90}"      # Non-FIFO stale t
 ALWAYS_FIFO="${ALWAYS_FIFO:-1}"                                # Route all sources through FIFO (0 to disable)
 FEEDER_STALE_THRESHOLD="${FEEDER_STALE_THRESHOLD:-90}"         # Kill feeder after 90s stale output
 FEEDER_MAX_RESTARTS="${FEEDER_MAX_RESTARTS:-10}"               # Per-URL feeder restarts before switching URL
-FEEDER_MAX_RESTART_BACKOFF="${FEEDER_MAX_RESTART_BACKOFF:-30}" # Max backoff seconds between feeder restarts
+FEEDER_MAX_RESTART_BACKOFF="${FEEDER_MAX_RESTART_BACKOFF:-10}" # Max backoff seconds between feeder restarts
 SEGMENT_CHECK_INTERVAL="${SEGMENT_CHECK_INTERVAL:-5}"         # Check segment freshness every 5s
 last_segment_check=0
 stream_start_time=0
@@ -3663,21 +3663,182 @@ start_slate_feeder() {
     log "FEEDER_SLATE: Started slate feeder PID $feeder_pid"
 }
 
+# swap_to_slate_feeder — Atomic kill-current + start-slate (zero-gap transition)
+# Idempotent: returns 0 if already on slate. Pre-checks SLATE_VIDEO BEFORE
+# killing the current feeder so we never lose a working feeder if slate is unavailable.
+swap_to_slate_feeder() {
+    # Already on slate and feeder alive → nothing to do
+    if [[ "$feeder_is_slate" -eq 1 ]] && [[ -n "$feeder_pid" ]] && kill -0 "$feeder_pid" 2>$DEVNULL; then
+        return 0
+    fi
+    # Pre-check: can we actually start slate?
+    if [[ ! -f "$SLATE_VIDEO" ]]; then
+        log "SWAP_SLATE: No slate video at $SLATE_VIDEO — cannot inject slate"
+        return 1
+    fi
+    kill_feeder
+    if start_slate_feeder "$stream_fifo"; then
+        log "SWAP_SLATE: Swapped to slate feeder"
+        return 0
+    else
+        log_error "SWAP_SLATE: Failed to start slate feeder"
+        return 1
+    fi
+}
+
+# probe_and_restore_source — Background probe loop while slate plays
+# Runs when all sources are exhausted. Probes each URL every PROBE_INTERVAL
+# seconds and verifies with segment production before presenting to viewers.
+# Returns 0 if a source was verified and is now live, 1 if encoder died.
+probe_and_restore_source() {
+    local PROBE_INTERVAL="${PROBE_RESTORE_INTERVAL:-30}"
+    local PROBE_VERIFY_TIMEOUT="${PROBE_RESTORE_VERIFY_TIMEOUT:-15}"
+    # Guard against non-numeric env overrides that would cause sleep to fail
+    # and the loop to spin at 100% CPU.
+    [[ "$PROBE_INTERVAL" =~ ^[0-9]+$ ]] || PROBE_INTERVAL=30
+    [[ "$PROBE_VERIFY_TIMEOUT" =~ ^[0-9]+$ ]] || PROBE_VERIFY_TIMEOUT=15
+    log "PROBE_RESTORE: Entering probe mode. Checking sources every ${PROBE_INTERVAL}s."
+
+    while true; do
+        # If encoder died, break out — outer loop handles restart
+        if ! is_process_running "$ffmpeg_pid"; then
+            log "PROBE_RESTORE: Encoder died during probe mode. Exiting."
+            return 1
+        fi
+
+        # If slate feeder died, restart it to keep viewers seeing slate
+        if [[ -n "$feeder_pid" ]] && ! kill -0 "$feeder_pid" 2>$DEVNULL; then
+            wait "$feeder_pid" 2>$DEVNULL || true
+            log "PROBE_RESTORE: Slate feeder died. Restarting slate."
+            start_slate_feeder "$stream_fifo" || true
+        fi
+
+        # Hot-reload config during probe mode
+        reload_config_if_changed
+
+        sleep "$PROBE_INTERVAL"
+
+        # Probe each URL in order
+        local probe_idx
+        for ((probe_idx=0; probe_idx<url_count; probe_idx++)); do
+            local probe_url="${url_array[$probe_idx]}"
+
+            # Prepare provider-specific URLs before probing
+            if [[ "${url_is_seenshow[$probe_idx]:-0}" == "1" ]]; then
+                if ! prepare_seenshow_url_for_index "$probe_idx"; then
+                    log "PROBE_RESTORE: Seenshow prepare failed for index $probe_idx. Skipping."
+                    continue
+                fi
+                probe_url="${url_array[$probe_idx]}"
+            elif is_aloula_url "${url_original[$probe_idx]:-}"; then
+                if ! prepare_aloula_url_for_index "$probe_idx"; then
+                    log "PROBE_RESTORE: Aloula prepare failed for index $probe_idx. Skipping."
+                    continue
+                fi
+                probe_url="${url_array[$probe_idx]}"
+            elif is_elahmad_url "${url_original[$probe_idx]:-}"; then
+                if ! prepare_elahmad_url_for_index "$probe_idx"; then
+                    log "PROBE_RESTORE: Elahmad prepare failed for index $probe_idx. Skipping."
+                    continue
+                fi
+                probe_url="${url_array[$probe_idx]}"
+            fi
+
+            # Lightweight HTTP probe (skip for seenshow — creates connections)
+            if [[ "${url_is_seenshow[$probe_idx]:-0}" != "1" ]]; then
+                local http_status
+                http_status=$(validate_url "$probe_url")
+                if is_4xx_error "$http_status" || [[ "$http_status" == "000" ]]; then
+                    # Proxy-needed HTTPS URLs can return false 4xx to curl but
+                    # still stream via streamlink — mirror startup preflight logic.
+                    local probe_uses_https_proxy=0
+                    if needs_https_proxy "$probe_url"; then
+                        probe_uses_https_proxy=1
+                    fi
+                    if [[ "$probe_uses_https_proxy" -eq 0 ]]; then
+                        continue
+                    fi
+                    log "PROBE_RESTORE: HTTP $http_status on proxy URL index $probe_idx; attempting test-feed anyway"
+                fi
+            fi
+
+            # Source looks reachable — test-feed to verify actual segment production
+            log "PROBE_RESTORE: URL index $probe_idx probe passed. Test-feeding..."
+            kill_feeder   # kills slate
+            current_url_index=$probe_idx
+            current_url="${url_array[$probe_idx]}"
+            start_feeder_for_current_url
+            feeder_restart_count=0
+
+            # Wait up to PROBE_VERIFY_TIMEOUT seconds for segment advancement.
+            # We track the newest segment by mtime, not file count, because
+            # -hls_flags delete_segments keeps count constant while stream is live.
+            local dest_dir
+            dest_dir=$(dirname "$destination")
+            local baseline_seg
+            baseline_seg=$(find "$dest_dir" -maxdepth 1 -name "*.ts" -type f -printf '%T@ %f\n' 2>$DEVNULL | sort -n | tail -1 | awk '{print $2}')
+            local advances=0
+            local verified=0
+            local attempt
+            for ((attempt=1; attempt<=PROBE_VERIFY_TIMEOUT; attempt++)); do
+                sleep 1
+                # Check if encoder died
+                if ! is_process_running "$ffmpeg_pid"; then
+                    log "PROBE_RESTORE: Encoder died during verification."
+                    return 1
+                fi
+                # Check if feeder died
+                if [[ -n "$feeder_pid" ]] && ! kill -0 "$feeder_pid" 2>$DEVNULL; then
+                    log "PROBE_RESTORE: Feeder died during verification for index $probe_idx."
+                    break
+                fi
+                # Check for segment advancement by identity (not count)
+                local newest_seg
+                newest_seg=$(find "$dest_dir" -maxdepth 1 -name "*.ts" -type f -printf '%T@ %f\n' 2>$DEVNULL | sort -n | tail -1 | awk '{print $2}')
+                if [[ -n "$newest_seg" && "$newest_seg" != "$baseline_seg" ]]; then
+                    advances=$((advances + 1))
+                    baseline_seg="$newest_seg"
+                fi
+                # Require 2 advancements to confirm sustained segment production
+                if [[ $advances -ge 2 ]]; then
+                    verified=1
+                    break
+                fi
+            done
+
+            if [[ $verified -eq 1 ]]; then
+                log "PROBE_RESTORE: Source index $probe_idx verified ($advances segment advancements)! Presenting real stream."
+                total_cycles=0
+                feeder_restart_count=0
+                return 0
+            else
+                log "PROBE_RESTORE: Verification failed for index $probe_idx (advances=$advances). Back to slate."
+                swap_to_slate_feeder || true
+            fi
+        done
+
+        log "PROBE_RESTORE: All URLs probed, none verified. Staying on slate."
+    done
+
+    return 1
+}
+
 # kill_feeder — Stop feeder process and its children without touching encoder
 kill_feeder() {
     [[ -z "$feeder_pid" ]] && return
-    kill -0 "$feeder_pid" 2>$DEVNULL || { feeder_pid=""; return; }
+    kill -0 "$feeder_pid" 2>$DEVNULL || { wait "$feeder_pid" 2>$DEVNULL || true; feeder_pid=""; return; }
     kill -TERM "$feeder_pid" 2>$DEVNULL || true
     pkill -TERM -P "$feeder_pid" 2>$DEVNULL || true
     local i
-    for i in {1..5}; do
+    for i in {1..4}; do
         kill -0 "$feeder_pid" 2>$DEVNULL || break
-        sleep 1
+        sleep 0.5
     done
     if kill -0 "$feeder_pid" 2>$DEVNULL; then
         kill -KILL "$feeder_pid" 2>$DEVNULL || true
         pkill -KILL -P "$feeder_pid" 2>$DEVNULL || true
     fi
+    wait "$feeder_pid" 2>$DEVNULL || true
     feeder_pid=""
     feeder_is_slate=0
 }
@@ -3711,11 +3872,12 @@ switch_feeder_to_next_url() {
     local depth="${1:-0}"
     if [[ $depth -ge $url_count ]]; then
         log_error "FEEDER_SWITCH: All $url_count URLs failed prepare. Injecting slate."
-        start_slate_feeder "$stream_fifo" || true
+        swap_to_slate_feeder || start_slate_feeder "$stream_fifo" || true
         return
     fi
 
-    kill_feeder
+    # Slate-first: protect viewers immediately before any switching logic
+    swap_to_slate_feeder || true
     local previous_index="$current_url_index"
     current_url_index=$(( (current_url_index + 1) % url_count ))
     log "FEEDER_SWITCH: Switching feeder to URL index $current_url_index"
@@ -3725,20 +3887,20 @@ switch_feeder_to_next_url() {
         seenshow_release_slot
     fi
 
-    # Full cycle detection — inject slate if all URLs exhausted
+    # Full cycle detection — enter probe mode if all URLs exhausted
     if [[ $current_url_index -eq 0 ]]; then
         total_cycles=$((total_cycles + 1))
         log "FEEDER_CYCLE: Completed URL cycle $total_cycles of $max_cycles"
         if [[ $total_cycles -ge $max_cycles ]]; then
-            log "FEEDER_CYCLE: All URLs exhausted after $max_cycles cycles. Injecting slate for 120s."
-            start_slate_feeder "$stream_fifo" || true
-            sleep 120
-            # Kill slate and retry real sources from primary
-            kill_feeder
-            total_cycles=0
-            feeder_restart_count=0
-            current_url_index=0
-            current_url="${url_array[0]}"
+            log "FEEDER_CYCLE: All URLs exhausted after $max_cycles cycles. Entering probe mode."
+            # Ensure slate is playing (idempotent)
+            swap_to_slate_feeder || true
+            if probe_and_restore_source; then
+                # Source verified and live — return to caller
+                return
+            fi
+            # Probe mode exited (encoder died) — let outer loop handle
+            return
         fi
     fi
 
@@ -3772,6 +3934,8 @@ switch_feeder_to_next_url() {
         current_url="${url_array[$current_url_index]}"
     fi
 
+    # Kill slate and start real feeder
+    kill_feeder
     start_feeder_for_current_url
     feeder_restart_count=0
 }
@@ -4426,23 +4590,27 @@ while true; do
         fi
 
         # FEEDER_MONITOR (ALWAYS_FIFO): Detect dead feeder and restart it.
-        # The encoder stays alive — only the feeder is restarted.
+        # Slate-first: swap to slate IMMEDIATELY so encoder gets data, then retry.
         if [[ "$ALWAYS_FIFO" -eq 1 && -n "$feeder_pid" ]] && ! kill -0 "$feeder_pid" 2>$DEVNULL; then
             wait "$feeder_pid" 2>$DEVNULL || true
             feeder_uptime=0
             if [[ $feeder_last_restart_time -gt 0 ]]; then
                 feeder_uptime=$(( $(date +%s) - feeder_last_restart_time ))
             fi
-            log "FEEDER_MONITOR: Feeder PID $feeder_pid exited after ${feeder_uptime}s — restarting on same URL"
+            log "FEEDER_MONITOR: Feeder PID $feeder_pid exited after ${feeder_uptime}s"
             feeder_pid=""
+            # Swap to slate immediately — viewers see loading screen, not freeze
+            swap_to_slate_feeder || true
             feeder_restart_count=$((feeder_restart_count + 1))
             if [[ $feeder_restart_count -ge $FEEDER_MAX_RESTARTS ]]; then
                 log "FEEDER_MONITOR: Max restarts ($FEEDER_MAX_RESTARTS) on current URL. Switching."
                 switch_feeder_to_next_url
             else
                 backoff=$(calculate_feeder_backoff)
-                [[ $backoff -gt 1 ]] && log "FEEDER_MONITOR: Backoff ${backoff}s before restart"
+                [[ $backoff -gt 1 ]] && log "FEEDER_MONITOR: Backoff ${backoff}s before restart (slate playing)"
                 sleep "$backoff"
+                # Kill slate and start real feeder
+                kill_feeder
                 start_feeder_for_current_url
             fi
         fi
@@ -4546,11 +4714,12 @@ while true; do
             restore_from_index="$current_url_index"
             if check_and_fallback_to_primary; then
                 if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
-                    # ALWAYS_FIFO: swap feeder to primary URL without touching encoder
+                    # ALWAYS_FIFO: slate-first, then swap feeder to primary URL
                     log "PRIMARY_RESTORED: Switching feeder to primary (encoder stays alive)"
-                    kill_feeder
+                    swap_to_slate_feeder || true
                     current_url_index=0
                     current_url="${url_array[0]}"
+                    kill_feeder
                     start_feeder_for_current_url
                     feeder_restart_count=0
                     total_cycles=0
@@ -4594,8 +4763,9 @@ while true; do
         # YOUTUBE_REFRESH: check if current YouTube URL needs refresh while streaming
         if [[ -z "$stop_reason" ]] && check_youtube_urls_need_refresh; then
             if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
-                # ALWAYS_FIFO: swap feeder with refreshed URL, encoder stays alive
+                # ALWAYS_FIFO: slate-first, then swap feeder with refreshed URL
                 log "YOUTUBE_REFRESH: Swapping feeder with refreshed URL (encoder stays alive)"
+                swap_to_slate_feeder || true
                 kill_feeder
                 start_feeder_for_current_url
                 feeder_restart_count=0
@@ -4633,17 +4803,19 @@ while true; do
         # SEGMENT_STALE: check if output is stale and switch to backup URL
         if [[ -z "$stop_reason" ]] && check_segment_staleness; then
             if [[ "$ALWAYS_FIFO" -eq 1 ]]; then
-                # ALWAYS_FIFO: replace feeder, encoder stays alive
-                log "SEGMENT_STALE: Replacing feeder (encoder stays alive)"
-                kill_feeder
+                # ALWAYS_FIFO: slate-first, then replace feeder — encoder stays alive
+                log "SEGMENT_STALE: Swapping to slate, then restarting feeder (encoder stays alive)"
+                swap_to_slate_feeder || true
                 if [[ $feeder_restart_count -ge $FEEDER_MAX_RESTARTS ]]; then
                     log "SEGMENT_STALE: Max feeder restarts ($FEEDER_MAX_RESTARTS). Switching URL."
                     feeder_restart_count=0
                     switch_feeder_to_next_url
                 else
                     backoff=$(calculate_feeder_backoff)
-                    [[ $backoff -gt 1 ]] && log "SEGMENT_STALE: Backoff ${backoff}s before feeder restart"
+                    [[ $backoff -gt 1 ]] && log "SEGMENT_STALE: Backoff ${backoff}s before feeder restart (slate playing)"
                     sleep "$backoff"
+                    # Kill slate and start real feeder
+                    kill_feeder
                     start_feeder_for_current_url
                     feeder_restart_count=$((feeder_restart_count + 1))
                 fi

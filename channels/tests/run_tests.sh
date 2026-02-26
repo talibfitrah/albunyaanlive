@@ -276,12 +276,58 @@ fi
 if ! has_pattern "switch_feeder_to_next_url" "$ROOT_DIR/try_start_stream.sh"; then
     fail "switch_feeder_to_next_url function missing in try_start_stream.sh"
 fi
-# Ensure slate recovery does not become permanent
-# Verify switch_feeder_to_next_url kills slate and restarts real feeder after cycle exhaustion.
-# The pattern is: inside the max_cycles block, kill_feeder must appear, followed by
-# start_feeder_for_current_url (on separate lines). Use awk to verify ordering.
-if ! awk '/total_cycles -ge \$max_cycles/{found=1} found && /kill_feeder/{kf=1} kf && /start_feeder_for_current_url/{ok=1; exit} END{exit !ok}' "$ROOT_DIR/try_start_stream.sh"; then
-    fail "switch_feeder_to_next_url must kill slate and restart real feeder after cycle exhaustion"
+# Ensure slate recovery does not become permanent — probe_and_restore_source must
+# kill slate feeder (kill_feeder) and start real feeder (start_feeder_for_current_url)
+# when a source is verified. Check both functions exist and contain the restore pattern.
+if ! has_pattern "probe_and_restore_source" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source function missing in try_start_stream.sh"
+fi
+if ! has_pattern "swap_to_slate_feeder" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "swap_to_slate_feeder function missing in try_start_stream.sh"
+fi
+# Verify probe_and_restore_source calls kill_feeder + start_feeder_for_current_url (source restore path)
+if ! has_pattern "kill_feeder.*# kills slate" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source must kill slate before starting real feeder"
+fi
+# Ensure FEEDER_MONITOR uses slate-first pattern (swap_to_slate_feeder before retry)
+if ! has_pattern "FEEDER_MONITOR:.*exited" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "FEEDER_MONITOR exit detection log marker missing"
+fi
+# Ensure SEGMENT_STALE uses slate-first pattern
+if ! has_pattern "SEGMENT_STALE:.*slate" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "SEGMENT_STALE must use slate-first pattern"
+fi
+# Ensure PROBE_RESTORE log markers exist for observability
+if ! has_pattern "PROBE_RESTORE:.*Entering probe mode" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "PROBE_RESTORE: Entering probe mode log marker missing"
+fi
+if ! has_pattern "PROBE_RESTORE:.*Source.*verified" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "PROBE_RESTORE: Source verified log marker missing"
+fi
+# Ensure SWAP_SLATE log markers exist
+if ! has_pattern "SWAP_SLATE:.*Swapped to slate" "$ROOT_DIR/try_start_stream.sh"; then
+    fail "SWAP_SLATE: Swapped to slate log marker missing"
+fi
+# [BLOCKER-guard] Probe verification must use segment identity/mtime advancement, NOT file count.
+# The old count-based check (ls *.ts | wc -l) fails under -hls_flags delete_segments because
+# count plateaus while stream is healthy. Verify the code uses find + mtime, not ls + wc.
+if has_pattern 'wc -l.*verified' "$ROOT_DIR/try_start_stream.sh" || \
+   has_pattern 'cur_count.*gt.*pre_count' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source must not use file count for verification (breaks under delete_segments)"
+fi
+if ! has_pattern 'advances.*ge.*2' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source must require >=2 segment advancements for verification"
+fi
+if ! has_pattern 'baseline_seg' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source must track segment identity (baseline_seg) for advancement"
+fi
+# [MAJOR-guard] Probe prefilter must mirror startup proxy-aware preflight:
+# proxy-needed HTTPS URLs returning 4xx should still be test-fed (not skipped).
+if ! has_pattern 'probe_uses_https_proxy' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe_and_restore_source must check probe_uses_https_proxy for 4xx parity with startup"
+fi
+if ! has_pattern 'needs_https_proxy.*probe_url' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "probe must call needs_https_proxy on probe URL before skipping 4xx"
 fi
 
 # Guard against duplicate audio options in a single command block
@@ -3117,10 +3163,256 @@ STUBEOF
     rm -rf "$tmp_dir" 2>"$DEVNULL" || true
 }
 
+# ---------------------------------------------------------------------------
+# Integration: Probe-mode verifies segment advancement (not count)
+# Simulates: all feeders fail → probe mode → source recovers → verified
+# Asserts: encoder survives, PROBE_RESTORE messages appear, and recovery
+#          uses segment identity advancement (not file count).
+# ---------------------------------------------------------------------------
+integration_probe_mode_segment_advancement() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    local bin_dir="$tmp_dir/bin"
+    local state_dir="$tmp_dir/state"
+    mkdir -p "$bin_dir" "$state_dir"
+
+    # Stub curl: always return 200
+    cat > "$bin_dir/curl" <<'STUBEOF'
+#!/bin/bash
+printf "200"
+STUBEOF
+    chmod +x "$bin_dir/curl"
+
+    # Stub ffmpeg: encoder produces segments with advancing names (simulates
+    # delete_segments: count stays at 3 but names advance). Feeder behavior:
+    # first FEEDER_MAX_RESTARTS+1 feeders die immediately to exhaust restarts
+    # and trigger probe mode. After that, feeders stay alive (source recovered).
+    cat > "$bin_dir/ffmpeg" <<'STUBEOF'
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-encoders" ]]; then
+    cat <<OUT
+Encoders:
+ V.S..D mpeg2video           MPEG-2 video
+ A....D aac                  AAC (Advanced Audio Coding)
+OUT
+    exit 0
+fi
+
+if [[ "${1:-}" == "-hide_banner" && "${2:-}" == "-protocols" ]]; then
+    cat <<OUT
+Supported file protocols:
+Input:
+  file
+  http
+Output:
+  file
+OUT
+    exit 0
+fi
+
+state_dir="${STATE_DIR:-/tmp}"
+
+# Detect feeder mode: -c copy -f mpegts pipe:1
+is_feeder=0
+for arg in "$@"; do
+    if [[ "$arg" == "mpegts" ]]; then
+        is_feeder=1
+        break
+    fi
+done
+
+# Detect slate feeder: -stream_loop -1
+is_slate=0
+for arg in "$@"; do
+    if [[ "$arg" == "-stream_loop" ]]; then
+        is_slate=1
+        break
+    fi
+done
+
+if [[ $is_slate -eq 1 ]]; then
+    # Slate feeder: stay alive
+    touch "$state_dir/slate_feeder_started"
+    trap 'exit 0' TERM INT
+    while true; do sleep 1; done
+fi
+
+if [[ $is_feeder -eq 1 ]]; then
+    count_file="$state_dir/feeder_start_count"
+    count=0
+    [[ -f "$count_file" ]] && count=$(cat "$count_file" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    # With FEEDER_MAX_RESTARTS=2 and max_cycles=5 (1 URL):
+    # 2 deaths per cycle × 5 cycles = 10 feeder deaths before probe mode.
+    # Probe then starts feeder #11, which should stay alive (recovery).
+    if [[ $count -le 10 ]]; then
+        sleep 0.5
+        exit 1
+    fi
+    # After probe mode: stay alive (source recovered)
+    touch "$state_dir/feeder_recovered"
+    trap 'exit 0' TERM INT
+    while true; do sleep 1; done
+fi
+
+# Encoder stub: produce segments with advancing names, delete oldest (like delete_segments)
+dest="${@: -1}"
+dest_dir="$(dirname "$dest")"
+mkdir -p "$dest_dir"
+echo "$$" > "$state_dir/encoder_pid"
+touch "$state_dir/encoder_started"
+
+seg_seq=0
+trap 'exit 0' TERM INT
+while true; do
+    seg_seq=$((seg_seq + 1))
+    touch "$dest_dir/seg_$(printf '%04d' $seg_seq).ts"
+    # Keep only 3 segments (simulates delete_segments)
+    if [[ $seg_seq -gt 3 ]]; then
+        rm -f "$dest_dir/seg_$(printf '%04d' $((seg_seq - 3))).ts" 2>/dev/null || true
+    fi
+    cat > "$dest" <<OUT
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:$seg_seq
+seg_$(printf '%04d' $seg_seq).ts
+OUT
+    sleep 1
+done
+STUBEOF
+    chmod +x "$bin_dir/ffmpeg"
+
+    cat > "$bin_dir/streamlink" <<'STUBEOF'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+STUBEOF
+    chmod +x "$bin_dir/streamlink"
+
+    cat > "$bin_dir/nvidia-smi" <<'STUBEOF'
+#!/bin/bash
+exit 0
+STUBEOF
+    chmod +x "$bin_dir/nvidia-smi"
+
+    local channel_id="test_probe_mode_${RANDOM}${RANDOM}"
+    local dest_dir="$tmp_dir/$channel_id"
+    mkdir -p "$dest_dir"
+    local dest="$dest_dir/master.m3u8"
+    local primary_url="http://primary.example/stream.m3u8"
+
+    local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
+    local fallback_log
+    fallback_log="$(fallback_log_path_for_channel "$channel_id")"
+    local legacy_fallback_log
+    legacy_fallback_log="$(legacy_fallback_log_path_for_channel "$channel_id")"
+    rm -f "$preferred_log" "$fallback_log" "$legacy_fallback_log" 2>"$DEVNULL" || true
+
+    # Create dummy slate video (just needs to exist for swap_to_slate_feeder pre-check)
+    mkdir -p "$tmp_dir/slate"
+    touch "$tmp_dir/slate/slate_loop.mp4"
+
+    STATE_DIR="$state_dir" PATH="$bin_dir:$PATH" ALWAYS_FIFO=1 \
+        PRIMARY_CHECK_INTERVAL=9999 CONFIG_CHECK_INTERVAL=9999 \
+        SEGMENT_CHECK_INTERVAL=1 FEEDER_STALE_THRESHOLD=300 \
+        FEEDER_MAX_RESTARTS=2 FEEDER_MAX_RESTART_BACKOFF=1 \
+        PROBE_RESTORE_INTERVAL=3 PROBE_RESTORE_VERIFY_TIMEOUT=15 \
+        SLATE_VIDEO="$tmp_dir/slate/slate_loop.mp4" \
+        "$ROOT_DIR/try_start_stream.sh" -u "$primary_url" -d "$dest" -n "$channel_id" &
+    local runner_pid=$!
+
+    # Wait for encoder to start
+    local timeout=10 waited=0
+    while (( waited < timeout )); do
+        [[ -f "$state_dir/encoder_started" ]] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [[ ! -f "$state_dir/encoder_started" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: encoder did not start"
+    fi
+    local encoder_pid
+    encoder_pid=$(cat "$state_dir/encoder_pid" 2>/dev/null || echo "")
+
+    # Wait for probe mode entry (slate feeder should appear after max restarts exhaust)
+    timeout=60; waited=0
+    while (( waited < timeout )); do
+        [[ -f "$state_dir/slate_feeder_started" ]] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [[ ! -f "$state_dir/slate_feeder_started" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: slate feeder never started (probe mode not entered)"
+    fi
+
+    # Wait for full probe lifecycle: probe must enter, test-feed, verify segment
+    # advancement, and restore. We poll the log for the "verified" message
+    # rather than a state file, because the state file is set before verification.
+    local log_file=""
+    log_file="$(wait_for_log_file_any_location "$preferred_log" "$fallback_log" "$legacy_fallback_log" 15)" || true
+    if [[ -z "$log_file" ]]; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: log file never appeared"
+    fi
+
+    # Wait for verified recovery (probe must complete segment advancement check)
+    timeout=90; waited=0
+    while (( waited < timeout )); do
+        if grep -q "PROBE_RESTORE:.*verified.*Presenting real stream" "$log_file" 2>"$DEVNULL"; then
+            break
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    if ! grep -q "PROBE_RESTORE:.*verified.*Presenting real stream" "$log_file" 2>"$DEVNULL"; then
+        # Dump last 30 lines for diagnosis
+        echo "--- Last 30 log lines ---"
+        tail -30 "$log_file" 2>"$DEVNULL" || true
+        echo "--- End log dump ---"
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: source never verified from probe mode (segment advancement check failed)"
+    fi
+
+    # Verify the SAME encoder is still running (not restarted)
+    if [[ -n "$encoder_pid" ]]; then
+        local current_encoder_pid
+        current_encoder_pid=$(cat "$state_dir/encoder_pid" 2>/dev/null || echo "")
+        if [[ "$encoder_pid" != "$current_encoder_pid" ]]; then
+            stop_runner_process "$runner_pid"
+            rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+            fail "PROBE_MODE: encoder PID changed ($encoder_pid -> $current_encoder_pid) — should survive probe mode"
+        fi
+    fi
+
+    # Verify key lifecycle markers in log
+    if ! grep -Fq "PROBE_RESTORE: Entering probe mode" "$log_file"; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: 'PROBE_RESTORE: Entering probe mode' log message not found"
+    fi
+    if ! grep -Fq "SWAP_SLATE:" "$log_file"; then
+        stop_runner_process "$runner_pid"
+        rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+        fail "PROBE_MODE: 'SWAP_SLATE:' log message not found"
+    fi
+
+    stop_runner_process "$runner_pid"
+    rm -rf "$tmp_dir" 2>"$DEVNULL" || true
+}
+
 integration_primary_fallback_and_hot_reload
 integration_graceful_restart_real_handoff_smoke
 integration_always_fifo_nonblocking_startup
 integration_always_fifo_feeder_restart_encoder_survives
+integration_probe_mode_segment_advancement
 integration_skips_unsupported_protocol_urls
 integration_https_seenshow_forces_proxy_even_with_native_https
 integration_https_proxy_fifo_failure_fails_safe
