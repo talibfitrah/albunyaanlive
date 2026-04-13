@@ -15,6 +15,30 @@ LOG_FILE="${LOG_FILE:-/home/msa/Development/scripts/albunyaan/channels/logs/refl
 INTERVAL="${INTERVAL:-3}"
 SEGMENT_DURATION="${SEGMENT_DURATION:-6}"
 
+# Telegram alerting: plain-language pings on status transitions. Fast
+# layer below the brain — no LLM involved. Cooldown prevents flapping
+# channels from spamming.
+TELEGRAM_ENV="${TELEGRAM_ENV_FILE:-$HOME/.claude/channels/telegram/.env}"
+ALERT_COOLDOWN_S="${ALERT_COOLDOWN_S:-600}"
+ALERT_MIN_OBSERVATIONS="${ALERT_MIN_OBSERVATIONS:-2}"   # require N-in-a-row before alerting
+# Startup grace: for the first N ticks after watcher start, observe only —
+# seed PRIOR_STATUS from current reality so pre-existing stalls don't
+# announce as fresh transitions.
+ALERT_STARTUP_GRACE_TICKS="${ALERT_STARTUP_GRACE_TICKS:-5}"
+
+if [[ -r "$TELEGRAM_ENV" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$TELEGRAM_ENV"
+    set +a
+fi
+
+declare -A PRIOR_STATUS=()           # kind → last-known status
+declare -A PENDING_COUNT=()          # kind → consecutive observations of new status
+declare -A LAST_ALERT_TS=()          # kind → unix ts of last telegram send
+declare -A PENDING_STATUS=()         # kind → status being debounced
+TICK_COUNT=0
+
 STALL_WARN=$((SEGMENT_DURATION * 2))
 STALL_CRIT=$((SEGMENT_DURATION * 4))
 
@@ -121,6 +145,123 @@ emit_state() {
     mv -f "$tmp" "$STATE_FILE"
 }
 
+tg_send() {
+    local msg="$1"
+    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_OWNER_ID:-}" ]] && return 0
+    curl -s --max-time 10 \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_OWNER_ID}" \
+        --data-urlencode "text=${msg}" >/dev/null || true
+}
+
+# consider_transition <kind> <new_status> <msg_on_alert>
+# Alerts only if:
+#   - status differs from last-known good status for this kind
+#   - the new status has been observed ALERT_MIN_OBSERVATIONS ticks in a row
+#     (debounces segment-age noise and brief nvidia-smi hiccups)
+#   - ALERT_COOLDOWN_S has passed since last alert for this kind
+consider_transition() {
+    local kind="$1" new_status="$2" msg="$3"
+    local now; now=$(date +%s)
+
+    # Startup grace: silently seed PRIOR_STATUS so a cold-start watcher
+    # doesn't announce pre-existing stalls as fresh transitions.
+    if (( TICK_COUNT < ALERT_STARTUP_GRACE_TICKS )); then
+        PRIOR_STATUS[$kind]="$new_status"
+        PENDING_STATUS[$kind]=""
+        PENDING_COUNT[$kind]=0
+        return
+    fi
+
+    local prior="${PRIOR_STATUS[$kind]:-healthy}"
+
+    if [[ "$new_status" == "$prior" ]]; then
+        PENDING_STATUS[$kind]=""
+        PENDING_COUNT[$kind]=0
+        return
+    fi
+
+    # New status still pending debounce?
+    if [[ "${PENDING_STATUS[$kind]:-}" != "$new_status" ]]; then
+        PENDING_STATUS[$kind]="$new_status"
+        PENDING_COUNT[$kind]=1
+        return
+    fi
+    PENDING_COUNT[$kind]=$((PENDING_COUNT[$kind] + 1))
+    if [[ "${PENDING_COUNT[$kind]}" -lt "$ALERT_MIN_OBSERVATIONS" ]]; then
+        return
+    fi
+
+    local last="${LAST_ALERT_TS[$kind]:-0}"
+    if (( now - last < ALERT_COOLDOWN_S )); then
+        # Still silent by cooldown; but commit the state so we don't
+        # keep counting forever.
+        PRIOR_STATUS[$kind]="$new_status"
+        PENDING_STATUS[$kind]=""
+        PENDING_COUNT[$kind]=0
+        return
+    fi
+
+    tg_send "$msg"
+    log "alert kind=$kind prior=$prior new=$new_status"
+    PRIOR_STATUS[$kind]="$new_status"
+    LAST_ALERT_TS[$kind]="$now"
+    PENDING_STATUS[$kind]=""
+    PENDING_COUNT[$kind]=0
+}
+
+channel_msg() {
+    local ch="$1" status="$2" age="$3"
+    case "$status" in
+        healthy)     echo "قناة ${ch} عادت للعمل." ;;
+        warn)        echo "قناة ${ch} متأخرة — آخر صورة منذ ${age} ثانية. أتابع." ;;
+        stalled)     echo "قناة ${ch} توقفت — آخر صورة منذ ${age} ثانية." ;;
+        no_segments) echo "قناة ${ch} لا تُنتج أي صور." ;;
+        *)           echo "قناة ${ch} تغيّر حالها إلى ${status} (عمر آخر صورة: ${age} ثانية)." ;;
+    esac
+}
+
+resource_msg() {
+    local kind="$1" status="$2" pct="$3"
+    local name
+    case "$kind" in
+        system-mem)      name="الذاكرة" ;;
+        system-cpu)      name="المعالج" ;;
+        system-gpu)      name="ذاكرة كرت الشاشة" ;;
+        system-disk-root) name="القرص الرئيسي" ;;
+        system-disk-hls)  name="قرص HLS" ;;
+        *) name="$kind" ;;
+    esac
+    case "$status" in
+        healthy)  echo "${name} عادت لوضع طبيعي." ;;
+        warn)     echo "تحذير: ${name} عند ${pct}٪." ;;
+        critical) echo "تنبيه حرج: ${name} عند ${pct}٪." ;;
+        *)        echo "${name}: ${status} (${pct}٪)." ;;
+    esac
+}
+
+check_alerts() {
+    # Per-channel
+    for dir in "$HLS_ROOT"/*/; do
+        local ch; ch="$(basename "$dir")"
+        [[ "$ch" == "slate" ]] && continue
+        local age status
+        age=$(newest_segment_age "$dir")
+        status=$(classify_age "$age")
+        consider_transition "ch-$ch" "$status" "$(channel_msg "$ch" "$status" "$age")"
+    done
+    # System resources — only alert at warn/critical transitions (skip info churn)
+    local mem cpu gpu dr dh
+    mem=$(mem_used_pct);     consider_transition "system-mem"       "$(classify_pct "$mem" "$MEM_WARN" "$MEM_CRIT")"   "$(resource_msg system-mem       "$(classify_pct "$mem" "$MEM_WARN" "$MEM_CRIT")"   "$mem")"
+    cpu=$(cpu_load_pct);     consider_transition "system-cpu"       "$(classify_pct "$cpu" "$CPU_WARN" "$CPU_CRIT")"   "$(resource_msg system-cpu       "$(classify_pct "$cpu" "$CPU_WARN" "$CPU_CRIT")"   "$cpu")"
+    gpu=$(gpu_mem_pct)
+    if [[ "$gpu" -ge 0 ]]; then
+        consider_transition "system-gpu" "$(classify_pct "$gpu" "$GPU_WARN" "$GPU_CRIT")" "$(resource_msg system-gpu "$(classify_pct "$gpu" "$GPU_WARN" "$GPU_CRIT")" "$gpu")"
+    fi
+    dr=$(disk_pct "/");         [[ -n "$dr" ]] && consider_transition "system-disk-root" "$(classify_pct "$dr" "$DISK_WARN" "$DISK_CRIT")" "$(resource_msg system-disk-root "$(classify_pct "$dr" "$DISK_WARN" "$DISK_CRIT")" "$dr")"
+    dh=$(disk_pct "$HLS_ROOT"); [[ -n "$dh" ]] && consider_transition "system-disk-hls"  "$(classify_pct "$dh" "$DISK_WARN" "$DISK_CRIT")" "$(resource_msg system-disk-hls  "$(classify_pct "$dh" "$DISK_WARN" "$DISK_CRIT")" "$dh")"
+}
+
 log_anomalies() {
     local mem cpu gpu disk_root disk_hls
     for dir in "$HLS_ROOT"/*/; do
@@ -144,5 +285,7 @@ trap 'log "reflex_watcher stopping"; exit 0' INT TERM
 while true; do
     emit_state
     log_anomalies
+    check_alerts
+    TICK_COUNT=$((TICK_COUNT + 1))
     sleep "$INTERVAL"
 done
