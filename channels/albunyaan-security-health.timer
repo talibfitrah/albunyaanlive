@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger monthly /health code-quality audit (1st of month, 03:00 Europe/Amsterdam)
+
+[Timer]
+OnCalendar=*-*-01 03:00:00
+Persistent=true
+RandomizedDelaySec=15min
+Unit=albunyaan-security-health.service
+
+[Install]
+WantedBy=timers.target
