@@ -62,6 +62,40 @@ escape_regex() {
     printf '%s' "$1" | sed 's/[][\\.^$*+?{}|()]/\\&/g'
 }
 
+# Reap any ffmpeg writing into this channel's .graceful_<id> temp dir.
+# SIGTERM first, wait up to ${1:-5}s, then SIGKILL. Matches the cmdline path
+# so it still finds orphans even after the temp dir has been removed.
+# Without this the next restart hits DUPLICATE_DETECTED in try_start_stream.sh
+# and exits without taking over.
+reap_temp_ffmpeg() {
+    local timeout="${1:-5}"
+    local pattern="ffmpeg.*\\.graceful_${ESC_CHANNEL_ID}/master\\.m3u8"
+    if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+        return 0
+    fi
+    log "Reaping orphan ffmpeg(s) writing to .graceful_${CHANNEL_ID}"
+    pkill -TERM -f "$pattern" 2>/dev/null || true
+    local waited=0
+    while (( waited < timeout )); do
+        if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+            log "Orphan ffmpeg(s) terminated after ${waited}s"
+            return 0
+        fi
+        sleep 1
+        ((waited++))
+    done
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        log "Force killing remaining orphan ffmpeg(s) for .graceful_${CHANNEL_ID}"
+        pkill -KILL -f "$pattern" 2>/dev/null || true
+        sleep 1
+        if pgrep -f "$pattern" >/dev/null 2>&1; then
+            local survivors
+            survivors=$(pgrep -f "$pattern" | tr '\n' ' ')
+            log "ERROR: ffmpeg orphan(s) survived SIGKILL: ${survivors}"
+        fi
+    fi
+}
+
 # =============================================================================
 # Argument parsing and validation
 # =============================================================================
@@ -274,6 +308,11 @@ cleanup_temp() {
     local exit_code=$?
     local temp_channel_id="$TEMP_CHANNEL_ID"
 
+    # Reap any ffmpeg writing into the temp dir BEFORE deleting it. Otherwise
+    # the encoder keeps a deleted-file handle open and survives as a PPID=1
+    # orphan, which the next restart attempt sees as DUPLICATE_DETECTED.
+    reap_temp_ffmpeg 5
+
     # Clean up temp directory
     if [[ -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR"
@@ -444,12 +483,25 @@ done
 if [[ $SEGMENT_COUNT -lt $REQUIRED_SEGMENTS ]]; then
     log "ERROR: Failed to generate enough segments. Aborting graceful restart."
 
-    # Kill the new process if it's still running
-    kill -TERM "$NEW_STREAM_PID" 2>/dev/null
-    sleep 2
-    kill -9 "$NEW_STREAM_PID" 2>/dev/null
+    # Kill the new process if it's still running. SIGTERM, then escalate to
+    # SIGKILL after a short wait — the parent dying does NOT take its ffmpeg
+    # child with it, so we also reap the encoder via reap_temp_ffmpeg below.
+    if kill -0 "$NEW_STREAM_PID" 2>/dev/null; then
+        kill -TERM "$NEW_STREAM_PID" 2>/dev/null
+        for _ in {1..5}; do
+            kill -0 "$NEW_STREAM_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$NEW_STREAM_PID" 2>/dev/null; then
+            kill -KILL "$NEW_STREAM_PID" 2>/dev/null
+        fi
+    fi
 
-    # Cleanup is handled by trap
+    # Reap the orphan ffmpeg the dying caller spawned. Trap will also call
+    # this, but doing it inline keeps the abort log chronologically clean.
+    reap_temp_ffmpeg 5
+
+    # Remaining cleanup (temp dir, lock/pid files) handled by trap
     exit 1
 fi
 
