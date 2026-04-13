@@ -1,0 +1,19 @@
+[Unit]
+Description=Albunyaan brain loop — comprehensive 30min operator wake
+Documentation=file:///home/msa/Development/scripts/albunyaan/V4_PHASE3_PHASE5_DESIGN.md
+After=network-online.target albunyaan-watcher.service
+Wants=network-online.target
+Requires=albunyaan-watcher.service
+
+[Service]
+Type=oneshot
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+Environment=HOME=/home/msa
+Environment=PATH=/home/msa/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/brain_loop/wake.sh
+StandardOutput=append:/home/msa/Development/scripts/albunyaan/channels/brain/cron.log
+StandardError=append:/home/msa/Development/scripts/albunyaan/channels/brain/cron.log
+TimeoutStartSec=20min
+Nice=5

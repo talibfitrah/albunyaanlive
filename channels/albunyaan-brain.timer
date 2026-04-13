@@ -1,0 +1,14 @@
+[Unit]
+Description=Trigger Albunyaan brain wake every 30 minutes (first 14 days)
+
+[Timer]
+# Every 30 minutes from boot. After 14 days of stable operation the brain
+# itself recommends a cadence drop in its wake_summary; cadence change is
+# made by editing this file (OnUnitActiveSec=1h, then later 8h).
+OnBootSec=2min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Unit=albunyaan-brain.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,5 @@
+state.json
+.state.tmp.*
+wake.log
+cron.log
+raw/
