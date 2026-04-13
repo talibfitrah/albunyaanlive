@@ -17,3 +17,26 @@ StandardOutput=append:/home/msa/Development/scripts/albunyaan/channels/brain/cro
 StandardError=append:/home/msa/Development/scripts/albunyaan/channels/brain/cron.log
 TimeoutStartSec=20min
 Nice=5
+
+# Resource hardening (brain found this gap itself on first wake).
+# A runaway claude invocation must not be able to starve the 22 live
+# streams. MemoryMax generous vs observed ~310MB RSS; CPUQuota leaves
+# one core fully available for ffmpeg at all times.
+MemoryMax=4G
+CPUQuota=80%
+TasksMax=256
+
+# Filesystem hardening — home + /tmp must remain writable for state
+# writes, /var/www/html/stream for HLS reads, and sudo (askpass)
+# restart of the watcher must still work.
+ProtectSystem=strict
+ReadWritePaths=/home/msa/Development/scripts/albunyaan /tmp /home/msa/.claude /home/msa/.local
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=no
+# PrivateTmp=no — wake.sh reads /tmp/albunyaan-watcher-state.json and
+# /tmp/albunyaan-thumbs/.
+# NoNewPrivileges=no — wake.sh uses sudo via askpass to restart the
+# watcher when the brain decides its heartbeat is stale.

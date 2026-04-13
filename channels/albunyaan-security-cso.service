@@ -16,3 +16,21 @@ StandardOutput=append:/home/msa/Development/scripts/albunyaan/channels/security/
 StandardError=append:/home/msa/Development/scripts/albunyaan/channels/security/cron.log
 TimeoutStartSec=45min
 Nice=10
+
+# Resource hardening — audits are read-only scans, should never eat
+# production capacity.
+MemoryMax=4G
+CPUQuota=60%
+TasksMax=256
+
+# Filesystem hardening — audits write findings to channels/security/
+# and append to TODOS.md. No sudo, no runtime state dependency on /tmp.
+ProtectSystem=strict
+ReadWritePaths=/home/msa/Development/scripts/albunyaan /home/msa/.claude /home/msa/.local
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

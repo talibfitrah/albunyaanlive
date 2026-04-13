@@ -130,30 +130,76 @@ tool with this contract:
 ```
 Subagent input:
   thumbnail_path:        /tmp/albunyaan-thumbs/thumb_<id>.png
-  baseline_thumb_path:   channels/baselines/thumb_<id>.png
-  expected_genre:        from manifest
-  expected_logo:         from manifest
-  notes:                 from manifest (slate descriptions, gotchas)
+  baseline_thumb_path:   channels/baselines/thumb_<id>.png   (reference only)
+  expected_genre:        from manifest (e.g. "Islamic lecture",
+                                              "Quran recitation",
+                                              "Kids Islamic content",
+                                              "News")
+  expected_logo:         from manifest — a TEXT DESCRIPTION of the
+                         logo that identifies this channel
+                         (e.g. "white 'ajaweed' wordmark, top-right")
+  notes:                 from manifest — includes known slate cards
+                         and gotchas (e.g. "anees serves a Stream-
+                         will-return-shortly maintenance card")
   channel_id:            <id>
+```
+
+**Sub-agent judging rules (critical — this was the failure mode on
+wake 1 where 8/22 channels false-positived):**
+
+The sub-agent is a vision judge, NOT an image-diff tool. It must
+evaluate at the SEMANTIC level:
+
+1. **Logo check (primary identity signal).** Look at the bug corner
+   / overlay regions. Does the expected_logo actually appear? A
+   channel logo is the strongest identifier — if the correct logo
+   is visible, verdict is almost certainly `match` regardless of
+   what else is on screen.
+2. **Genre check.** Given expected_genre, does the on-screen
+   content plausibly match? A lecture channel showing a speaker
+   with Arabic captions is `match`. A Quran channel showing
+   calligraphy over a mosque is `match`. A kids channel showing
+   cartoon characters is `match`. **Normal programming variation
+   within a genre is NOT a mismatch.**
+3. **Slate check.** If the frame shows a static maintenance card,
+   "coming back soon" message, technical difficulties screen, or
+   a non-moving branded holding slate, verdict is `slate`. Include
+   the slate text (if readable) in `detected_text`.
+4. **Blackframe / no-signal.** Mostly-black frame with no content
+   → `blackframe`.
+5. **The baseline thumbnail is a REFERENCE, not a target.** Use it
+   only to learn what the channel's logo and typical look are.
+   Never return `mismatch` solely because the current frame differs
+   pixel-wise from the baseline — live TV programming changes
+   every few seconds, that is normal. Only return `mismatch` if
+   the logo is clearly a DIFFERENT channel's logo, or the content
+   genre is clearly wrong (e.g. news anchor on a kids channel).
 
 Subagent output (the LAST line of its response must be a single
 JSON object):
-  { "channel_id": "<id>",
-    "verdict": "match" | "mismatch" | "slate" | "blackframe" | "unknown",
-    "confidence": 0.0..1.0,
-    "reasoning": "one or two sentences explaining what you saw",
-    "detected_text": "any visible Arabic/English text" }
+
+```
+{ "channel_id": "<id>",
+  "verdict": "match" | "mismatch" | "slate" | "blackframe" | "unknown",
+  "confidence": 0.0..1.0,
+  "reasoning": "one or two sentences: logo seen? genre? what you saw",
+  "detected_text": "any visible Arabic/English text",
+  "logo_detected": true|false|"unknown" }
 ```
 
 Dispatch channel sub-agents in PARALLEL — one tool message with N
 Task calls, not sequential. They are independent. If 22 in one
 batch is rejected by limits, split into batches of 8-10.
 
-For each sub-agent that returns `mismatch` with confidence >= 0.7,
-or `slate` for a channel whose `prior_state.channel_history[id]`
-shows mismatches accumulating across wakes, this is potentially
-the worst-case bug: wrong content under a channel's name. Telegram
-alert this wake with the channel name and what was detected.
+For each sub-agent that returns `mismatch` with confidence >= 0.7
+AND `logo_detected=false`, this is potentially the worst-case bug:
+wrong content under a channel's name. Telegram alert this wake.
+If `mismatch` but `logo_detected=true`, the channel is showing the
+correct brand — likely just a programming change; downgrade to
+`unknown` in your aggregated state and do not alert.
+
+For a `slate` verdict where `prior_state.channel_history[id]`
+shows slate accumulating across wakes, open or escalate an incident.
 
 ### 7. Security and code-review pass
 
