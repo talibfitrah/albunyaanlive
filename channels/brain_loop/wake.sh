@@ -24,12 +24,23 @@ STATE_DIR="$REPO_ROOT/channels/brain"
 STATE_FILE="$STATE_DIR/state.json"
 WAKE_LOG="$STATE_DIR/wake.log"
 RAW_DIR="$STATE_DIR/raw"
+LOCK_FILE="$STATE_DIR/wake.lock"
 WATCHER_STATE_FILE="${WATCHER_STATE_FILE:-/tmp/albunyaan-watcher-state.json}"
 TELEGRAM_ENV="${TELEGRAM_ENV_FILE:-$HOME/.claude/channels/telegram/.env}"
 CLAUDE_BIN="${CLAUDE_BIN:-/home/msa/.local/bin/claude}"
 PROMPT_FILE="$SCRIPT_DIR/PROMPT.md"
+TELEGRAM_MAX_MSGS_PER_WAKE="${TELEGRAM_MAX_MSGS_PER_WAKE:-10}"
 
 mkdir -p "$STATE_DIR" "$RAW_DIR"
+
+# Concurrency guard. If a previous wake is still running (claude can take
+# minutes), bail out cleanly — we'd rather skip than corrupt state.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[$(date -Iseconds)] another wake is in progress (lock held); skipping this tick" \
+        | tee -a "$WAKE_LOG"
+    exit 0
+fi
 
 TS="$(date -Iseconds)"
 TS_SHORT="$(date +%Y%m%dT%H%M%S)"
@@ -178,33 +189,60 @@ fi
 
 # --- act on the response ---------------------------------------------------
 
-# Extract the new_state block and atomically write it
-NEW_STATE="$(echo "$JSON_DOC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("new_state", {}), indent=2, ensure_ascii=False))')"
-if [[ -n "$NEW_STATE" && "$NEW_STATE" != "{}" ]]; then
+# Extract and validate the new_state block before writing.
+# Required: dict with "schema" and "wake_count" (int). Without these, the
+# next wake's PRIOR_STATE parser breaks and the brain loses continuity —
+# better to keep the prior good state.
+NEW_STATE_VALID="$(echo "$JSON_DOC" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ns = d.get("new_state")
+if not isinstance(ns, dict):
+    sys.exit(1)
+if "schema" not in ns or "wake_count" not in ns:
+    sys.exit(2)
+if not isinstance(ns["wake_count"], int):
+    sys.exit(3)
+print(json.dumps(ns, indent=2, ensure_ascii=False))
+' 2>/dev/null)"
+if [[ -n "$NEW_STATE_VALID" ]]; then
     TMP_STATE="$(mktemp -p "$STATE_DIR" .state.tmp.XXXXXX)"
-    echo "$NEW_STATE" >"$TMP_STATE"
-    mv -f "$TMP_STATE" "$STATE_FILE"
+    echo "$NEW_STATE_VALID" >"$TMP_STATE"
+    if ! mv -f "$TMP_STATE" "$STATE_FILE"; then
+        log_line "WARN failed to install new state file; prior state retained"
+        rm -f "$TMP_STATE"
+    fi
+else
+    log_line "WARN brain returned invalid or missing new_state; prior state retained"
 fi
 
-# Post telegram messages
-echo "$JSON_DOC" | python3 -c '
+# Post telegram messages, capped to TELEGRAM_MAX_MSGS_PER_WAKE (default 10).
+# A wide-incident wake (e.g. all 22 channels stalled) shouldn't spam 22+
+# pings. Anything beyond the cap is summarised in a footer pointing at the
+# server log.
+TELEGRAM_MAX_MSGS_PER_WAKE="$TELEGRAM_MAX_MSGS_PER_WAKE" RAW_LOG_PATH="$RAW_LOG" \
+    python3 -c '
 import json, sys, os, subprocess
-d = json.load(sys.stdin)
-msgs = d.get("telegram_messages", []) or []
+d = json.loads(sys.stdin.read())
+msgs = [m for m in (d.get("telegram_messages") or []) if isinstance(m, str) and m.strip()]
+cap = int(os.environ.get("TELEGRAM_MAX_MSGS_PER_WAKE", "10"))
 token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 chat = os.environ.get("TELEGRAM_OWNER_ID", "")
 if not token or not chat:
     raise SystemExit(0)
-for m in msgs:
-    if not isinstance(m, str) or not m.strip():
-        continue
+to_send = msgs[:cap]
+if len(msgs) > cap:
+    overflow = len(msgs) - cap
+    raw = os.environ.get("RAW_LOG_PATH", "(see server log)")
+    to_send.append(f"... و{overflow} رسالة إضافية. التفاصيل الكاملة في سجل الخادم: {raw}")
+for m in to_send:
     subprocess.run([
         "curl", "-s", "--max-time", "15",
         f"https://api.telegram.org/bot{token}/sendMessage",
         "--data-urlencode", f"chat_id={chat}",
         "--data-urlencode", f"text={m}",
     ], stdout=subprocess.DEVNULL, check=False)
-'
+' <<<"$JSON_DOC"
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)
 RESTART_WATCHER="$(echo "$JSON_DOC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if (d.get("actions") or {}).get("restart_watcher") else "no")')"

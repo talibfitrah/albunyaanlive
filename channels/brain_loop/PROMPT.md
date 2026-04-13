@@ -145,8 +145,9 @@ JSON object):
     "detected_text": "any visible Arabic/English text" }
 ```
 
-Dispatch ALL channel sub-agents in PARALLEL — one tool message
-with N Task calls, not sequential. They are independent.
+Dispatch channel sub-agents in PARALLEL — one tool message with N
+Task calls, not sequential. They are independent. If 22 in one
+batch is rejected by limits, split into batches of 8-10.
 
 For each sub-agent that returns `mismatch` with confidence >= 0.7,
 or `slate` for a channel whose `prior_state.channel_history[id]`
@@ -201,8 +202,10 @@ Send messages ONLY when something matters to the user:
 - A code-review finding of `medium`+ severity.
 - A resource trend you'd want them to know about (e.g. disk fills
   in 2 days at current rate).
-- Daily report wake (08:00 Europe/Amsterdam): one message
-  summarizing the last 24 hours.
+- Daily report wake (08:00 Europe/Amsterdam — check current time
+  with `date -Iseconds`): one message summarizing the last 24
+  hours. Treat any wake firing within the 07:50-08:10 local
+  window as the daily-report wake.
 
 NO telegram for: routine "everything is fine" wakes, info-level
 findings, recurring incidents you've already alerted about (unless
@@ -245,6 +248,10 @@ matching this shape (no trailing prose, no code fences):
     "graceful_restart": ["zaad"],
     "extra_disk_cleanup": false
   },
+  // NOTE on actions: only `restart_watcher` is currently auto-executed
+  // (low-risk). `graceful_restart` and `extra_disk_cleanup` are LOGGED
+  // for the user to act on — the wrapper does NOT touch live streams.
+  // List channels you'd recommend restarting; the user/operator decides.
   "telegram_messages": [
     "first message in plain language",
     "second message"
