@@ -1,23 +1,28 @@
 #!/bin/bash
 
-# Set the path to the script's directory
 SCRIPT_DIR="/home/msa/Development/scripts/albunyaan/channels"
-
-# Change the working directory to the script's directory
 cd "$SCRIPT_DIR" || exit
 
-LOG_FILE="output.log"
 ARCHIVE_DIR="log_archive"
-
-# Create archive directory if it doesn't exist
-mkdir -p "$ARCHIVE_DIR"
-
-# Generate timestamp for the current date
+LOGS_SUBDIR="logs"
 TIMESTAMP=$(date '+%Y%m%d')
+RETENTION_DAYS=7
 
-# Move the current log file to the archive directory with a timestamp
-mv "$LOG_FILE" "$ARCHIVE_DIR/$LOG_FILE.$TIMESTAMP"
+mkdir -p "$ARCHIVE_DIR" "$LOGS_SUBDIR"
 
-# Create a new empty log file
-touch "$LOG_FILE"
-chmod 777 "$LOG_FILE"
+rotate_one() {
+    local path="$1"
+    [[ -f "$path" && -s "$path" ]] || return 0
+    local base="$(basename "$path")"
+    mv "$path" "$ARCHIVE_DIR/${base}.${TIMESTAMP}"
+    touch "$path"
+    chmod 644 "$path"
+}
+
+rotate_one "output.log"
+
+for f in "$LOGS_SUBDIR"/*.log; do
+    rotate_one "$f"
+done
+
+find "$ARCHIVE_DIR" -type f -name '*.log.*' -mtime +${RETENTION_DAYS} -delete

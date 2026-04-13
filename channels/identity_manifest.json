@@ -1,0 +1,313 @@
+{
+  "channels": {
+    "almajd-news": {
+      "provider_name": "Al MAJD news",
+      "match_names": [
+        "Al MAJD news"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Arabic news bulletin — studio set, male presenter in thobe, news chyrons, mosque/Islamic motifs in backgrounds, Al Majd logo top-left",
+      "expected_logo_description": "Al Majd News — Arabic script logo top-left, green channel-number badge",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-news.png",
+      "notes": ""
+    },
+    "hadith-almajd": {
+      "provider_name": "Al MAJD Hadith",
+      "match_names": [
+        "Al MAJD Hadith"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Hadith lectures / Islamic study programs — scholars, sometimes mosque settings, Arabic text overlays",
+      "expected_logo_description": "Al Majd Hadith — Arabic watermark top-right area",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_hadith-almajd.png",
+      "notes": "Baseline captured from a washed-out frame; re-sample when confident channel is showing typical content."
+    },
+    "almajd-quran": {
+      "provider_name": "Al MAJD Quran",
+      "match_names": [
+        "Al MAJD Quran"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Quran recitation with on-screen Arabic verses over mosque/Islamic-art backgrounds, ornamental cards, Al Majd watermark",
+      "expected_logo_description": "Al Majd Quran — Arabic script logo top-left",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-quran.png",
+      "notes": ""
+    },
+    "almajd-kids": {
+      "provider_name": "Al MAJD Kids",
+      "match_names": [
+        "Al MAJD Kids"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Children's programming — child presenters, colorful sets, animated segments, quiz/educational formats",
+      "expected_logo_description": "Al Majd Kids — green/colorful logo top-right corner",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-kids.png",
+      "notes": ""
+    },
+    "almajd-3aamah": {
+      "provider_name": "Al Majd General",
+      "match_names": [
+        "Al Majd General"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "General Al Majd programming — news, magazine shows, male presenters in thobe, studio sets, Arabic chyrons",
+      "expected_logo_description": "Al Majd General — Arabic logo top-left",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-3aamah.png",
+      "notes": ""
+    },
+    "natural": {
+      "provider_name": "Al Majd Tabeeya",
+      "match_names": [
+        "Al Majd Tabeeya"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Nature documentary content — landscapes, plants, wildlife, water scenes, calm footage",
+      "expected_logo_description": "Al Majd Tabeeya — small Arabic logo top-right",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_natural.png",
+      "notes": ""
+    },
+    "daal": {
+      "provider_name": "Al MAJD DAL",
+      "match_names": [
+        "Al MAJD DAL"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Children's content channel programming — colorful animated cards, kid-genre tiles, youth-oriented",
+      "expected_logo_description": "Al Majd DAL — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_daal.png",
+      "notes": ""
+    },
+    "maassah": {
+      "provider_name": "Al MAJD Masa",
+      "match_names": [
+        "Al MAJD Masa"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Magazine/lifestyle show format — studio interiors, presenters, interior-design or culture segments",
+      "expected_logo_description": "Al Majd Masa — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_maassah.png",
+      "notes": ""
+    },
+    "basmah": {
+      "provider_name": "Al MAJD Basma",
+      "match_names": [
+        "Al MAJD Basma"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Children's animated programming — cartoon characters, Arabic-dubbed animation, kid-friendly sets",
+      "expected_logo_description": "Al Majd Basma — colorful logo top-right with genre icons",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_basmah.png",
+      "notes": ""
+    },
+    "ajaweed": {
+      "provider_name": "Al MAJD Ajaweed",
+      "match_names": [
+        "Al MAJD Ajaweed"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Traditional Arab/Islamic cultural programs — majlis settings, male presenters in thobe, heritage themes",
+      "expected_logo_description": "Al Majd Ajaweed — Arabic logo top-right",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_ajaweed.png",
+      "notes": ""
+    },
+    "makkah": {
+      "provider_name": "MAKKAH TV",
+      "match_names": [
+        "MAKKAH TV"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Live feed of Masjid al-Haram (Grand Mosque, Makkah) — wide crowd shots, Kaaba or Haram courtyard, often at night with lighting",
+      "expected_logo_description": "MAKKAH TV — small channel bug, Arabic text bottom banner",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_makkah.png",
+      "notes": ""
+    },
+    "rawdah": {
+      "provider_name": "Al MAJD Rawda",
+      "match_names": [
+        "Al MAJD Rawda"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Child-oriented Quran recitation and Islamic education — colorful Surah cards with verses displayed over decorative backgrounds",
+      "expected_logo_description": "Al Majd Rawda — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_rawdah.png",
+      "notes": ""
+    },
+    "sunnah": {
+      "provider_name": "SUNNAH 4k",
+      "match_names": [
+        "SUNNAH 4k"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 3
+      },
+      "expected_content_genre": "Live feed of Masjid al-Haram — similar to MAKKAH TV but a separate broadcast, often crisper/4K, Haram crowds and Kaaba",
+      "expected_logo_description": "SUNNAH 4K — Arabic watermark",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_sunnah.png",
+      "notes": ""
+    },
+    "uthaymeen": {
+      "provider_name": "Bin Othaimeen",
+      "match_names": [
+        "Bin Othaimeen"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Lectures by/about Sheikh Ibn Uthaymeen — scholarly lectures, Arabic text cards with lecture titles, mosque or studio settings",
+      "expected_logo_description": "Bin Othaimeen — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_uthaymeen.png",
+      "notes": ""
+    },
+    "arrahmah": {
+      "provider_name": "Al Rahma",
+      "match_names": [
+        "Al Rahma"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Islamic call-in / lecture programs — presenters in natural/green-decorated sets, phone numbers on-screen, pink/floral motifs",
+      "expected_logo_description": "Al Rahma — Arabic logo, call-in banners visible",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_arrahmah.png",
+      "notes": ""
+    },
+    "almajd-islamic-science": {
+      "provider_name": "Al Majd EDU",
+      "match_names": [
+        "Al Majd EDU"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Islamic education / quiz show format — green/teal studio sets, 'Sibaq al-Uqul' style programs",
+      "expected_logo_description": "Al Majd EDU — Arabic logo top-left",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-islamic-science.png",
+      "notes": ""
+    },
+    "mekkah-quran": {
+      "provider_name": "SAUDI QURAN",
+      "match_names": [
+        "SAUDI QURAN"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 3
+      },
+      "expected_content_genre": "Live feed of Masjid al-Haram, typically DAYTIME courtyard view with tawaf visible — distinct from MAKKAH TV by lighting/angle",
+      "expected_logo_description": "SAUDI QURAN — small channel bug",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_mekkah-quran.png",
+      "notes": ""
+    },
+    "nada": {
+      "provider_name": "Al Nada TV",
+      "match_names": [
+        "Al Nada TV"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Studio lecture/talk show format — male presenter in suit, bookshelf or plain backdrop, single-camera speaking",
+      "expected_logo_description": "Al Nada TV — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_nada.png",
+      "notes": ""
+    },
+    "anees": {
+      "provider_name": "Al Anis TV",
+      "match_names": [
+        "Al Anis TV"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Al Anis TV programming — Islamic talk/lecture content. NOTE: frequently observed showing upstream maintenance slate 'البث سيعود بعد قليل إن شاء الله / Stream will return shortly' — this is NOT the Albunyaan slate, it's the upstream's own outage screen",
+      "expected_logo_description": "Al Anis TV — Arabic logo when live; upstream slate when down shows centered loader + bilingual 'Stream will return shortly' text on dark blue background",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_anees.png",
+      "notes": "Upstream silent-swap to its own maintenance slate observed 2026-04-13. When thumbnail shows dark-blue 'Stream will return shortly' card, content is NOT live — treat as upstream outage even though segment_age reports healthy."
+    },
+    "zaad": {
+      "provider_name": "ZAD TV",
+      "match_names": [
+        "ZAD TV"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 3
+      },
+      "expected_content_genre": "ZAD TV programming — Islamic lectures and educational content, outdoor/garden or studio settings, Arabic text overlays at bottom",
+      "expected_logo_description": "ZAD TV — small logo, often muted/dimmed shots",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_zaad.png",
+      "notes": ""
+    },
+    "almajd-documentary": {
+      "provider_name": "Al MAJD Documentary",
+      "match_names": [
+        "Al MAJD Documentary"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 2
+      },
+      "expected_content_genre": "Documentary programming — Arabic-language historical/biographical documentaries, narrated content, program cards",
+      "expected_logo_description": "Al Majd Documentary — Arabic logo top-left",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_almajd-documentary.png",
+      "notes": ""
+    },
+    "saad": {
+      "provider_name": "Sheikh Saad (non-vlc)",
+      "match_names": [
+        "Sheikh Saad",
+        "Saad"
+      ],
+      "source_hints": {
+        "vlc_as_backup": false,
+        "non_vlc_backups_count": 1
+      },
+      "expected_content_genre": "Sheikh Saad channel programming — Quran recitation and Islamic content, ornate mosque-interior CGI/imagery, Quran-on-stand visuals common",
+      "expected_logo_description": "Sheikh Saad — Arabic logo",
+      "baseline_thumb_path": "/home/msa/Development/scripts/albunyaan/channels/baselines/thumb_saad.png",
+      "notes": "Non-vlc source (ddns + YouTube backup)"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Albunyaan reflex watcher (HLS freshness + system resources)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/reflex_watcher.sh
+Restart=always
+RestartSec=5
+Nice=10
+CPUQuota=10%
+MemoryMax=128M
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
