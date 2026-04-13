@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger weekly /cso security audit (Sundays 03:00 Europe/Amsterdam)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=10min
+Unit=albunyaan-security-cso.service
+
+[Install]
+WantedBy=timers.target

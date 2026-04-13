@@ -1,0 +1,18 @@
+[Unit]
+Description=Albunyaan security cadence — /cso weekly audit
+Documentation=file:///home/msa/Development/scripts/albunyaan/V4_PHASE3_PHASE5_DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+Environment=HOME=/home/msa
+Environment=PATH=/home/msa/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/security_cadence/run_audit.sh cso
+StandardOutput=append:/home/msa/Development/scripts/albunyaan/channels/security/cron.log
+StandardError=append:/home/msa/Development/scripts/albunyaan/channels/security/cron.log
+TimeoutStartSec=45min
+Nice=10
