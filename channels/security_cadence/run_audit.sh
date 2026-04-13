@@ -73,7 +73,6 @@ echo "[$TS] starting /${SKILL} audit"
 
 "$CLAUDE_BIN" -p \
     --output-format text \
-    --max-budget-usd 5 \
     --allowed-tools "Read,Glob,Grep,Bash" \
     --fallback-model claude-haiku-4-5-20251001 \
     "$PROMPT" >"$RAW_LOG" 2>&1
