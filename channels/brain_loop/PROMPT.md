@@ -217,9 +217,10 @@ JSON object):
   "logo_detected": true|false|"unknown" }
 ```
 
-Dispatch channel sub-agents in PARALLEL — one tool message with N
-Task calls, not sequential. They are independent. If 22 in one
-batch is rejected by limits, split into batches of 8-10.
+Dispatch the SELECTED channel sub-agents in PARALLEL — one tool
+message with N Task calls, not sequential. They are independent.
+N is already capped at 8 by the selective-dispatch rule above, so
+no further batching is needed.
 
 For each sub-agent that returns `mismatch` with confidence >= 0.7
 AND `logo_detected=true` (i.e. a CLEARLY WRONG logo is on screen),

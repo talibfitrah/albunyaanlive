@@ -128,26 +128,37 @@ write_offset() {
 #   so we fetch only the latest update_id and seed from there — don't replay
 #   24h of queued messages on a cold start (A-2).
 # - Zero/empty value: same recovery path. Non-zero values are trusted.
+# - Seed retries until success: if the first getUpdates call fails (no network
+#   at cold start), we loop with a 10s backoff rather than fall back to
+#   OFFSET=0, because OFFSET=0 in the main poll means "replay everything".
 OFFSET=0
 if [[ -r "$OFFSET_FILE" ]]; then
     OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
     OFFSET=${OFFSET:-0}
 fi
-if [[ "$OFFSET" -eq 0 ]]; then
-    seed_resp=$(curl -s --max-time 15 "${API}/getUpdates?offset=-1&limit=1" 2>/dev/null || echo '{"ok":false}')
-    SEED=$(printf '%s' "$seed_resp" | python3 -c '
+
+seed_offset() {
+    local resp seed
+    resp=$(curl -s --max-time 15 "${API}/getUpdates?offset=-1&limit=1" 2>/dev/null) || return 1
+    # Must be a valid JSON "ok":true response. Anything else (network glitch,
+    # partial body, HTML error page from an upstream proxy) → fail loudly.
+    seed=$(printf '%s' "$resp" | python3 -c '
 import json, sys
-try:
-    d = json.load(sys.stdin)
-    r = d.get("result") or []
-    if r:
-        print(r[-1].get("update_id", 0) + 1)
-    else:
-        print(0)
-except Exception:
-    print(0)
-' 2>/dev/null || echo 0)
-    OFFSET=${SEED:-0}
+d = json.load(sys.stdin)
+if not d.get("ok"):
+    sys.exit(2)
+r = d.get("result") or []
+print(r[-1].get("update_id", 0) + 1 if r else 0)
+' 2>/dev/null) || return 1
+    OFFSET="${seed:-0}"
+    return 0
+}
+
+if [[ "$OFFSET" -eq 0 ]]; then
+    until seed_offset; do
+        log "startup seed failed (no network or API error); retrying in 10s"
+        sleep 10
+    done
     write_offset "$OFFSET"
     log "startup seeded offset=$OFFSET (no prior state)"
 fi
