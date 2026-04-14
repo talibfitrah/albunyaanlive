@@ -239,32 +239,58 @@ fi
 # A wide-incident wake (e.g. all 22 channels stalled) shouldn't spam 22+
 # pings. Anything beyond the cap is summarised in a footer pointing at the
 # server log.
+#
+# Message shape from PROMPT.md:
+#   {"severity": "severe|warn|info", "en": "...", "ar": "..."}
+# Backwards-compatible: plain strings are treated as severity=info EN-only.
+#
+# Routing:
+#   - EN always → user (bot #2 / OPERATOR_BOT_TOKEN + OPERATOR_OWNER_ID)
+#   - AR on severity=severe → colleague (bot #1 / TELEGRAM_BOT_TOKEN + COLLEAGUE_OWNER_ID)
 TELEGRAM_MAX_MSGS_PER_WAKE="$TELEGRAM_MAX_MSGS_PER_WAKE" RAW_LOG_PATH="$RAW_LOG" \
     python3 -c '
 import json, sys, os, subprocess
 d = json.loads(sys.stdin.read())
-msgs = [m for m in (d.get("telegram_messages") or []) if isinstance(m, str) and m.strip()]
+raw = d.get("telegram_messages") or []
 cap = int(os.environ.get("TELEGRAM_MAX_MSGS_PER_WAKE", "10"))
-# Routine brain summaries go to the user (bot #2) only. Severe conditions
-# use tg_alert directly from bash (see failure paths above). TODO: update
-# PROMPT.md so the brain emits bilingual + severity-tagged messages, so we
-# can fan out incident-level items to the colleague too.
-token = os.environ.get("OPERATOR_BOT_TOKEN", "")
-chat = os.environ.get("OPERATOR_OWNER_ID", "")
-if not token or not chat:
-    raise SystemExit(0)
-to_send = msgs[:cap]
-if len(msgs) > cap:
-    overflow = len(msgs) - cap
-    raw = os.environ.get("RAW_LOG_PATH", "(see server log)")
-    to_send.append(f"... and {overflow} more messages. Full details in server log: {raw}")
-for m in to_send:
+
+# Normalize to list of (severity, en, ar) tuples.
+msgs = []
+for item in raw:
+    if isinstance(item, str) and item.strip():
+        msgs.append(("info", item, ""))
+    elif isinstance(item, dict):
+        en = (item.get("en") or "").strip()
+        if not en: continue
+        sev = (item.get("severity") or "info").lower()
+        if sev not in ("severe", "warn", "info"): sev = "info"
+        ar = (item.get("ar") or "").strip()
+        msgs.append((sev, en, ar))
+
+op_token = os.environ.get("OPERATOR_BOT_TOKEN", "")
+op_chat  = os.environ.get("OPERATOR_OWNER_ID", "")
+co_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+co_chat  = os.environ.get("COLLEAGUE_OWNER_ID", "")
+
+def send(token, chat, text):
+    if not token or not chat or not text: return
     subprocess.run([
         "curl", "-s", "--max-time", "15",
         f"https://api.telegram.org/bot{token}/sendMessage",
         "--data-urlencode", f"chat_id={chat}",
-        "--data-urlencode", f"text={m}",
+        "--data-urlencode", f"text={text}",
     ], stdout=subprocess.DEVNULL, check=False)
+
+to_send = msgs[:cap]
+if len(msgs) > cap:
+    overflow = len(msgs) - cap
+    rl = os.environ.get("RAW_LOG_PATH", "(see server log)")
+    to_send.append(("info", f"... and {overflow} more messages. Full details in server log: {rl}", ""))
+
+for sev, en, ar in to_send:
+    send(op_token, op_chat, en)
+    if sev == "severe" and ar:
+        send(co_token, co_chat, ar)
 ' <<<"$JSON_DOC"
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)

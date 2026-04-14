@@ -51,10 +51,9 @@ the wrapper makes the changes.
 Read `/tmp/albunyaan-watcher-state.json` (provided inline). Check
 `state.unix` is within 30 seconds of "now." If it's stale, the
 watcher is hung. Set `actions.restart_watcher = true` in your
-output, emit one `telegram_messages` entry in plain language
-("نظام المراقبة متوقف — جاري إعادة التشغيل"), and SKIP the rest
-of the checklist this wake. The wrapper will restart it and your
-next wake will resume normal checks.
+output, emit one `telegram_messages` entry with severity=severe
+(EN + AR), and SKIP the rest of the checklist this wake. The
+wrapper will restart it and your next wake will resume normal checks.
 
 ### 2. Per-channel segment freshness (read from watcher state)
 
@@ -257,16 +256,38 @@ NO telegram for: routine "everything is fine" wakes, info-level
 findings, recurring incidents you've already alerted about (unless
 they've escalated).
 
-**Tone for ALL telegram messages: plain Arabic or English at the
-level of a non-technical home user (~17 years old).** No jargon,
-no file paths, no PIDs, no technical terms. The user reads these
-on their phone.
+**Bilingual output — audience-based routing.** Every telegram
+message is a structured object:
+
+```
+{"severity": "severe|warn|info",
+ "en": "plain English for the user (bot #2)",
+ "ar": "plain Arabic for the colleague (bot #1)"}
+```
+
+- `severity=severe` → wrapper sends EN to user AND AR to colleague.
+  Use for viewer-facing incidents, watcher hang, critical resources,
+  visual identity mismatches.
+- `severity=warn` → user only (EN). Wrapper ignores AR here.
+  Use for ongoing warnings, escalations that are not yet critical.
+- `severity=info` → user only (EN). Wrapper ignores AR here.
+  Use for recoveries, routine daily report, closed incidents.
+
+Even though the AR field is only delivered on severe, you MUST fill
+it for severe entries. For warn/info, set `ar` to an empty string.
+
+**Tone: plain language at the level of a non-technical home user
+(~17 years old).** No jargon, no file paths, no PIDs, no technical
+terms — in either language. The user/colleague reads these on their
+phone.
 
 - BAD: `Channel zaad: segment_age_s=45 (threshold=24)`
-- GOOD: `قناة زاد توقفت — الصورة لم تتحرك منذ 45 ثانية. أتحقق الآن.`
+- GOOD EN: `Channel zaad stalled — no new frames for 45 seconds. Investigating.`
+- GOOD AR: `قناة زاد توقفت — الصورة لم تتحرك منذ 45 ثانية. أتحقق الآن.`
 
 - BAD: `Visual identity mismatch for channel makkah, confidence 0.84`
-- GOOD: `قناة مكة تعرض محتوى مختلفاً عن المتوقع. قد يكون هناك خطأ في
+- GOOD EN: `Channel makkah is showing unexpected content. The upstream source may have a problem.`
+- GOOD AR: `قناة مكة تعرض محتوى مختلفاً عن المتوقع. قد يكون هناك خطأ في
   مصدر البث.`
 
 ### 10. Persist state
@@ -299,8 +320,9 @@ matching this shape (no trailing prose, no code fences):
   // for the user to act on — the wrapper does NOT touch live streams.
   // List channels you'd recommend restarting; the user/operator decides.
   "telegram_messages": [
-    "first message in plain language",
-    "second message"
+    {"severity": "severe", "en": "User-facing English", "ar": "نص عربي للزميل"},
+    {"severity": "warn",   "en": "User-facing English", "ar": ""},
+    {"severity": "info",   "en": "User-facing English", "ar": ""}
   ],
   "code_review_findings": [
     {
