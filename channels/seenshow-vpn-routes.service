@@ -1,0 +1,17 @@
+[Unit]
+Description=Seenshow VPN route persistence for tun1 (geo-bypass)
+# Start after OpenVPN creates tun1. We use sys-devices to detect tun1 presence.
+After=network-online.target openvpn.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Wait for tun1 to exist (up to 60s), then add routes
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show tun1 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "tun1 not found after 60s"; exit 1'
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/seenshow-vpn-routes.sh tun1
+# Re-apply routes if tun1 is restarted
+ExecReload=/home/msa/Development/scripts/albunyaan/channels/seenshow-vpn-routes.sh tun1
+
+[Install]
+WantedBy=multi-user.target

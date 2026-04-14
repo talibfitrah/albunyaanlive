@@ -23,6 +23,11 @@ puppeteer-profile/
 *.pid.lock
 *.seed
 
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
 # Lock files
 /tmp/stream_*.lock
 
