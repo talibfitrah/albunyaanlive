@@ -1,7 +1,163 @@
 # Albunyaan v4 24/7 Operator — Build State
 
 Source of truth for ongoing work to implement the v4 operator system prompt.
-Pick this up in a new session by reading this file first.
+**Pick this up in a new session by reading this file first (entirely).**
+
+---
+
+## RESUME CHECKLIST (run these first, in order)
+
+```bash
+# 1. What shipped since last context you had
+git log --oneline -20
+
+# 2. Are the long-running services alive?
+systemctl status albunyaan-watcher albunyaan-brain.timer \
+  albunyaan-security-cso.timer albunyaan-security-health.timer --no-pager
+
+# 3. What does the brain believe about the world?
+cat channels/brain/state.json | python3 -m json.tool
+
+# 4. What wakes have completed?
+cat channels/brain/wake.log
+
+# 5. Is the watcher reporting fresh state?
+python3 -c 'import json,time; d=json.load(open("/tmp/albunyaan-watcher-state.json")); print("state age:", int(time.time())-d["unix"], "s; unhealthy:", [c for c in d["channels"] if c["status"]!="healthy"])'
+
+# 6. Any recent stalls, alerts, or anomalies?
+tail -60 channels/logs/reflex_watcher.log
+```
+
+After this, read the "CURRENT STATE" section below, then decide from
+"OPEN WORK" what to do next.
+
+---
+
+## CURRENT STATE (as of 2026-04-14 02:07 CEST)
+
+### Running and armed
+
+- **`albunyaan-watcher.service`** — Phase 1a reflex watcher, 3s loop,
+  emits `/tmp/albunyaan-watcher-state.json`. Now also posts
+  **direct Telegram alerts** on status transitions (plain Arabic),
+  with debounce (2 obs), per-kind cooldown (10min), and 15s startup
+  grace so cold-starts don't announce pre-existing stalls.
+- **`albunyaan-brain.timer`** — Phase 3 brain loop, 30min cadence.
+  Wake 1 completed successfully 2026-04-14 01:45:55 (8min 20s).
+  Hardened after wake 1 findings (MemoryMax=4G, CPUQuota=80%,
+  ProtectSystem=strict, ReadWritePaths whitelist, ProtectKernel*).
+  Next wake: ~02:07:47 CEST (will validate hardening + refined
+  sub-agent contract).
+- **`albunyaan-security-cso.timer`** — weekly /cso audit. First
+  fire: Sunday 2026-04-19 03:08 CEST.
+- **`albunyaan-security-health.timer`** — monthly /health audit.
+  First fire: 2026-05-01 03:11 CEST.
+
+### Open incident tracked by brain
+
+- `anees-slate-20260414T0138` — upstream maintenance slate confirmed
+  via visual identity (confidence 1.0). Segments flow (watcher
+  can't see it), only visual probe catches it. Known condition per
+  `channels/identity_manifest.json`. Brain will escalate if
+  persists past 3 consecutive wakes (~1.5h).
+
+### All commits landed this session (newest last)
+
+```
+8879671 Promote ayyadonline as zaad primary source
+3792039 Reap orphan ffmpeg in graceful_restart cleanup paths
+956ebe0 Add Phase 5 security cadence prototype (/cso weekly) + Phase 3/5 design
+325d90c Strip --max-budget-usd from headless audit wrapper
+2e36c94 Add Phase 3 brain loop prototype (30min comprehensive wake)
+d2018c0 Brain wrapper: fix three blocking issues found in self-review
+c0acc5a Brain wrapper: fix three remaining self-review issues
+4dc7ae8 Reflex watcher: direct Telegram alerts on status transitions
+1bfe924 Add /health monthly security cadence timer
+5ec012d Act on brain wake 1 findings: systemd hardening + sub-agent contract
+```
+
+### Memory rules added/updated this session
+
+- `feedback_telegram_tone.md` — **Arabic is now the DEFAULT for all
+  Telegram output** (not just mirror-user-language). English is
+  fallback only.
+- `project_channel_swap_workflow.md` — Telegram colleague requesting
+  a channel replacement = retire old + create new (new folder under
+  `/var/www/html/stream/hls/`). Reply with
+  `https://stream.edratech.nl/<folder_name>/master.m3u8` once
+  healthy. Folder name drives the URL exactly.
+- `feedback_telegram_url_disambiguation.md` — ALWAYS ask in Arabic
+  whether an incoming URL belongs to the channel being discussed
+  or a different one, and confirm its intended role (primary /
+  backup / replacement). Prevents wrong-content-under-channel-name
+  bugs.
+
+---
+
+## OPEN WORK (priority order)
+
+### Blocked until later today (~20:11 CEST)
+
+- **Phase 1b — slate override action layer.** Watcher currently
+  observe-only; on stall detection it should force slate within one
+  segment cycle. Blocked on Phase 1a baseline data (~24h from the
+  watcher's 2026-04-13 20:11 start). Needs: sentinel-file protocol
+  (so watcher doesn't race `try_start_stream.sh` on master.m3u8
+  writes), slate transcode pipeline or reuse of FEEDER_SLATE,
+  recovery swap-back policy. Design notes in
+  `V4_PHASE3_PHASE5_DESIGN.md` are for Phase 3/5 only — Phase 1b
+  design still pending.
+- Estimate: 4-8 focused hours AFTER baseline matures.
+
+### Ready now (independent work)
+
+- **Two-way Telegram bridge.** Brain currently only pushes; user
+  can't interrupt/query mid-incident. Two options: piggyback the
+  existing `plugin:telegram:telegram` plugin (already runs, already
+  authenticated) vs build a tiny webhook listener. Piggyback is
+  probably right — less moving parts. ~2-4 hours.
+- **Phase 4b — threshold enforcement actions.** Currently brain
+  proposes `graceful_restart` and `extra_disk_cleanup`; wrapper
+  logs but doesn't execute. Move to auto-execute ONLY after safety
+  guards designed (don't restart a channel whose only sin is being
+  on a slow upstream). ~2-4 hours.
+
+### Small loose ends (under 30 min each)
+
+- `channels/TROUBLESHOOTING.md` entry the brain itself proposed:
+  "channel healthy by segment age but showing upstream slate —
+  visual probe required." See
+  `channels/brain/raw/wake_20260414T013735.log` `troubleshooting_updates`.
+- Investigate whether Seenshow slot-limit rejections when multiple
+  channels fail over simultaneously (observed 2026-04-14 ~01:29)
+  warrant pre-allocating runner slots or increasing the resolver's
+  cap. Not urgent — slate fallback handled it.
+- Watch: wake 2 should show reduced false-positive mismatches after
+  the sub-agent contract refinement. If not, iterate on PROMPT.md
+  step 6.
+
+---
+
+## Key architectural decisions recorded
+
+- **Headless claude via systemd timers, NOT cloud `/schedule`.** The
+  cloud remote-trigger model can't reach `/tmp/albunyaan-watcher-state.json`
+  or the local Telegram bridge. All operator loops run locally.
+- **Subscription auth works headless** (`claude -p` under User=msa,
+  verified end-to-end via systemd-run with stripped env). No DBus/
+  keyring needed; OAuth credentials live under $HOME.
+- **Fast alerts stay in the watcher (no LLM).** Brain does the smart
+  work (visual identity, code review, incident bookkeeping); the
+  watcher handles dumb transition alerts directly via curl. 10x
+  less subscription quota for the same operator behavior.
+- **Wrapper owns all writes. Brain is observe/recommend only for now.**
+  Only `restart_watcher` is auto-executed. `graceful_restart` and
+  `extra_disk_cleanup` are proposed, logged, NOT applied.
+- **Prompt injection defended with per-wake random delimiters + scoped
+  Bash allowlist.** A compromised brain still cannot mutate the
+  system.
+
+---
 
 ---
 
