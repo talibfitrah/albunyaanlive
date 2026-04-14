@@ -129,6 +129,23 @@ YTDLP_EXTRACTOR_ARGS="${YTDLP_EXTRACTOR_ARGS:-youtubepot-bgutilhttp:base_url=htt
 YTDLP_COOKIES="${YTDLP_COOKIES:-}"                        # Optional: path to cookies.txt for YouTube auth
 YTDLP_COOKIES_BROWSER="${YTDLP_COOKIES_BROWSER:-}"        # Optional: browser[:profile_path] for cookies
 YTDLP_PROXY="${YTDLP_PROXY:-}"                            # Optional: proxy for yt-dlp/streamlink
+FFMPEG_CPU_MASK="${FFMPEG_CPU_MASK:-0,1,8-15}"            # CPU mask for ffmpeg+streamlink (host assumes cores 2-7 belong to VM)
+# Validate FFMPEG_CPU_MASK at startup — a mask with cores beyond `nproc`
+# (e.g. 8-15 on an 8-core host) makes taskset fail and kills every channel
+# on spawn. Test the mask against a no-op; if it rejects, clear the mask
+# so spawns fall back to unpinned mode.
+if [[ -n "$FFMPEG_CPU_MASK" ]] && ! taskset -c "$FFMPEG_CPU_MASK" true 2>/dev/null; then
+    echo "WARN: FFMPEG_CPU_MASK='$FFMPEG_CPU_MASK' invalid on this host (nproc=$(nproc 2>/dev/null || echo '?')); clearing to unpin spawns" >&2
+    FFMPEG_CPU_MASK=""
+fi
+# Build a reusable prefix array. An empty mask degrades to unpinned spawns
+# without tripping `${var[@]}` on an unset. Applied to BOTH ffmpeg and
+# streamlink so the CPU isolation (keep VM cores 2-7 clear) is not
+# half-enforced — streamlink can spike one core 100% on TLS-heavy sources.
+TASKSET_PREFIX=()
+if [[ -n "$FFMPEG_CPU_MASK" ]]; then
+    TASKSET_PREFIX=(taskset -c "$FFMPEG_CPU_MASK")
+fi
 YTDLP_ALLOW_DIRECT_FALLBACK="${YTDLP_ALLOW_DIRECT_FALLBACK:-1}"  # Retry without proxy if proxy resolve fails
 TOR_ROTATE_FAILURES="${TOR_ROTATE_FAILURES:-3}"           # Rotate Tor after N consecutive YouTube failures
 TOR_ROTATE_COOLDOWN="${TOR_ROTATE_COOLDOWN:-300}"         # Min seconds between Tor rotations (5 min)
@@ -1579,13 +1596,17 @@ resolve_seenshow_url_for_index() {
         return 1
     }
 
-    local resolved_url
-    resolved_url=$(printf '%s' "$response" \
+    # identity_url: the canonical upstream URL; used as the stable metadata key
+    #   (url_is_seenshow, hls_path, expiry parsing) regardless of how we fetch.
+    # transport_url: what FFmpeg actually fetches. Equal to identity_url unless
+    #   we rewrite to go through the local /proxy endpoint (TLS fingerprint hack).
+    local identity_url
+    identity_url=$(printf '%s' "$response" \
         | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' \
         | head -1 \
         | sed 's#\\/#/#g')
 
-    if [[ ! "$resolved_url" =~ ^https?:// ]]; then
+    if [[ ! "$identity_url" =~ ^https?:// ]]; then
         local err
         err=$(printf '%s' "$response" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' | head -1)
         [[ -z "$err" ]] && err="invalid_response"
@@ -1593,8 +1614,19 @@ resolve_seenshow_url_for_index() {
         return 1
     fi
 
-    url_array[$index]="$resolved_url"
-    init_url_seenshow_metadata "$index" "$resolved_url"
+    # Route seenshow through local proxy to preserve TLS fingerprint compatibility.
+    # The hdntl tokens are bound to curl's TLS fingerprint (used during promotion).
+    # The resolver's /proxy endpoint uses curl, so FFmpeg fetches via HTTP localhost.
+    local transport_url="$identity_url"
+    if [[ "$identity_url" =~ ^https://live\.seenshow\.com/(.*) ]]; then
+        local proxy_base="${SEENSHOW_RESOLVER_URL%/}"
+        local proxy_url="${proxy_base}/proxy/${BASH_REMATCH[1]}"
+        log "SEENSHOW: Routing through local proxy: ${proxy_url:0:120}"
+        transport_url="$proxy_url"
+    fi
+
+    url_array[$index]="$transport_url"
+    init_url_seenshow_metadata "$index" "$identity_url"
 
     local expiry="${url_seenshow_expiry[$index]:-0}"
     if [[ "$expiry" =~ ^[0-9]+$ && "$expiry" -gt 0 ]]; then
@@ -3857,7 +3889,7 @@ start_feeder_for_current_url() {
             return
         fi
         set_streamlink_args "$url"
-        "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+        "${TASKSET_PREFIX[@]}" "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
         feeder_pid=$!
         feeder_is_slate=0
         log "FEEDER: Started streamlink feeder PID $feeder_pid for ${url:0:80}"
@@ -4017,15 +4049,24 @@ build_ffmpeg_cmd() {
 
     case "$effective_scale" in
         4|3)
-            # GPU: CUDA decode + scale to 1080p + NVENC encode
-            # Standard re-encode mode for sources needing normalization
+            # GPU: CPU decode + CPU scale (format-resilient) + NVENC encode
+            # CPU-side scale absorbs source format changes (logo overlays, ad insertion)
+            # that previously crashed scale_npp/hwupload_cuda filter chain.
             # (scale 3 aliased here — always scale to ensure consistent 1080p)
-            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
-            ffmpeg_cmd+=( -vf "scale_npp=1920:1080" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
-            ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+            if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
+                log "SCALE4: Forced COPY mode due to repeated GPU filter crashes (filter_crash_count=$filter_crash_count). No re-encoding."
+                ffmpeg_cmd+=( -c copy )
+            elif nvidia-smi >$DEVNULL 2>&1; then
+                ffmpeg_cmd+=( -vf "scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda" )
+                ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
+                ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 2 )
+                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+            else
+                log "SCALE4: GPU unavailable, falling back to stream copy (no re-encoding)"
+                ffmpeg_cmd+=( -c copy )
+            fi
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
@@ -4050,7 +4091,7 @@ build_ffmpeg_cmd() {
                 # This avoids scale_npp crashes when source format changes mid-stream.
                 ffmpeg_cmd+=( -vf "scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda" )
                 ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
-                ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 4 )
+                ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 2 )
                 ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
                 ffmpeg_cmd+=( -f hls -hls_time 6 )
                 ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
@@ -4062,15 +4103,24 @@ build_ffmpeg_cmd() {
             fi
             ;;
         12|13)
-            # GPU stretch: CUDA decode + stretch-fill to 1920x1080 + NVENC encode
-            # For sources with non-16:9 aspect ratios (black bar removal)
+            # GPU stretch: CPU decode + CPU scale (format-resilient) + NVENC encode
+            # For sources with non-16:9 aspect ratios (stretch-fill to 1080p)
+            # CPU-side scale absorbs source format changes mid-stream.
             # (scale 13 aliased here)
-            ffmpeg_cmd+=( -hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid -i "$actual_input_url" )
+            ffmpeg_cmd+=( -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
-            ffmpeg_cmd+=( -vf "scale_npp=w=1920:h=1080:interp_algo=lanczos" )
-            ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 2 )
-            ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k -threads 4 )
-            ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+            if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
+                log "SCALE12: Forced COPY mode due to repeated GPU filter crashes (filter_crash_count=$filter_crash_count). No re-encoding."
+                ffmpeg_cmd+=( -c copy )
+            elif nvidia-smi >$DEVNULL 2>&1; then
+                ffmpeg_cmd+=( -vf "scale=1920:1080:flags=lanczos,format=nv12,hwupload_cuda" )
+                ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 2 )
+                ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k -threads 2 )
+                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+            else
+                log "SCALE12: GPU unavailable, falling back to stream copy (no re-encoding)"
+                ffmpeg_cmd+=( -c copy )
+            fi
             ffmpeg_cmd+=( -f hls -hls_time 6 )
             ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             ;;
@@ -4271,6 +4321,33 @@ wait_for_pid_exit() {
 # due to source URL security limiting to 1 connection per URL
 # =============================================================================
 
+# is_live_ffmpeg_for_channel — Returns 0 if pid is a live foreign FFmpeg writing
+# to /$channel_id/, 1 if it's stale / recycled / unrelated. Logs a DUPLICATE_STALE
+# reason for each non-match so callers know why the PID was skipped. Keeping this
+# as its own function makes check_existing_ffmpeg a simple loop + early-return.
+is_live_ffmpeg_for_channel() {
+    local pid="$1"
+    if ! kill -0 "$pid" 2>$DEVNULL; then
+        log "DUPLICATE_STALE: PID $pid is no longer running. Ignoring stale process entry."
+        return 1
+    fi
+    local proc_cmd
+    proc_cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>$DEVNULL) || {
+        log "DUPLICATE_STALE: Cannot read /proc/$pid/cmdline. Process likely exited. Ignoring."
+        return 1
+    }
+    if [[ "$proc_cmd" != *"ffmpeg"* ]]; then
+        log "DUPLICATE_STALE: PID $pid is not an FFmpeg process. Ignoring recycled PID."
+        return 1
+    fi
+    # Slash-bounded match: channel "foo" must not collide with /footv/ or /foobar/.
+    if [[ "$proc_cmd" != *"/${channel_id}/"* ]]; then
+        log "DUPLICATE_STALE: PID $pid FFmpeg is not writing to /${channel_id}/. Ignoring."
+        return 1
+    fi
+    return 0
+}
+
 check_existing_ffmpeg() {
     local escaped_channel_id
     escaped_channel_id=$(printf '%s' "$channel_id" | sed 's/[][\\.^$*+?{}|()]/\\&/g')
@@ -4279,15 +4356,17 @@ check_existing_ffmpeg() {
     local existing_pids
     existing_pids=$(pgrep -f "ffmpeg.*/${escaped_channel_id}/master" 2>$DEVNULL || true)
 
-    if [[ -n "$existing_pids" ]]; then
-        # Filter out our own FFmpeg (current, recently exited, and slate placeholder)
-        for pid in $existing_pids; do
-            if [[ "$pid" != "$ffmpeg_pid" && "$pid" != "$last_ffmpeg_pid" && "$pid" != "$$" && "$pid" != "$slate_ffmpeg_pid" ]]; then
-                log_error "DUPLICATE_DETECTED: Another FFmpeg (PID $pid) is already running for $channel_id"
-                return 1
-            fi
-        done
-    fi
+    [[ -z "$existing_pids" ]] && return 0
+
+    # Filter out our own FFmpeg (current, recently exited, and slate placeholder)
+    for pid in $existing_pids; do
+        [[ "$pid" == "$ffmpeg_pid" || "$pid" == "$last_ffmpeg_pid" \
+           || "$pid" == "$$" || "$pid" == "$slate_ffmpeg_pid" ]] && continue
+        if is_live_ffmpeg_for_channel "$pid"; then
+            log_error "DUPLICATE_DETECTED: Another FFmpeg (PID $pid) is already running for $channel_id"
+            return 1
+        fi
+    done
     return 0
 }
 
@@ -4473,7 +4552,8 @@ while true; do
         fi
 
         # Start encoder (reads from FIFO, runs for hours/days)
-        "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+        # Pin ffmpeg to CPUs 0,1,8-15 to avoid contention with VM on cores 2-7
+        "${TASKSET_PREFIX[@]}" "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
         ffmpeg_pid=$!
 
         # Start initial feeder (writes to FIFO)
@@ -4539,9 +4619,9 @@ while true; do
             set_streamlink_args "$proxy_source_url"
 
             # Use FIFO for reliable PID capture
-            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            "${TASKSET_PREFIX[@]}" "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
             proxy_pid=$!
-            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            "${TASKSET_PREFIX[@]}" "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
             ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         elif [[ "$current_url" == *.m3u8* ]]; then
@@ -4555,9 +4635,9 @@ while true; do
             # Build streamlink command with optional proxy
             set_streamlink_args "$current_url"
 
-            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            "${TASKSET_PREFIX[@]}" "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
             proxy_pid=$!
-            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            "${TASKSET_PREFIX[@]}" "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
             ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         else
@@ -4571,9 +4651,9 @@ while true; do
             # Build streamlink command with optional proxy
             set_streamlink_args "$current_url"
 
-            "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
+            "${TASKSET_PREFIX[@]}" "${streamlink_args[@]}" > "$stream_fifo" 2>>"$logfile" &
             proxy_pid=$!
-            "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
+            "${TASKSET_PREFIX[@]}" "${ffmpeg_cmd[@]}" < "$stream_fifo" >> "$logfile" 2>"$ffmpeg_error_file" &
             ffmpeg_pid=$!
             log "FFmpeg PID: $ffmpeg_pid, streamlink PID: ${proxy_pid:-unknown}"
         fi
@@ -4581,7 +4661,7 @@ while true; do
         [[ -n "$stream_fifo" ]] && rm -f "$stream_fifo" 2>$DEVNULL
     else
         stream_fifo=""  # No FIFO used for direct FFmpeg
-        "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
+        "${TASKSET_PREFIX[@]}" "${ffmpeg_cmd[@]}" >> "$logfile" 2>"$ffmpeg_error_file" &
         ffmpeg_pid=$!
         log "FFmpeg PID: $ffmpeg_pid"
     fi

@@ -3760,20 +3760,60 @@ echo "  PASS: Staleness verification has 4 branches + slash-bounded path match"
 # test will fail and force a deliberate decision.
 # ---------------------------------------------------------------------------
 echo "--- taskset CPU pinning invariant ---"
-# The CPU mask is centralized in $FFMPEG_CPU_MASK (see top of try_start_stream.sh).
-# Every ffmpeg spawn site must wrap the call in `taskset -c "$FFMPEG_CPU_MASK"`.
+# The CPU mask is centralized in $FFMPEG_CPU_MASK and wrapped in
+# TASKSET_PREFIX (either `(taskset -c "$FFMPEG_CPU_MASK")` or empty array
+# when the mask fails startup validation). Every ffmpeg AND streamlink
+# spawn site must go through "${TASKSET_PREFIX[@]}" so the CPU-isolation
+# boundary holds even when the mask is invalid on a different host.
 if ! has_pattern '^FFMPEG_CPU_MASK=' "$TSS"; then
     fail "FFMPEG_CPU_MASK variable must be defined at top of try_start_stream.sh"
 fi
-TASKSET_COUNT=$(grep -cE '^\s*taskset -c "\$FFMPEG_CPU_MASK" "\$\{ffmpeg_cmd\[@\]\}"' "$TSS" || true)
-if [[ "$TASKSET_COUNT" -lt 5 ]]; then
-    fail "taskset -c \$FFMPEG_CPU_MASK appears ${TASKSET_COUNT} times; expected at least 5 (one per ffmpeg spawn site)"
+# Startup validation must exist — mask with cores beyond nproc must clear
+# itself rather than kill every spawn on the wrong host.
+if ! grep -q 'taskset -c "\$FFMPEG_CPU_MASK" true' "$TSS"; then
+    fail "FFMPEG_CPU_MASK must be validated against the host at startup (taskset ... true probe missing)"
+fi
+# Prefix array must be defined so empty-mask degrades to unpinned spawns.
+if ! grep -q 'TASKSET_PREFIX=(' "$TSS"; then
+    fail "TASKSET_PREFIX array must be defined so ffmpeg/streamlink spawns degrade cleanly when mask is empty"
+fi
+# Every ffmpeg spawn site must use the prefix. Count sites.
+FFMPEG_PINNED_COUNT=$(grep -cE '^\s*"\$\{TASKSET_PREFIX\[@\]\}" "\$\{ffmpeg_cmd\[@\]\}"' "$TSS" || true)
+if [[ "$FFMPEG_PINNED_COUNT" -lt 5 ]]; then
+    fail "FFMPEG spawn sites using TASKSET_PREFIX: ${FFMPEG_PINNED_COUNT}; expected at least 5"
+fi
+# Every streamlink spawn must use the prefix too (CPU isolation is not
+# half-enforced — streamlink TLS parsing can spike one core to 100%).
+STREAMLINK_PINNED_COUNT=$(grep -cE '^\s*"\$\{TASKSET_PREFIX\[@\]\}" "\$\{streamlink_args\[@\]\}"' "$TSS" || true)
+if [[ "$STREAMLINK_PINNED_COUNT" -lt 3 ]]; then
+    fail "Streamlink spawn sites using TASKSET_PREFIX: ${STREAMLINK_PINNED_COUNT}; expected at least 3"
+fi
+# Negative: no bare `taskset -c "$FFMPEG_CPU_MASK"` should remain at a spawn
+# site (the indirect TASKSET_PREFIX path is the only allowed form).
+if grep -nE '^\s*taskset -c "\$FFMPEG_CPU_MASK" "\$\{(ffmpeg_cmd|streamlink_args)\[@\]\}"' "$TSS" >"$DEVNULL"; then
+    fail "Bare 'taskset -c \$FFMPEG_CPU_MASK' spawn still present; all spawns must go through TASKSET_PREFIX"
 fi
 # Negative: no hardcoded mask should remain (all sites must go through the variable).
 if grep -nE 'taskset -c 0,1,8-15' "$TSS" >"$DEVNULL"; then
     fail "Hardcoded taskset mask 0,1,8-15 still present — all sites must use \$FFMPEG_CPU_MASK"
 fi
-echo "  PASS: FFMPEG_CPU_MASK defined and wraps all ${TASKSET_COUNT} FFmpeg spawn sites"
+echo "  PASS: TASKSET_PREFIX wraps ${FFMPEG_PINNED_COUNT} FFmpeg + ${STREAMLINK_PINNED_COUNT} streamlink spawns, startup validation present"
+
+# ---------------------------------------------------------------------------
+# Seenshow URL placement invariant — operator rule, not enforced by code.
+# ---------------------------------------------------------------------------
+# Per operator direction (2026-04-14): seenshow must NEVER be primary
+# (rate-limited upstream, MAX_CONCURRENT=3 in resolver). Must appear at
+# stream_url_backup1 as the first failover, or at backup2/backup3. Never
+# at stream_url= (primary).
+# ---------------------------------------------------------------------------
+echo "--- seenshow URL placement invariant ---"
+SEENSHOW_PRIMARY_VIOLATIONS=$(grep -lE '^stream_url="https?://[^"]*seenshow\.com' "$ROOT_DIR"/channel_*.sh 2>/dev/null || true)
+if [[ -n "$SEENSHOW_PRIMARY_VIOLATIONS" ]]; then
+    fail "seenshow must never be a primary URL (rate-limited). Violating file(s): $SEENSHOW_PRIMARY_VIOLATIONS"
+fi
+SEENSHOW_BACKUP_COUNT=$(grep -cE '^stream_url_backup[123]="https?://[^"]*seenshow\.com' "$ROOT_DIR"/channel_*.sh 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+echo "  PASS: no channel has seenshow as primary; ${SEENSHOW_BACKUP_COUNT} channel(s) use seenshow as a backup"
 
 echo "--- Telegram dispatch (wake normalizer + bot offset + tg_alert + severity routing) ---"
 bash "$ROOT_DIR/tests/telegram_dispatch.unit.test.sh"
