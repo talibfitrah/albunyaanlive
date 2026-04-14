@@ -138,26 +138,47 @@ if [[ -r "$OFFSET_FILE" ]]; then
 fi
 
 seed_offset() {
-    local resp seed
+    # Returns:
+    #   0 — success; OFFSET set
+    #   1 — transient failure (network, timeout, bad JSON) — safe to retry
+    #   2 — auth failure (401/403/invalid token) — DO NOT retry; let
+    #       systemd surface the failure via exit code so it shows in
+    #       `systemctl status` and journalctl rather than spinning
+    #       silently forever.
+    local resp seed py_exit
     resp=$(curl -s --max-time 15 "${API}/getUpdates?offset=-1&limit=1" 2>/dev/null) || return 1
-    # Must be a valid JSON "ok":true response. Anything else (network glitch,
-    # partial body, HTML error page from an upstream proxy) → fail loudly.
     seed=$(printf '%s' "$resp" | python3 -c '
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
 if not d.get("ok"):
-    sys.exit(2)
+    code = d.get("error_code")
+    # 401 Unauthorized, 403 Forbidden (bot blocked / token revoked)
+    if code in (401, 403):
+        sys.exit(2)
+    sys.exit(1)
 r = d.get("result") or []
 print(r[-1].get("update_id", 0) + 1 if r else 0)
-' 2>/dev/null) || return 1
+' 2>/dev/null)
+    py_exit=$?
+    if [[ $py_exit -eq 2 ]]; then return 2; fi
+    if [[ $py_exit -ne 0 ]]; then return 1; fi
     OFFSET="${seed:-0}"
     return 0
 }
 
 if [[ "$OFFSET" -eq 0 ]]; then
-    until seed_offset; do
-        log "startup seed failed (no network or API error); retrying in 10s"
-        sleep 10
+    while true; do
+        seed_offset
+        case $? in
+            0) break ;;
+            2) log "FATAL startup seed auth failure (401/403); exiting for systemd to flag"
+               exit 11 ;;
+            *) log "startup seed failed (network or API error); retrying in 10s"
+               sleep 10 ;;
+        esac
     done
     write_offset "$OFFSET"
     log "startup seeded offset=$OFFSET (no prior state)"
