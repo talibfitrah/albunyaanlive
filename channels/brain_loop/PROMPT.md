@@ -222,16 +222,36 @@ message with N Task calls, not sequential. They are independent.
 N is already capped at 8 by the selective-dispatch rule above, so
 no further batching is needed.
 
+**HARD CONTRACT — read this twice:** the sub-agent's `logo_detected`
+boolean is AUTHORITATIVE. The brain (you) does not re-interpret it,
+does not override it based on the sub-agent's prose, does not
+"combine text evidence with the structured field". If `logo_detected`
+is `false` or `"unknown"`, there is no logo evidence. Period.
+Sub-agents sometimes hallucinate phrases like "foreign channel logo
+positively identified" in their prose while correctly setting
+`logo_detected=false` — in that case the structured field wins and
+the prose is treated as noise. This mistake cost a real false-page
+on rawdah on 2026-04-14; do not repeat it.
+
 For each sub-agent that returns `mismatch` with confidence >= 0.7
-AND `logo_detected=true` (i.e. a CLEARLY WRONG logo is on screen),
-this is potentially the worst-case bug: wrong content under a
-channel's name. Telegram alert this wake.
+AND `logo_detected=true` (strictly the boolean `true`, not the
+string `"unknown"`, not a prose claim), this is potentially the
+worst-case bug: wrong content under a channel's name. Telegram
+alert this wake.
 
 Logo-only mode changes the meaning of `mismatch`: it now means "a
-different channel's logo was seen", not "the content looks wrong".
-If `mismatch` with `logo_detected=false` (no logo visible),
-downgrade to `unknown` in your aggregated state and do not alert —
-we cannot judge identity without either a logo or reference images.
+different channel's logo was SEEN and identified as a SPECIFIC
+competing channel's bug logo". It does NOT mean "the content looks
+unexpected" or "I think I see a logo somewhere that might be wrong".
+If `mismatch` with `logo_detected=false` (or `"unknown"`), downgrade
+to `unknown` in your aggregated state and do not alert — we cannot
+judge identity without either a verified logo or reference images.
+
+**Kids Islamic channels (almajd-kids, rawdah) normally show
+cartoon content.** Cartoon imagery by itself is NEVER evidence of
+a feed substitution on these channels. The only way to alert on
+a kids channel is: sub-agent returns mismatch + logo_detected=true
++ it names a specific competing channel whose logo was seen.
 
 For a `slate` verdict where `prior_state.channel_history[id]`
 shows slate accumulating across wakes, open or escalate an incident.
