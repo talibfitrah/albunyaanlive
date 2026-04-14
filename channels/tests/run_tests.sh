@@ -330,6 +330,28 @@ if ! has_pattern 'needs_https_proxy.*probe_url' "$ROOT_DIR/try_start_stream.sh";
     fail "probe must call needs_https_proxy on probe URL before skipping 4xx"
 fi
 
+# [GPU-PIPELINE-GUARD] Ensure scale 4/3/12/13 use resilient CPU-side decode + hwupload_cuda.
+# The old pipeline (h264_cuvid decode + scale_npp) crashes on mid-stream format changes.
+# The resilient pipeline: CPU decode → scale=W:H,format=nv12,hwupload_cuda → h264_nvenc
+# These guards prevent regression to the crash-prone pipeline.
+# Check that scale_npp does not appear in active (non-comment) code
+scale_npp_active=$(grep -n 'scale_npp' "$ROOT_DIR/try_start_stream.sh" | grep -vE '^[[:space:]]*[0-9]+:[[:space:]]*#' || true)
+if [[ -n "$scale_npp_active" ]]; then
+    fail "scale_npp found in active code (not comment) — must use CPU-side scale + hwupload_cuda instead"
+fi
+# Check that h264_cuvid does not appear in active (non-comment) code
+cuvid_active=$(grep -n 'h264_cuvid' "$ROOT_DIR/try_start_stream.sh" | grep -vE '^[[:space:]]*[0-9]+:[[:space:]]*#' || true)
+if [[ -n "$cuvid_active" ]]; then
+    fail "h264_cuvid found in active code — scale 4/3/12/13 must use CPU decode + hwupload_cuda"
+fi
+# Verify the resilient filter chain pattern exists for GPU-accelerated scales
+if ! has_pattern 'scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "resilient GPU pipeline (fast_bilinear + format=nv12 + hwupload_cuda) missing for scale 4/3"
+fi
+if ! has_pattern 'scale=1920:1080:flags=lanczos,format=nv12,hwupload_cuda' "$ROOT_DIR/try_start_stream.sh"; then
+    fail "resilient GPU pipeline (lanczos + format=nv12 + hwupload_cuda) missing for scale 12/13"
+fi
+
 # Guard against duplicate audio options in a single command block
 prev=""
 while IFS= read -r line; do
@@ -1142,28 +1164,15 @@ EOF
     fi
 
     wait_for_log_pattern "$log_file" "URL_SWITCH: Switching to URL index 1" 10
+    # Seenshow identity must be preserved after proxy URL rewrite (canonical URL
+    # is used for metadata, transport URL goes through local proxy).
     wait_for_log_pattern "$log_file" "SEENSHOW: Skipping preflight probe for URL index 1" 10
-    wait_for_log_pattern "$log_file" "HTTPS_PROXY: Starting streamlink pipe for HLS:" 10
-
-    local streamlink_args_file="$state_dir/streamlink_args"
-    for _ in {1..10}; do
-        if [[ -f "$streamlink_args_file" ]]; then
-            break
-        fi
-        sleep 1
-    done
-    if [[ ! -f "$streamlink_args_file" ]]; then
-        stop_runner_process "$runner_pid"
-        fail "streamlink args capture file not found for protocol test"
-    fi
-    if ! grep -Fq -- "Referer=https://live.seenshow.com/" "$streamlink_args_file"; then
-        stop_runner_process "$runner_pid"
-        fail "seenshow streamlink request missing Referer header"
-    fi
-    if ! grep -Fq -- "Origin=https://live.seenshow.com" "$streamlink_args_file"; then
-        stop_runner_process "$runner_pid"
-        fail "seenshow streamlink request missing Origin header"
-    fi
+    # Seenshow URLs are now routed through the local resolver proxy, so FFmpeg
+    # fetches via http://127.0.0.1:8090/proxy/... instead of going through
+    # streamlink. Verify the proxy routing happened.
+    wait_for_log_pattern "$log_file" "SEENSHOW: Routing through local proxy:" 10
+    # FFmpeg should start directly (no streamlink) with the proxied HTTP URL.
+    wait_for_log_pattern "$log_file" "FFmpeg PID:" 10
 
     if grep -Fq "URL_SWITCH: Switching to URL index 2 (reason: HTTP_403)" "$log_file"; then
         fail "proxied HTTPS backup should not be skipped on preflight 403"
@@ -1306,28 +1315,11 @@ EOF
     fi
 
     wait_for_log_pattern "$log_file" "URL_SWITCH: Switching to URL index 1" 10
+    # Seenshow identity must be preserved after proxy URL rewrite even when
+    # ffmpeg has native https support — proxy path is always used for seenshow.
     wait_for_log_pattern "$log_file" "SEENSHOW: Skipping preflight probe for URL index 1" 10
-    wait_for_log_pattern "$log_file" "HTTPS_PROXY: Starting streamlink pipe for HLS:" 10
-
-    local streamlink_args_file="$state_dir/streamlink_args"
-    for _ in {1..10}; do
-        if [[ -f "$streamlink_args_file" ]]; then
-            break
-        fi
-        sleep 1
-    done
-    if [[ ! -f "$streamlink_args_file" ]]; then
-        stop_runner_process "$runner_pid"
-        fail "streamlink args capture file not found for seenshow proxy test"
-    fi
-    if ! grep -Fq -- "Referer=https://live.seenshow.com/" "$streamlink_args_file"; then
-        stop_runner_process "$runner_pid"
-        fail "seenshow proxy path missing Referer header when ffmpeg supports https"
-    fi
-    if ! grep -Fq -- "Origin=https://live.seenshow.com" "$streamlink_args_file"; then
-        stop_runner_process "$runner_pid"
-        fail "seenshow proxy path missing Origin header when ffmpeg supports https"
-    fi
+    wait_for_log_pattern "$log_file" "SEENSHOW: Routing through local proxy:" 10
+    wait_for_log_pattern "$log_file" "FFmpeg PID:" 10
 
     if grep -Fq "URL_SWITCH: Switching to URL index 2 (reason: HTTP_403)" "$log_file"; then
         stop_runner_process "$runner_pid"
@@ -1377,6 +1369,8 @@ EOF
     chmod +x "$bin_dir/curl"
 
     # Force FIFO creation failure to exercise safe failover path.
+    # Uses a non-seenshow HTTPS URL (seenshow URLs are now proxy-rewritten to HTTP
+    # and would bypass the streamlink/FIFO path entirely).
     cat > "$bin_dir/mkfifo" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -1436,7 +1430,9 @@ EOF
     local dest="$dest_dir/master.m3u8"
 
     local primary_url="http://primary.example/stream.m3u8"
-    local bad_backup_url="https://live.seenshow.com/hls/live/test/live/master.m3u8"
+    # Use a non-seenshow HTTPS URL to test the HTTPS proxy FIFO failure path.
+    # Seenshow URLs are proxy-rewritten to HTTP and don't trigger this path.
+    local bad_backup_url="https://cdn.example.com/live/stream.m3u8"
     local good_backup_url="http://backup2.example/stream.m3u8"
 
     local preferred_log="$ROOT_DIR/logs/${channel_id}.log"
@@ -1573,9 +1569,12 @@ EOF
 
     wait_for_log_pattern "$log_file" "SEENSHOW: Acquired resolver slot for $channel_id" 12
     wait_for_log_pattern "$log_file" "SEENSHOW: Refreshed tokenized URL for index 0" 12
+    # Seenshow URLs are now proxy-rewritten to http://127.0.0.1:8090/proxy/...
+    # so FFmpeg fetches via regular HTTP (no streamlink needed).
+    wait_for_log_pattern "$log_file" "SEENSHOW: Routing through local proxy:" 12
+    wait_for_log_pattern "$log_file" "FFmpeg PID:" 12
     wait_for_file "$state_dir/acquire_called" 12
     wait_for_file "$state_dir/resolve_called" 12
-    wait_for_file "$state_dir/streamlink_called" 12
 
     stop_runner_process "$runner_pid"
     wait_for_file "$state_dir/release_called" 12
@@ -3608,5 +3607,175 @@ if [[ -n "$token_hits" ]]; then
     exit 1
 fi
 echo "PASS: No persisted tokens in registry or channel configs."
+
+# ---------------------------------------------------------------------------
+# Seenshow resolver: /proxy/hls/* regression guards
+# ---------------------------------------------------------------------------
+# These are static source-level invariants. They catch silent deletion or
+# semantic inversion of safety code (SSRF prefix check, Host-header isolation).
+# A full integration harness with fake-curl + live server is tracked as
+# follow-up work but too flaky to land without port-allocation + readiness
+# infrastructure.
+# ---------------------------------------------------------------------------
+echo "--- Seenshow /proxy/hls/* regression guards ---"
+RESOLVER_JS="$ROOT_DIR/seenshow_resolver.js"
+
+if [[ ! -f "$RESOLVER_JS" ]]; then
+    echo "SKIP: seenshow_resolver.js not present"
+else
+    # Guard 1: SSRF prefix check must reject non-/hls/ paths with 400.
+    # Inversion (dropping the !) would silently allow SSRF. Check the exact
+    # negated form.
+    if ! has_pattern "if \(!remotePath\.startsWith\('/hls/'\)\)" "$RESOLVER_JS"; then
+        fail "SSRF prefix guard missing or inverted in $RESOLVER_JS — must be: if (!remotePath.startsWith('/hls/'))"
+    fi
+    if ! has_pattern "Only /hls/ paths are proxied" "$RESOLVER_JS"; then
+        fail "SSRF rejection 400 response string missing in $RESOLVER_JS"
+    fi
+    echo "  PASS: SSRF prefix guard present (non-/hls/ rejected with 400)"
+
+    # Guard 2: playlist rewrite MUST use configured HOST:PORT, not req.headers.host.
+    # Using req.headers.host allows a malicious Host header to poison the rewritten
+    # playlist and redirect FFmpeg fetches. This is a positive assertion the
+    # configured HOST:PORT is used near the rewrite.
+    if ! has_pattern 'http://\$\{HOST\}:\$\{PORT\}' "$RESOLVER_JS"; then
+        fail "Playlist rewrite must use http://\${HOST}:\${PORT} template in $RESOLVER_JS"
+    fi
+    # Negative: req.headers.host must NOT be USED as code (comments explaining the
+    # opposite-of-use are fine and in fact document the invariant). Filter out
+    # lines whose content starts with `//` or ` *` (block-comment continuation).
+    host_hits=$(grep -nE 'req\.headers\.host' "$RESOLVER_JS" | grep -vE ':[[:space:]]*(//|\*)' || true)
+    if [[ -n "$host_hits" ]]; then
+        echo "FAIL: req.headers.host used as code in $RESOLVER_JS — host-header isolation invariant violated:"
+        echo "$host_hits"
+        exit 1
+    fi
+    echo "  PASS: Playlist rewrite uses configured HOST:PORT (no req.headers.host reference)"
+
+    # Guard 3: HEAD method accepted on /proxy/ and curl --head passed through.
+    # Wiring goes: /proxy/ HEAD request → buildCurlArgs({ mode: 'head' }) → curl --head.
+    if ! has_pattern "method === 'GET' \|\| method === 'HEAD'" "$RESOLVER_JS"; then
+        fail "HEAD method support missing on /proxy/ in $RESOLVER_JS"
+    fi
+    if ! has_pattern "isHead \? 'head' : 'dumpHeaders'" "$RESOLVER_JS"; then
+        fail "/proxy/ handler must call buildCurlArgs with mode 'head' or 'dumpHeaders' in $RESOLVER_JS"
+    fi
+    if ! has_pattern "mode === 'head'" "$RESOLVER_JS"; then
+        fail "buildCurlArgs must have a 'head' mode branch in $RESOLVER_JS"
+    fi
+    if ! has_pattern "args\.push\('--head'\)" "$RESOLVER_JS"; then
+        fail "buildCurlArgs 'head' mode must push --head flag in $RESOLVER_JS"
+    fi
+    echo "  PASS: HEAD method supported and forwarded to curl (via buildCurlArgs)"
+
+    # Guard 4: AUTH_PROXY 'none' sentinel exists — operator can opt out of Tor.
+    if ! has_pattern "_rawProxy === 'none'" "$RESOLVER_JS"; then
+        fail "SEENSHOW_AUTH_PROXY 'none' sentinel missing in $RESOLVER_JS"
+    fi
+    echo "  PASS: AUTH_PROXY='none' opt-out sentinel present"
+
+    # Guard 5: curlGetText — must reject on curl nonzero exit when no HTTP status
+    # was captured. Without this, callers hang forever when curl isn't on PATH
+    # or --interface tun1 doesn't exist.
+    if ! has_pattern "reject\(new Error\(.curl exit" "$RESOLVER_JS"; then
+        fail "curlGetText error propagation missing in $RESOLVER_JS (must reject on curl exit with no HTTP status)"
+    fi
+    if ! has_pattern "child\.on\('error', reject\)" "$RESOLVER_JS"; then
+        fail "curlGetText child 'error' → reject wiring missing in $RESOLVER_JS"
+    fi
+    echo "  PASS: curlGetText error paths propagate (spawn failure, nonzero exit)"
+
+    # Guard 6: --interface CURL_INTERFACE passed to curl so requests use VPN tunnel.
+    if ! has_pattern "'--interface', CURL_INTERFACE" "$RESOLVER_JS"; then
+        fail "curl --interface CURL_INTERFACE flag missing in $RESOLVER_JS — requests would not use VPN tunnel"
+    fi
+    echo "  PASS: curl routes through CURL_INTERFACE (VPN tunnel)"
+
+    # Syntax-check the resolver — catches any parse error introduced by refactors.
+    node --check "$RESOLVER_JS" >"$DEVNULL" 2>&1 || fail "seenshow_resolver.js failed node --check"
+    echo "  PASS: seenshow_resolver.js parses cleanly"
+fi
+
+# ---------------------------------------------------------------------------
+# try_start_stream.sh: GPU encoder fallback invariants (scales 4, 9, 12)
+# ---------------------------------------------------------------------------
+# Each scale branch has a three-way guard:
+#   force_copy_mode → -c copy (after repeated NVENC crashes)
+#   nvidia-smi absent → -c copy (safe default on CPU-only hosts)
+#   else → NVENC transcode
+# If any arm is silently deleted, channels either crash-loop on NVENC errors
+# or fail encoder startup on CPU-only hosts.
+# ---------------------------------------------------------------------------
+echo "--- GPU encoder fallback invariants ---"
+TSS="$ROOT_DIR/try_start_stream.sh"
+
+for scale in 4 9 12; do
+    if ! has_pattern "SCALE${scale}: Forced COPY mode" "$TSS"; then
+        fail "Scale $scale: force_copy_mode branch missing (log token 'SCALE${scale}: Forced COPY mode')"
+    fi
+    if ! has_pattern "SCALE${scale}: GPU unavailable, falling back to stream copy" "$TSS"; then
+        fail "Scale $scale: nvidia-smi absent fallback missing (log token 'SCALE${scale}: GPU unavailable')"
+    fi
+done
+# Variable must be initialized so `${force_copy_mode:-0}` isn't the only safety net.
+if ! has_pattern '^force_copy_mode=0' "$TSS"; then
+    fail "force_copy_mode must be initialized to 0 at top of try_start_stream.sh"
+fi
+echo "  PASS: Scales 4/9/12 have both force_copy_mode and nvidia-smi fallback branches"
+
+# ---------------------------------------------------------------------------
+# try_start_stream.sh: duplicate-FFmpeg staleness verification
+# ---------------------------------------------------------------------------
+# After pgrep finds a candidate, we must verify it's (a) alive, (b) actually
+# FFmpeg, and (c) writing to THIS channel's output. The channel-path match
+# uses /${channel_id}/ with slashes on BOTH sides to prevent substring
+# collisions (channel "foo" must not match /footv/ or /foobar/).
+# ---------------------------------------------------------------------------
+echo "--- Duplicate-FFmpeg staleness verification ---"
+# Single-quoted patterns — `$` is treated as literal by grep -E only if escaped (`\$`).
+for token in \
+    'DUPLICATE_STALE: PID \$pid is no longer running' \
+    'DUPLICATE_STALE: Cannot read /proc/\$pid/cmdline' \
+    'DUPLICATE_STALE: PID \$pid is not an FFmpeg process' \
+    'DUPLICATE_STALE: PID \$pid FFmpeg is not writing to /\$\{channel_id\}/' \
+    'DUPLICATE_DETECTED: Another FFmpeg'; do
+    if ! has_pattern "$token" "$TSS"; then
+        fail "Duplicate-PID check missing branch: $token"
+    fi
+done
+# Critical: path match MUST use slashes on both sides. Substring-only match
+# (e.g., *"$channel_id"* without slashes) is a bug — channel "foo" matches
+# ffmpeg writing to /footv/master.m3u8.
+if ! has_pattern '"\$proc_cmd" != \*"/\$\{channel_id\}/"\*' "$TSS"; then
+    fail "Duplicate-PID path match must be /\${channel_id}/ with slashes on both sides (substring collision guard)"
+fi
+echo "  PASS: Staleness verification has 4 branches + slash-bounded path match"
+
+# ---------------------------------------------------------------------------
+# try_start_stream.sh: taskset CPU pinning invariant
+# ---------------------------------------------------------------------------
+# Every FFmpeg invocation should be wrapped in `taskset -c 0,1,8-15` so
+# encoding stays off the cores reserved for system/IO work. There are 5
+# FFmpeg spawn sites today; if a new site is added without taskset, this
+# test will fail and force a deliberate decision.
+# ---------------------------------------------------------------------------
+echo "--- taskset CPU pinning invariant ---"
+# The CPU mask is centralized in $FFMPEG_CPU_MASK (see top of try_start_stream.sh).
+# Every ffmpeg spawn site must wrap the call in `taskset -c "$FFMPEG_CPU_MASK"`.
+if ! has_pattern '^FFMPEG_CPU_MASK=' "$TSS"; then
+    fail "FFMPEG_CPU_MASK variable must be defined at top of try_start_stream.sh"
+fi
+TASKSET_COUNT=$(grep -cE '^\s*taskset -c "\$FFMPEG_CPU_MASK" "\$\{ffmpeg_cmd\[@\]\}"' "$TSS" || true)
+if [[ "$TASKSET_COUNT" -lt 5 ]]; then
+    fail "taskset -c \$FFMPEG_CPU_MASK appears ${TASKSET_COUNT} times; expected at least 5 (one per ffmpeg spawn site)"
+fi
+# Negative: no hardcoded mask should remain (all sites must go through the variable).
+if grep -nE 'taskset -c 0,1,8-15' "$TSS" >"$DEVNULL"; then
+    fail "Hardcoded taskset mask 0,1,8-15 still present — all sites must use \$FFMPEG_CPU_MASK"
+fi
+echo "  PASS: FFMPEG_CPU_MASK defined and wraps all ${TASKSET_COUNT} FFmpeg spawn sites"
+
+echo "--- Telegram dispatch (wake normalizer + bot offset + tg_alert + severity routing) ---"
+bash "$ROOT_DIR/tests/telegram_dispatch.unit.test.sh"
 
 echo "All tests passed."

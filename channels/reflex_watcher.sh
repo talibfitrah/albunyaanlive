@@ -209,6 +209,17 @@ consider_transition() {
     fi
 
     local severity; severity=$(severity_of_status "$new_status")
+
+    # Recovery escalation (A-7): if the prior status was severe-tier, the
+    # colleague got paged with AR. An eventual healthy transition is info
+    # (user only) by default, which leaves the colleague thinking the
+    # channel is still down. Route recovery AR to colleague when we had
+    # previously paged them for this kind.
+    local prior_sev; prior_sev=$(severity_of_status "$prior")
+    if [[ "$severity" != "severe" && "$prior_sev" == "severe" ]]; then
+        severity="severe"
+    fi
+
     tg_alert "$severity" "$en_msg" "$ar_msg"
     log "alert kind=$kind prior=$prior new=$new_status severity=$severity"
     PRIOR_STATUS[$kind]="$new_status"

@@ -51,6 +51,13 @@ channels/*_catalog.json
 # Operator bot runtime state (Telegram getUpdates offset)
 channels/operator_bot/update_offset
 
+# Brain loop runtime state — lock, live state JSON, per-wake raw logs.
+# Never commit: state.json changes every 30 min, raw/ is an LLM transcript
+# dump that may contain sensitive system state, wake.lock is a flock handle.
+channels/brain/wake.lock
+channels/brain/state.json
+channels/brain/raw/
+
 # Vendored external dependency (separate repo/workflow)
 channels/bgutil-pot-node/
 

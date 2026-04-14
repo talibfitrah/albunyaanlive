@@ -247,33 +247,16 @@ fi
 # Routing:
 #   - EN always → user (bot #2 / OPERATOR_BOT_TOKEN + OPERATOR_OWNER_ID)
 #   - AR on severity=severe → colleague (bot #1 / TELEGRAM_BOT_TOKEN + COLLEAGUE_OWNER_ID)
+# The dispatch is fault-tolerant: any exception in normalization falls back
+# to a single severe alert so the operator knows the brain output was malformed
+# rather than silently dropping all messages (A-1).
 TELEGRAM_MAX_MSGS_PER_WAKE="$TELEGRAM_MAX_MSGS_PER_WAKE" RAW_LOG_PATH="$RAW_LOG" \
     python3 -c '
-import json, sys, os, subprocess
-d = json.loads(sys.stdin.read())
-raw = d.get("telegram_messages") or []
-cap = int(os.environ.get("TELEGRAM_MAX_MSGS_PER_WAKE", "10"))
-
-# Normalize to list of (severity, en, ar) tuples.
-msgs = []
-for item in raw:
-    if isinstance(item, str) and item.strip():
-        msgs.append(("info", item, ""))
-    elif isinstance(item, dict):
-        en = (item.get("en") or "").strip()
-        if not en: continue
-        sev = (item.get("severity") or "info").lower()
-        if sev not in ("severe", "warn", "info"): sev = "info"
-        ar = (item.get("ar") or "").strip()
-        msgs.append((sev, en, ar))
-
-op_token = os.environ.get("OPERATOR_BOT_TOKEN", "")
-op_chat  = os.environ.get("OPERATOR_OWNER_ID", "")
-co_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-co_chat  = os.environ.get("COLLEAGUE_OWNER_ID", "")
+import json, sys, os, subprocess, time
 
 def send(token, chat, text):
-    if not token or not chat or not text: return
+    if not token or not chat or not text:
+        return
     subprocess.run([
         "curl", "-s", "--max-time", "15",
         f"https://api.telegram.org/bot{token}/sendMessage",
@@ -281,16 +264,54 @@ def send(token, chat, text):
         "--data-urlencode", f"text={text}",
     ], stdout=subprocess.DEVNULL, check=False)
 
-to_send = msgs[:cap]
-if len(msgs) > cap:
-    overflow = len(msgs) - cap
-    rl = os.environ.get("RAW_LOG_PATH", "(see server log)")
-    to_send.append(("info", f"... and {overflow} more messages. Full details in server log: {rl}", ""))
+op_token = os.environ.get("OPERATOR_BOT_TOKEN", "")
+op_chat  = os.environ.get("OPERATOR_OWNER_ID", "")
+co_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+co_chat  = os.environ.get("COLLEAGUE_OWNER_ID", "")
 
-for sev, en, ar in to_send:
-    send(op_token, op_chat, en)
-    if sev == "severe" and ar:
-        send(co_token, co_chat, ar)
+try:
+    d = json.loads(sys.stdin.read())
+    raw = d.get("telegram_messages") or []
+    if not isinstance(raw, list):
+        raise TypeError(f"telegram_messages must be a list, got {type(raw).__name__}")
+    cap = int(os.environ.get("TELEGRAM_MAX_MSGS_PER_WAKE", "10"))
+
+    msgs = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            msgs.append(("info", item, ""))
+        elif isinstance(item, dict):
+            en = (item.get("en") or "").strip()
+            if not en:
+                continue
+            sev = (item.get("severity") or "info").lower()
+            if sev not in ("severe", "warn", "info"):
+                sev = "info"
+            ar = (item.get("ar") or "").strip()
+            msgs.append((sev, en, ar))
+        # Anything else (numbers, nested lists) is skipped silently.
+
+    to_send = msgs[:cap]
+    if len(msgs) > cap:
+        overflow = len(msgs) - cap
+        rl = os.environ.get("RAW_LOG_PATH", "(see server log)")
+        to_send.append(("info", f"... and {overflow} more messages. Full details in server log: {rl}", ""))
+
+    for i, (sev, en, ar) in enumerate(to_send):
+        # Throttle to stay under Telegram 30 msg/s global limit (A-5).
+        if i > 0:
+            time.sleep(0.5)
+        send(op_token, op_chat, en)
+        if sev == "severe" and ar:
+            send(co_token, co_chat, ar)
+except Exception as exc:
+    rl = os.environ.get("RAW_LOG_PATH", "(see server log)")
+    send(op_token, op_chat,
+         f"Alert: brain telegram_messages malformed ({type(exc).__name__}: {exc}). "
+         f"No per-wake messages sent. See {rl}")
+    send(co_token, co_chat,
+         f"تنبيه: تقرير الفحص غير صالح. راجع السجل على الخادم.")
+    sys.exit(0)
 ' <<<"$JSON_DOC"
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)

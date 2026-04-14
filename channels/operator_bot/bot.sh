@@ -116,11 +116,40 @@ dispatch() {
     esac
 }
 
-# Initialize offset. If file missing, start fresh (offset=0 means "any unread").
+# Atomic write: tmp + rename, so a crash mid-write cannot truncate the file
+# and cause a 0-offset replay of 24h of queued chatter on restart (A-2).
+write_offset() {
+    local tmp="${OFFSET_FILE}.tmp.$$"
+    printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$OFFSET_FILE"
+}
+
+# Initialize offset.
+# - Missing or unreadable file: start from Telegram's tail (offset=-1, limit=1)
+#   so we fetch only the latest update_id and seed from there — don't replay
+#   24h of queued messages on a cold start (A-2).
+# - Zero/empty value: same recovery path. Non-zero values are trusted.
 OFFSET=0
 if [[ -r "$OFFSET_FILE" ]]; then
     OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
     OFFSET=${OFFSET:-0}
+fi
+if [[ "$OFFSET" -eq 0 ]]; then
+    seed_resp=$(curl -s --max-time 15 "${API}/getUpdates?offset=-1&limit=1" 2>/dev/null || echo '{"ok":false}')
+    SEED=$(printf '%s' "$seed_resp" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    r = d.get("result") or []
+    if r:
+        print(r[-1].get("update_id", 0) + 1)
+    else:
+        print(0)
+except Exception:
+    print(0)
+' 2>/dev/null || echo 0)
+    OFFSET=${SEED:-0}
+    write_offset "$OFFSET"
+    log "startup seeded offset=$OFFSET (no prior state)"
 fi
 
 log "startup offset=$OFFSET owner=$OPERATOR_OWNER_ID"
@@ -136,20 +165,25 @@ while true; do
         continue
     fi
 
-    # Process each update; update offset to max(update_id)+1.
+    # Process each update FIRST, then advance offset. If we crash mid-dispatch,
+    # Telegram re-delivers on restart (within its 24h queue) — at-least-once
+    # beats at-most-once for operator commands (A-2).
     while IFS=$'\t' read -r update_id from_id chat_id text; do
         [[ -z "$update_id" ]] && continue
-        NEW_OFFSET=$((update_id + 1))
-        OFFSET=$NEW_OFFSET
-        echo "$OFFSET" >"$OFFSET_FILE"
 
         if [[ "$from_id" != "$OPERATOR_OWNER_ID" ]]; then
             log "dropped update_id=$update_id from=$from_id (not owner)"
-            continue
+        else
+            log "cmd update_id=$update_id text=$(printf '%s' "$text" | head -c 80)"
+            # Wrap dispatch so a failing command cannot escape -euo pipefail
+            # and let a poison-pill update infinite-loop via systemd restarts
+            # (A-2 safety rail on at-least-once semantics).
+            dispatch "$chat_id" "$text" || log "dispatch FAILED update_id=$update_id rc=$?"
         fi
 
-        log "cmd update_id=$update_id text=$(printf '%s' "$text" | head -c 80)"
-        dispatch "$chat_id" "$text"
+        NEW_OFFSET=$((update_id + 1))
+        OFFSET=$NEW_OFFSET
+        write_offset "$OFFSET"
     done < <(echo "$resp" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)

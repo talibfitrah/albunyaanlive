@@ -122,9 +122,33 @@ For each channel where step 6 (visual identity) returns "slate":
 Run `channels/sample_thumbnails.sh` (no args). It writes one PNG
 per channel to `/tmp/albunyaan-thumbs/thumb_<id>.png`.
 
+**Token budget — DISPATCH SELECTIVELY (not all channels every wake):**
+
+The reflex watcher already tracks HLS segment freshness at sub-second
+cost — if it says a channel is `healthy`, there is no reason to burn
+LLM tokens re-verifying the video. Visual identity is expensive
+(~5k tokens per sub-agent × 22 channels = one wake can consume 100k+
+tokens) and Claude has both per-minute and per-day rate limits.
+
+Decide which channels to dispatch BEFORE reading thumbnails. A channel
+gets a visual sub-agent on this wake if ANY of:
+
+  a) Watcher status for that channel is NOT `healthy` (i.e. warn,
+     stalled, or no_segments — these are the suspect channels).
+  b) `prior_state.channel_history[id].last_visual_verdict` is not
+     `match` (never-verified, slate-stuck, or previously mismatched
+     channels need re-checking).
+  c) `prior_state.channel_history[id].last_visual_ts` is more than
+     6 hours old (stale verdict — re-verify to catch drift even on
+     watcher-healthy channels).
+
+Cap total visual sub-agents per wake at **8**. If more than 8 channels
+qualify, prioritize (a) > (b) > (c) and defer the rest to the next
+wake. Record which channels were checked in `new_state`.
+
 Then read `channels/identity_manifest.json` to get the per-channel
-expectations. For each channel, dispatch a sub-agent via the `Task`
-tool with this contract:
+expectations. For each SELECTED channel, dispatch a sub-agent via the
+`Task` tool with this contract:
 
 ```
 Subagent input:
@@ -143,36 +167,43 @@ Subagent input:
   channel_id:            <id>
 ```
 
-**Sub-agent judging rules (critical — this was the failure mode on
-wake 1 where 8/22 channels false-positived):**
+**Sub-agent judging rules — LOGO-ONLY MODE (current policy):**
+
+Per operator direction (2026-04-14), visual identity is judged on
+**channel logo only**. All other visual checks (genre matching,
+presenter face, stylistic cues, caption language, content type) are
+deferred until per-channel reference images (logo crops + canonical
+screenshots) are uploaded to the repo as a source of truth. Until
+then, the sub-agent MUST NOT return `mismatch` based on anything
+other than a clearly-wrong logo.
 
 The sub-agent is a vision judge, NOT an image-diff tool. It must
 evaluate at the SEMANTIC level:
 
-1. **Logo check (primary identity signal).** Look at the bug corner
-   / overlay regions. Does the expected_logo actually appear? A
-   channel logo is the strongest identifier — if the correct logo
-   is visible, verdict is almost certainly `match` regardless of
-   what else is on screen.
-2. **Genre check.** Given expected_genre, does the on-screen
-   content plausibly match? A lecture channel showing a speaker
-   with Arabic captions is `match`. A Quran channel showing
-   calligraphy over a mosque is `match`. A kids channel showing
-   cartoon characters is `match`. **Normal programming variation
-   within a genre is NOT a mismatch.**
-3. **Slate check.** If the frame shows a static maintenance card,
+1. **Logo check (the ONLY identity signal right now).** Look at
+   the bug corner / overlay regions. Does the expected_logo
+   actually appear? If yes → `match`. If a DIFFERENT channel's
+   logo is clearly visible → `mismatch`. If no logo is visible at
+   all (content fills the frame without an overlay) → `unknown`.
+   Do NOT rule `mismatch` solely because the logo is absent — many
+   channels drop the bug during full-screen content.
+2. **Slate check.** If the frame shows a static maintenance card,
    "coming back soon" message, technical difficulties screen, or
    a non-moving branded holding slate, verdict is `slate`. Include
-   the slate text (if readable) in `detected_text`.
-4. **Blackframe / no-signal.** Mostly-black frame with no content
+   the slate text (if readable) in `detected_text`. This is a
+   presence check, not a style check.
+3. **Blackframe / no-signal.** Mostly-black frame with no content
    → `blackframe`.
-5. **The baseline thumbnail is a REFERENCE, not a target.** Use it
-   only to learn what the channel's logo and typical look are.
-   Never return `mismatch` solely because the current frame differs
-   pixel-wise from the baseline — live TV programming changes
-   every few seconds, that is normal. Only return `mismatch` if
-   the logo is clearly a DIFFERENT channel's logo, or the content
-   genre is clearly wrong (e.g. news anchor on a kids channel).
+4. **DO NOT judge on genre, subject matter, caption language,
+   presenter, or visual style.** Those checks are DEFERRED until
+   reference images are provided. A channel showing unexpected
+   content but with the correct logo = `match`. Unexpected content
+   without a visible logo = `unknown` (not mismatch).
+5. **The baseline thumbnail is a REFERENCE for the logo only.** Use
+   it to learn what the channel's logo looks like. Never return
+   `mismatch` because the current frame looks different from the
+   baseline — that happens every few seconds on live TV and is
+   normal.
 
 Subagent output (the LAST line of its response must be a single
 JSON object):
@@ -191,11 +222,15 @@ Task calls, not sequential. They are independent. If 22 in one
 batch is rejected by limits, split into batches of 8-10.
 
 For each sub-agent that returns `mismatch` with confidence >= 0.7
-AND `logo_detected=false`, this is potentially the worst-case bug:
-wrong content under a channel's name. Telegram alert this wake.
-If `mismatch` but `logo_detected=true`, the channel is showing the
-correct brand — likely just a programming change; downgrade to
-`unknown` in your aggregated state and do not alert.
+AND `logo_detected=true` (i.e. a CLEARLY WRONG logo is on screen),
+this is potentially the worst-case bug: wrong content under a
+channel's name. Telegram alert this wake.
+
+Logo-only mode changes the meaning of `mismatch`: it now means "a
+different channel's logo was seen", not "the content looks wrong".
+If `mismatch` with `logo_detected=false` (no logo visible),
+downgrade to `unknown` in your aggregated state and do not alert —
+we cannot judge identity without either a logo or reference images.
 
 For a `slate` verdict where `prior_state.channel_history[id]`
 shows slate accumulating across wakes, open or escalate an incident.
