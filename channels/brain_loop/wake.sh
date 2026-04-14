@@ -59,14 +59,9 @@ if [[ -r "$TELEGRAM_ENV" ]]; then
     set +a
 fi
 
-tg_send() {
-    local msg="$1"
-    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_OWNER_ID:-}" ]] && return 0
-    curl -s --max-time 15 \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TELEGRAM_OWNER_ID}" \
-        --data-urlencode "text=${msg}" >/dev/null || true
-}
+# Shared bilingual alert helper: user (EN) always, colleague (AR) on severe.
+# shellcheck source=../tg_alert.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../tg_alert.sh"
 
 log_line() {
     echo "[$(date -Iseconds)] $*" | tee -a "$WAKE_LOG"
@@ -141,7 +136,9 @@ RC=$?
 
 if [[ $RC -ne 0 ]]; then
     log_line "FAILED claude exit=$RC, raw: $RAW_LOG"
-    tg_send "تنبيه: فشل في فحص النظام (رمز ${RC}). لم يتم تحديث الحالة. سيُعاد المحاولة في الجولة التالية."
+    tg_alert severe \
+        "Alert: brain wake failed (exit ${RC}). State not updated. Will retry next wake." \
+        "تنبيه: فشل في فحص النظام (رمز ${RC}). لم يتم تحديث الحالة. سيُعاد المحاولة في الجولة التالية."
     exit "$RC"
 fi
 
@@ -195,13 +192,17 @@ PYEOF
 
 if [[ -z "$JSON_DOC" ]]; then
     log_line "FAILED could not extract JSON output, raw: $RAW_LOG"
-    tg_send "تنبيه: فحص النظام لم يُنتج تقريراً منظماً. التفاصيل في سجل الخادم."
+    tg_alert severe \
+        "Alert: brain wake produced no structured report. See server log." \
+        "تنبيه: فحص النظام لم يُنتج تقريراً منظماً. التفاصيل في سجل الخادم."
     exit 4
 fi
 
 if ! echo "$JSON_DOC" | python3 -m json.tool >/dev/null 2>&1; then
     log_line "FAILED extracted JSON did not parse, raw: $RAW_LOG"
-    tg_send "تنبيه: تقرير الفحص غير صالح. التفاصيل في سجل الخادم."
+    tg_alert severe \
+        "Alert: brain wake report invalid. See server log." \
+        "تنبيه: تقرير الفحص غير صالح. التفاصيل في سجل الخادم."
     exit 5
 fi
 
@@ -244,15 +245,19 @@ import json, sys, os, subprocess
 d = json.loads(sys.stdin.read())
 msgs = [m for m in (d.get("telegram_messages") or []) if isinstance(m, str) and m.strip()]
 cap = int(os.environ.get("TELEGRAM_MAX_MSGS_PER_WAKE", "10"))
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat = os.environ.get("TELEGRAM_OWNER_ID", "")
+# Routine brain summaries go to the user (bot #2) only. Severe conditions
+# use tg_alert directly from bash (see failure paths above). TODO: update
+# PROMPT.md so the brain emits bilingual + severity-tagged messages, so we
+# can fan out incident-level items to the colleague too.
+token = os.environ.get("OPERATOR_BOT_TOKEN", "")
+chat = os.environ.get("OPERATOR_OWNER_ID", "")
 if not token or not chat:
     raise SystemExit(0)
 to_send = msgs[:cap]
 if len(msgs) > cap:
     overflow = len(msgs) - cap
     raw = os.environ.get("RAW_LOG_PATH", "(see server log)")
-    to_send.append(f"... و{overflow} رسالة إضافية. التفاصيل الكاملة في سجل الخادم: {raw}")
+    to_send.append(f"... and {overflow} more messages. Full details in server log: {raw}")
 for m in to_send:
     subprocess.run([
         "curl", "-s", "--max-time", "15",

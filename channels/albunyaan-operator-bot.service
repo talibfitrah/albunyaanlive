@@ -1,0 +1,41 @@
+[Unit]
+Description=Albunyaan operator bot (Telegram bot #2 — command channel)
+After=network-online.target albunyaan-watcher.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels/operator_bot
+Environment=HOME=/home/msa
+Environment=PATH=/home/msa/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/operator_bot/bot.sh
+Restart=always
+RestartSec=5
+Nice=10
+CPUQuota=5%
+MemoryMax=64M
+TasksMax=32
+
+# Filesystem hardening. /tmp readable for watcher state;
+# sudo askpass path stays available via home.
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels /home/msa/.claude/channels/telegram
+ReadOnlyPaths=/home/msa/.sudo_pass.sh
+PrivateTmp=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+NoNewPrivileges=false
+RestrictSUIDSGID=false
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

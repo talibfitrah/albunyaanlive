@@ -48,6 +48,9 @@ playlists/*.m3u
 channels/provider_catalog.json
 channels/*_catalog.json
 
+# Operator bot runtime state (Telegram getUpdates offset)
+channels/operator_bot/update_offset
+
 # Vendored external dependency (separate repo/workflow)
 channels/bgutil-pot-node/
 

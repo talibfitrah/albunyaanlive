@@ -36,14 +36,9 @@ if [[ -r "$TELEGRAM_ENV" ]]; then
     set +a
 fi
 
-tg_send() {
-    local msg="$1"
-    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_OWNER_ID:-}" ]] && return 0
-    curl -s --max-time 15 \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TELEGRAM_OWNER_ID}" \
-        --data-urlencode "text=${msg}" >/dev/null || true
-}
+# Shared bilingual alert helper: user (EN) always, colleague (AR) on severe.
+# shellcheck source=../tg_alert.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../tg_alert.sh"
 
 # Structured-output contract pinned to the prompt. Trailing JSON line is what
 # the wrapper parses; everything before is human prose / tool transcripts.
@@ -79,7 +74,9 @@ echo "[$TS] starting /${SKILL} audit"
 RC=$?
 
 if [[ $RC -ne 0 ]]; then
-    tg_send "فحص /${SKILL} فشل (رمز خروج ${RC}). راجع السجل على الخادم."
+    tg_alert severe \
+        "Security audit /${SKILL} failed (exit ${RC}). Check server log." \
+        "فحص /${SKILL} فشل (رمز خروج ${RC}). راجع السجل على الخادم."
     echo "[$TS] FAILED rc=$RC, raw log: $RAW_LOG" >&2
     exit "$RC"
 fi
@@ -99,14 +96,18 @@ if [[ -z "$JSON_LINE" ]]; then
         cat "$RAW_LOG"
         echo '```'
     } >"$RUN_LOG"
-    tg_send "فحص /${SKILL} اكتمل لكن لم يُنتج تقريراً منظماً. الملف الكامل محفوظ على الخادم."
+    tg_alert warn \
+        "Security audit /${SKILL} completed but produced no structured report. Full file on server." \
+        ""
     exit 4
 fi
 
 if ! echo "$JSON_LINE" | python3 -m json.tool >/dev/null 2>&1; then
     echo "[$TS] JSON line failed to parse" >&2
     cp "$RAW_LOG" "$RUN_LOG"
-    tg_send "فحص /${SKILL} أنتج JSON غير صالح. الملف محفوظ للمراجعة."
+    tg_alert warn \
+        "Security audit /${SKILL} produced invalid JSON. File saved for review." \
+        ""
     exit 5
 fi
 
@@ -184,29 +185,47 @@ SKILL_NAME="$SKILL" ROUTABLE_JSON_ARG="$ROUTABLE_JSON" python3 -c '
 import json, os, subprocess
 skill = os.environ["SKILL_NAME"]
 findings = json.loads(os.environ["ROUTABLE_JSON_ARG"])
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat = os.environ.get("TELEGRAM_OWNER_ID", "")
-if not token or not chat:
-    raise SystemExit(0)
-for f in findings:
-    sev = f.get("severity", "?").upper()
-    title = f.get("title", "(untitled)")
-    where = f.get("location", "?")
-    why = f.get("why_it_matters", "?")
-    fix = f.get("suggested_fix", "?")
-    msg = (
-        f"\U0001F6E1 فحص /{skill}\n"
-        f"[{sev}] {title}\n"
-        f"الموقع: {where}\n\n"
-        f"لماذا يهم: {why}\n\n"
-        f"الحل المقترح: {fix}"
-    )
+op_token = os.environ.get("OPERATOR_BOT_TOKEN", "")
+op_chat  = os.environ.get("OPERATOR_OWNER_ID", "")
+co_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+co_chat  = os.environ.get("COLLEAGUE_OWNER_ID", "")
+
+def send(token, chat, text):
+    if not token or not chat: return
     subprocess.run([
         "curl", "-s", "--max-time", "15",
         f"https://api.telegram.org/bot{token}/sendMessage",
         "--data-urlencode", f"chat_id={chat}",
-        "--data-urlencode", f"text={msg}",
+        "--data-urlencode", f"text={text}",
     ], stdout=subprocess.DEVNULL, check=False)
+
+for f in findings:
+    sev = (f.get("severity") or "?").upper()
+    title = f.get("title", "(untitled)")
+    where = f.get("location", "?")
+    why = f.get("why_it_matters", "?")
+    fix = f.get("suggested_fix", "?")
+
+    # EN → user (every finding)
+    en = (
+        f"Security /{skill}\n"
+        f"[{sev}] {title}\n"
+        f"Location: {where}\n\n"
+        f"Why it matters: {why}\n\n"
+        f"Suggested fix: {fix}"
+    )
+    send(op_token, op_chat, en)
+
+    # AR → colleague (critical only; spare them medium/low churn)
+    if sev in ("CRITICAL", "HIGH"):
+        ar = (
+            f"\U0001F6E1 فحص /{skill}\n"
+            f"[{sev}] {title}\n"
+            f"الموقع: {where}\n\n"
+            f"لماذا يهم: {why}\n\n"
+            f"الحل المقترح: {fix}"
+        )
+        send(co_token, co_chat, ar)
 '
 
 echo "[$TS] complete. file: $RUN_LOG, routed: $ROUTABLE_COUNT"

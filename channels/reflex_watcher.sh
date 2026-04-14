@@ -33,6 +33,19 @@ if [[ -r "$TELEGRAM_ENV" ]]; then
     set +a
 fi
 
+# Shared bilingual alert helper: user (EN) always, colleague (AR) on severe.
+# shellcheck source=tg_alert.sh
+source "$(dirname "${BASH_SOURCE[0]}")/tg_alert.sh"
+
+# Map a channel/resource status to a tg_alert severity.
+severity_of_status() {
+    case "$1" in
+        stalled|no_segments|critical) echo "severe" ;;
+        warn)                         echo "warn" ;;
+        healthy|*)                    echo "info" ;;
+    esac
+}
+
 declare -A PRIOR_STATUS=()           # kind → last-known status
 declare -A PENDING_COUNT=()          # kind → consecutive observations of new status
 declare -A LAST_ALERT_TS=()          # kind → unix ts of last telegram send
@@ -145,23 +158,16 @@ emit_state() {
     mv -f "$tmp" "$STATE_FILE"
 }
 
-tg_send() {
-    local msg="$1"
-    [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_OWNER_ID:-}" ]] && return 0
-    curl -s --max-time 10 \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TELEGRAM_OWNER_ID}" \
-        --data-urlencode "text=${msg}" >/dev/null || true
-}
-
-# consider_transition <kind> <new_status> <msg_on_alert>
+# consider_transition <kind> <new_status> <en_msg> <ar_msg>
 # Alerts only if:
 #   - status differs from last-known good status for this kind
 #   - the new status has been observed ALERT_MIN_OBSERVATIONS ticks in a row
 #     (debounces segment-age noise and brief nvidia-smi hiccups)
 #   - ALERT_COOLDOWN_S has passed since last alert for this kind
+# Severity is derived from new_status: severe/warn/info. Colleague only
+# sees severe transitions (via tg_alert's routing).
 consider_transition() {
-    local kind="$1" new_status="$2" msg="$3"
+    local kind="$1" new_status="$2" en_msg="$3" ar_msg="$4"
     local now; now=$(date +%s)
 
     # Startup grace: silently seed PRIOR_STATUS so a cold-start watcher
@@ -202,15 +208,27 @@ consider_transition() {
         return
     fi
 
-    tg_send "$msg"
-    log "alert kind=$kind prior=$prior new=$new_status"
+    local severity; severity=$(severity_of_status "$new_status")
+    tg_alert "$severity" "$en_msg" "$ar_msg"
+    log "alert kind=$kind prior=$prior new=$new_status severity=$severity"
     PRIOR_STATUS[$kind]="$new_status"
     LAST_ALERT_TS[$kind]="$now"
     PENDING_STATUS[$kind]=""
     PENDING_COUNT[$kind]=0
 }
 
-channel_msg() {
+channel_msg_en() {
+    local ch="$1" status="$2" age="$3"
+    case "$status" in
+        healthy)     echo "Channel ${ch} recovered." ;;
+        warn)        echo "Channel ${ch} lagging — last segment ${age}s ago. Monitoring." ;;
+        stalled)     echo "Channel ${ch} stalled — last segment ${age}s ago." ;;
+        no_segments) echo "Channel ${ch} is producing no segments." ;;
+        *)           echo "Channel ${ch} status changed to ${status} (segment age ${age}s)." ;;
+    esac
+}
+
+channel_msg_ar() {
     local ch="$1" status="$2" age="$3"
     case "$status" in
         healthy)     echo "قناة ${ch} عادت للعمل." ;;
@@ -221,13 +239,32 @@ channel_msg() {
     esac
 }
 
-resource_msg() {
+resource_msg_en() {
     local kind="$1" status="$2" pct="$3"
     local name
     case "$kind" in
-        system-mem)      name="الذاكرة" ;;
-        system-cpu)      name="المعالج" ;;
-        system-gpu)      name="ذاكرة كرت الشاشة" ;;
+        system-mem)       name="Memory" ;;
+        system-cpu)       name="CPU" ;;
+        system-gpu)       name="GPU memory" ;;
+        system-disk-root) name="Root disk" ;;
+        system-disk-hls)  name="HLS disk" ;;
+        *) name="$kind" ;;
+    esac
+    case "$status" in
+        healthy)  echo "${name} back to normal." ;;
+        warn)     echo "Warning: ${name} at ${pct}%." ;;
+        critical) echo "Critical: ${name} at ${pct}%." ;;
+        *)        echo "${name}: ${status} (${pct}%)." ;;
+    esac
+}
+
+resource_msg_ar() {
+    local kind="$1" status="$2" pct="$3"
+    local name
+    case "$kind" in
+        system-mem)       name="الذاكرة" ;;
+        system-cpu)       name="المعالج" ;;
+        system-gpu)       name="ذاكرة كرت الشاشة" ;;
         system-disk-root) name="القرص الرئيسي" ;;
         system-disk-hls)  name="قرص HLS" ;;
         *) name="$kind" ;;
@@ -248,18 +285,41 @@ check_alerts() {
         local age status
         age=$(newest_segment_age "$dir")
         status=$(classify_age "$age")
-        consider_transition "ch-$ch" "$status" "$(channel_msg "$ch" "$status" "$age")"
+        consider_transition "ch-$ch" "$status" \
+            "$(channel_msg_en "$ch" "$status" "$age")" \
+            "$(channel_msg_ar "$ch" "$status" "$age")"
     done
     # System resources — only alert at warn/critical transitions (skip info churn)
-    local mem cpu gpu dr dh
-    mem=$(mem_used_pct);     consider_transition "system-mem"       "$(classify_pct "$mem" "$MEM_WARN" "$MEM_CRIT")"   "$(resource_msg system-mem       "$(classify_pct "$mem" "$MEM_WARN" "$MEM_CRIT")"   "$mem")"
-    cpu=$(cpu_load_pct);     consider_transition "system-cpu"       "$(classify_pct "$cpu" "$CPU_WARN" "$CPU_CRIT")"   "$(resource_msg system-cpu       "$(classify_pct "$cpu" "$CPU_WARN" "$CPU_CRIT")"   "$cpu")"
+    local mem cpu gpu dr dh st
+    mem=$(mem_used_pct); st=$(classify_pct "$mem" "$MEM_WARN" "$MEM_CRIT")
+    consider_transition "system-mem" "$st" \
+        "$(resource_msg_en system-mem "$st" "$mem")" \
+        "$(resource_msg_ar system-mem "$st" "$mem")"
+    cpu=$(cpu_load_pct); st=$(classify_pct "$cpu" "$CPU_WARN" "$CPU_CRIT")
+    consider_transition "system-cpu" "$st" \
+        "$(resource_msg_en system-cpu "$st" "$cpu")" \
+        "$(resource_msg_ar system-cpu "$st" "$cpu")"
     gpu=$(gpu_mem_pct)
     if [[ "$gpu" -ge 0 ]]; then
-        consider_transition "system-gpu" "$(classify_pct "$gpu" "$GPU_WARN" "$GPU_CRIT")" "$(resource_msg system-gpu "$(classify_pct "$gpu" "$GPU_WARN" "$GPU_CRIT")" "$gpu")"
+        st=$(classify_pct "$gpu" "$GPU_WARN" "$GPU_CRIT")
+        consider_transition "system-gpu" "$st" \
+            "$(resource_msg_en system-gpu "$st" "$gpu")" \
+            "$(resource_msg_ar system-gpu "$st" "$gpu")"
     fi
-    dr=$(disk_pct "/");         [[ -n "$dr" ]] && consider_transition "system-disk-root" "$(classify_pct "$dr" "$DISK_WARN" "$DISK_CRIT")" "$(resource_msg system-disk-root "$(classify_pct "$dr" "$DISK_WARN" "$DISK_CRIT")" "$dr")"
-    dh=$(disk_pct "$HLS_ROOT"); [[ -n "$dh" ]] && consider_transition "system-disk-hls"  "$(classify_pct "$dh" "$DISK_WARN" "$DISK_CRIT")" "$(resource_msg system-disk-hls  "$(classify_pct "$dh" "$DISK_WARN" "$DISK_CRIT")" "$dh")"
+    dr=$(disk_pct "/")
+    if [[ -n "$dr" ]]; then
+        st=$(classify_pct "$dr" "$DISK_WARN" "$DISK_CRIT")
+        consider_transition "system-disk-root" "$st" \
+            "$(resource_msg_en system-disk-root "$st" "$dr")" \
+            "$(resource_msg_ar system-disk-root "$st" "$dr")"
+    fi
+    dh=$(disk_pct "$HLS_ROOT")
+    if [[ -n "$dh" ]]; then
+        st=$(classify_pct "$dh" "$DISK_WARN" "$DISK_CRIT")
+        consider_transition "system-disk-hls" "$st" \
+            "$(resource_msg_en system-disk-hls "$st" "$dh")" \
+            "$(resource_msg_ar system-disk-hls "$st" "$dh")"
+    fi
 }
 
 log_anomalies() {
