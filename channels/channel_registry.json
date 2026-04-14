@@ -13,7 +13,7 @@
         "http://eg.ayyadonline.net:80/farouq10226/rgbi4lg4si/77453"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:31.825Z"
+      "last_updated": "2026-03-21T17:31:44.126Z"
     },
     "hadith-almajd": {
       "stream_id": 1406,
@@ -24,12 +24,9 @@
       "provider_name": "Al MAJD Hadith",
       "preferred_credential": "034120793341",
       "scale": 0,
-      "non_vlc_backups": [
-        "http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/2474",
-        "http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/2474.m3u8"
-      ],
+      "non_vlc_backups": [],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-09T22:19:52.343Z"
+      "last_updated": "2026-04-14T08:30:00.000Z"
     },
     "almajd-quran": {
       "stream_id": 1405,
@@ -44,7 +41,7 @@
         "https://live.seenshow.com/hls/live/2120829/LIVE-002-QURAN/3.m3u8"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-12T22:28:24.269Z"
+      "last_updated": "2026-03-21T17:33:47.143Z"
     },
     "almajd-kids": {
       "stream_id": 1413,
@@ -60,7 +57,7 @@
         "http://eg.ayyadonline.net:80/farouq20226/p3u0zbtd5g/77336"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:31.818Z"
+      "last_updated": "2026-03-21T17:29:41.111Z"
     },
     "almajd-3aamah": {
       "stream_id": 1404,
@@ -76,7 +73,7 @@
         "http://eg.ayyadonline.net:80/farouq30226/v7ol4yjret/201243"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:01.747Z"
+      "last_updated": "2026-03-21T17:23:32.001Z"
     },
     "natural": {
       "stream_id": 1403,
@@ -92,7 +89,7 @@
         "http://eg.ayyadonline.net:80/farouq40226/psvs6vyebv/77334"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:21.950Z"
+      "last_updated": "2026-03-21T17:52:14.446Z"
     },
     "daal": {
       "stream_id": 1409,
@@ -108,7 +105,7 @@
         "http://eg.ayyadonline.net:80/farouq150226/h09ewdpvos/1302163"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:01.889Z"
+      "last_updated": "2026-03-21T17:41:59.287Z"
     },
     "maassah": {
       "stream_id": 1414,
@@ -124,7 +121,7 @@
         "http://eg.ayyadonline.net:80/farouq13226/vv3qmkms2w/13058"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:11.905Z"
+      "last_updated": "2026-03-21T17:46:05.353Z"
     },
     "basmah": {
       "stream_id": 1412,
@@ -140,7 +137,7 @@
         "http://eg.ayyadonline.net:80/farouq50226/0fbyqin6jo/77338"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:51.862Z"
+      "last_updated": "2026-03-21T17:39:56.261Z"
     },
     "ajaweed": {
       "stream_id": 1408,
@@ -155,7 +152,7 @@
         "http://eg.ayyadonline.net:80/farouq60226/eqegh1wakb/1302160"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:02:51.718Z"
+      "last_updated": "2026-03-21T17:21:28.969Z"
     },
     "makkah": {
       "stream_id": 1421,
@@ -171,7 +168,7 @@
         "http://eg.ayyadonline.net:80/farouq70226/g7mt67ciwg/28179"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:11.913Z"
+      "last_updated": "2026-03-21T17:48:08.389Z"
     },
     "rawdah": {
       "stream_id": 1411,
@@ -187,7 +184,7 @@
         "http://eg.ayyadonline.net:80/farouq80226/o7dom2miwm/77333"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:31.978Z"
+      "last_updated": "2026-03-21T17:54:17.477Z"
     },
     "sunnah": {
       "stream_id": 1420,
@@ -219,7 +216,7 @@
         "http://eg.ayyadonline.net:80/farouq120226/xghg0kfpp8/170860"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:32.000Z"
+      "last_updated": "2026-03-21T17:56:20.497Z"
     },
     "arrahmah": {
       "stream_id": 357372,
@@ -234,7 +231,7 @@
         "http://eg.ayyadonline.net:80/farouq90226/5ah23gx7vk/28183"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:41.836Z"
+      "last_updated": "2026-03-21T17:37:53.233Z"
     },
     "almajd-islamic-science": {
       "stream_id": 357369,
@@ -250,7 +247,7 @@
         "http://eg.ayyadonline.net:80/farouq100226/9pfz609zql/1302162"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:21.802Z"
+      "last_updated": "2026-03-21T17:27:38.073Z"
     },
     "mekkah-quran": {
       "stream_id": 1438,
@@ -282,7 +279,7 @@
         "http://eg.ayyadonline.net:80/farouq190226/k977aq53gw/75516"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-10T15:42:29.446Z"
+      "last_updated": "2026-03-21T17:50:11.430Z"
     },
     "anees": {
       "stream_id": 360333,
@@ -298,7 +295,7 @@
         "https://www.youtube.com/channel/UClhc_0qfdQHMmiHRii5TOPA/live"
       ],
       "vlc_as_backup": false,
-      "last_updated": null
+      "last_updated": "2026-04-13T01:49:40.147Z"
     },
     "zaad": {
       "stream_id": 1434,
@@ -315,7 +312,7 @@
         "http://eg.ayyadonline.net:80/farouq200226/tqidc6qejy/77065"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:04:32.008Z"
+      "last_updated": "2026-04-14T06:51:44.869Z"
     },
     "almajd-documentary": {
       "stream_id": 1407,
@@ -331,7 +328,7 @@
         "http://eg.ayyadonline.net:80/farouq180226/r6vn4pcug5/77337"
       ],
       "vlc_as_backup": false,
-      "last_updated": "2026-02-22T20:03:11.774Z"
+      "last_updated": "2026-03-21T17:25:35.037Z"
     }
   }
 }

@@ -10,7 +10,6 @@ stream_url="http://vlc.news:80/658660392910/079449534451/357376"
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="http://eg.ayyadonline.net:80/farouq120226/xghg0kfpp8/170860"
 stream_url_backup2=""
-
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/uthaymeen/master.m3u8"

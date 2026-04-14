@@ -7,8 +7,9 @@
 stream_name="ssadtv.ddns.net"
 stream_url="https://ssadtv.ddns.net/live/saad/playlist.m3u8"
 
-# Backup URLs (optional) - leave empty if not available
-stream_url_backup1=""
+# Backup URLs (optional)
+# vlc.news carries "سعد الغامدي" as stream_id 1387
+stream_url_backup1="http://vlc.news:80/444180075026/066620053514/1387"
 stream_url_backup2=""
 
 stream_url_backup3=""

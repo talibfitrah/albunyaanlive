@@ -8,8 +8,11 @@ stream_name="034120793341/390247405461/1406"
 stream_url="http://vlc.news:80/034120793341/390247405461/1406"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="http://ts3.eagtop.vip:80/elkhatabi3/g2ng8pd5a5/2474"
-stream_url_backup2="http://ts3.eagtop.vip:80/live/elkhatabi3/g2ng8pd5a5/2474.m3u8"
+# eagtop backups died 2026-02-27 (HTTP 451). Cleared rather than left in
+# place so failover doesn't waste time on known-dead hosts. TODO: populate
+# with an ayyad URL and a vlc.news alternate-credential URL once available.
+stream_url_backup1=""
+stream_url_backup2=""
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/hadith-almajd/master.m3u8"

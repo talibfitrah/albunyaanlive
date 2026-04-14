@@ -14,9 +14,9 @@ stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/almajd-news/master.m3u8"
 stream_id="/var/www/html/stream/hls/almajd-news/master.m3u8"
-# NOTE: scale 4 uses h264_cuvid (GPU decode) which is strict and can hang on
-# corrupted/irregular transport streams. For Almajd News, prefer the more
-# error-tolerant software decode path (scale 9) to keep HLS output advancing.
+# NOTE: scale 4 uses GPU encode (NVENC) which can crash on mid-stream format
+# changes. For Almajd News, prefer the fully software decode/encode path
+# (scale 9) to keep HLS output advancing on irregular transport streams.
 scale=9
 
 # Build backup URL string (pipe-separated)
