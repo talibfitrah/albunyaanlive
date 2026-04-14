@@ -42,9 +42,14 @@ API="https://api.telegram.org/bot${OPERATOR_BOT_TOKEN}"
 reply() {
     local chat_id="$1"
     local text="$2"
-    curl -s --max-time 15 "${API}/sendMessage" \
+    local resp http_ok
+    resp=$(curl -s --max-time 15 "${API}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
-        --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+        --data-urlencode "text=${text}" 2>&1) || true
+    http_ok=$(printf '%s' "$resp" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print("yes" if d.get("ok") else "no")' 2>/dev/null || echo "parse-fail")
+    if [[ "$http_ok" != "yes" ]]; then
+        log "reply FAILED chat=$chat_id len=${#text} resp=$(printf '%s' "$resp" | head -c 200)"
+    fi
 }
 
 cmd_help() {
@@ -97,14 +102,17 @@ cmd_wake() {
 dispatch() {
     local chat_id="$1"
     local text="$2"
-    # Strip leading whitespace, take first token.
+    # First token after trim. Only respond to messages that start with
+    # "/" — casual chatter ("nice job", "thanks") stays silent instead of
+    # triggering an "Unknown command" nag.
     local cmd
     cmd=$(printf '%s' "$text" | awk '{print $1}')
     case "$cmd" in
-        /status|status)  reply "$chat_id" "$(cmd_status)" ;;
-        /wake|wake)      reply "$chat_id" "$(cmd_wake)" ;;
-        /help|help|/start) reply "$chat_id" "$(cmd_help)" ;;
-        *)               reply "$chat_id" "Unknown command. Try /help." ;;
+        /status)  reply "$chat_id" "$(cmd_status)" ;;
+        /wake)    reply "$chat_id" "$(cmd_wake)" ;;
+        /help|/start) reply "$chat_id" "$(cmd_help)" ;;
+        /*)       reply "$chat_id" "Unknown command. Try /help." ;;
+        *)        log "chatter from=$chat_id (ignored): $(printf '%s' "$text" | head -c 80)" ;;
     esac
 }
 
