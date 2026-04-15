@@ -235,6 +235,49 @@ else
     log_line "WARN brain returned invalid or missing new_state; prior state retained"
 fi
 
+# Apply any identity_updates the brain returned. Brain owns the
+# `identity_status` and `identity_checked_at` fields of each per-channel
+# state file; watcher reads them each cycle (see reflex/state.sh).
+REFLEX_STATE_DIR="${REFLEX_STATE_DIR:-/var/run/albunyaan/state}"
+echo "$JSON_DOC" | python3 -c "$(cat <<'PYEOF'
+import json, sys, os, time, fcntl
+
+state_dir = sys.argv[1]
+if not os.path.isdir(state_dir):
+    sys.exit(0)
+d = json.load(sys.stdin)
+updates = (d.get("identity_updates") or [])
+if not isinstance(updates, list):
+    sys.exit(0)
+
+now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+for u in updates:
+    ch = u.get("channel_id")
+    status = u.get("identity_status")
+    if not ch or status not in ("verified", "mismatch"):
+        continue
+    path = os.path.join(state_dir, f"{ch}.json")
+    lock = os.path.join(state_dir, f"{ch}.lock")
+    if not os.path.exists(path):
+        continue
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                s = json.load(f)
+            s["identity_status"] = status
+            s["identity_checked_at"] = now_iso
+            if status == "verified":
+                s["reverify_requested"] = False
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(s, f, indent=2)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+PYEOF
+)" "$REFLEX_STATE_DIR" || log_line "WARN identity_updates apply failed"
+
 # Post telegram messages, capped to TELEGRAM_MAX_MSGS_PER_WAKE (default 10).
 # A wide-incident wake (e.g. all 22 channels stalled) shouldn't spam 22+
 # pings. Anything beyond the cap is summarised in a footer pointing at the
