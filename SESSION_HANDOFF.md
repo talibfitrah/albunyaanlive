@@ -148,3 +148,30 @@ Rate-limit resilience, playability probe, and the 08:00 report are
 explicitly out of scope for this plan — they're spec §11 follow-ups.
 
 [NEW]
+
+## 2026-04-15 — /review pipeline landed 7 fixes, 2 memory-flagged bugs
+
+Ran gstack /review (code-reviewer + security + testing specialists +
+Claude adversarial subagent). Codex passes deferred due to the auth
+timeouts the user flagged. 6 commits on main since reflex-complete:
+
+| Commit    | Fix |
+|-----------|-----|
+| f164ab3   | wake.sh channel_id regex (path traversal); jq --arg everywhere in transitions.sh (6 injection sites closed); _push_transition latent injection; RuntimeDirectoryMode 0755→0750 (auth token leak); PID cmdline guard requires channel_id match |
+| 57cd5e8   | **Hyphenated channel glob** — 9/22 channels were silently inert. Registry.json lookup now primary, with glob + hyphen→underscore fallback |
+| 94fbc09   | probe_url 3-state return code; rc=2 for resolver schemes (elahmad:/aloula:/seenshow:/youtube:) and RFC1918/loopback; transitions.sh primary-probe sites handle rc=2 as "no info, advance timer" |
+| bd45373   | **Circuit-breaker persistence** — /var/lib/albunyaan sticky sidecar via systemd StateDirectory; state_init rehydrates DEGRADED on first-create (24h TTL); survives tmpfs wipe + crash loops |
+| ec16a20   | test_signals.sh (6 tests, decoy-PID harness); 3 new state.sh edge-case tests; state_init now uses `[[ -s ]]` + explicit type-check (uncovered an actual bug on zero-byte files) |
+
+**Two bugs surfaced via memory updates (not by the review pipeline itself):**
+- `feedback_reflex_channel_id_glob` — 9 channels silently excluded from state machine; fixed by 57cd5e8.
+- `feedback_probe_url_http_only` — Makkah primary elahmad:makkahtv climbed `consecutive_failures=9` while the real pipeline was fine; fixed by 94fbc09.
+
+**Deferred (documented in-code or as comments, not blocking):**
+- Bash signal-trap queuing behind foreground ffmpeg (red-team, conf 7) — architectural; needs ack mechanism; grace windows mostly absorb the lag today.
+- Signal overwrite race on rapid back-to-back swaps (red-team, conf 7) — latest-wins IS correct for state targeting; doc comment added in signals.sh.
+- wake.sh identity_updates unit test; transitions.sh integration gaps (BACKUP→LIVE, excluded-skip, backoff); try_start_stream.sh reflex handler runtime test.
+
+**Operator's deploy gate unchanged** — Steps B (restart supervisors) and C (flip REFLEX_DRY_RUN=0) still pending.
+
+[NEW]
