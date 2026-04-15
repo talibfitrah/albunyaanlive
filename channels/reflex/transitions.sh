@@ -24,12 +24,12 @@ _count_recent_transitions() {
 # _push_transition <channel_id> <from> <to> <reason>
 _push_transition() {
     local ch="$1" from="$2" to="$3" reason="$4"
-    local now; now=$(date +%s)
-    state_modify "$ch" "
-      .transition_history += [{at: \"$now\", from: \"$from\", to: \"$to\", reason: \"$reason\"}]
+    local now last; now=$(date +%s); last=$(date -Iseconds)
+    state_modify "$ch" '
+      .transition_history += [{at: $at, from: $from, to: $to, reason: $reason}]
       | .transition_history |= (if length > 50 then .[-50:] else . end)
-      | .last_transition = \"$(date -Iseconds)\"
-    "
+      | .last_transition = $last
+    ' --arg at "$now" --arg from "$from" --arg to "$to" --arg reason "$reason" --arg last "$last"
 }
 
 # _iso_plus <seconds>   → now + N seconds in ISO8601
@@ -115,30 +115,37 @@ _handle_slate() {
             succ=$(( succ + 1 ))
             if (( succ >= 2 )); then
                 _push_transition "$ch" "SLATE" "LIVE" "primary_recovered"
+                local now_iso grace_iso
+                now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
                 state_modify "$ch" '
                   .state = "LIVE"
-                  | .current_source_url = "'"$primary_url"'"
+                  | .current_source_url = $url
                   | .current_source_role = "primary"
-                  | .grace_until = "'"$(_iso_plus 30)"'"
-                  | .primary_probe = {last_attempt:"'"$(_iso_plus 0)"'",consecutive_failures:0,consecutive_successes:0,next_attempt_after:"'"$(_iso_plus 0)"'"}
+                  | .grace_until = $grace
+                  | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
                   | .excluded_backups = []
                   | .reverify_requested = false
-                '
+                ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
                 echo "SIGNAL:swap:$ch:$primary_url"
                 return
             else
-                state_modify "$ch" ".primary_probe.consecutive_successes = $succ | .primary_probe.last_attempt = \"$(_iso_plus 0)\""
+                local now_iso; now_iso=$(_iso_plus 0)
+                state_modify "$ch" '
+                  .primary_probe.consecutive_successes = ($n | tonumber)
+                  | .primary_probe.last_attempt = $now
+                ' --arg n "$succ" --arg now "$now_iso"
             fi
         else
             local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
             fail=$(( fail + 1 ))
             local delay; delay=$(backoff_delay "$fail")
-            state_modify "$ch" "
-              .primary_probe.consecutive_failures = $fail
+            local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
+            state_modify "$ch" '
+              .primary_probe.consecutive_failures = ($f | tonumber)
               | .primary_probe.consecutive_successes = 0
-              | .primary_probe.last_attempt = \"$(_iso_plus 0)\"
-              | .primary_probe.next_attempt_after = \"$(_iso_plus $delay)\"
-            "
+              | .primary_probe.last_attempt = $now
+              | .primary_probe.next_attempt_after = $next
+            ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso"
         fi
     fi
 
@@ -155,13 +162,14 @@ _handle_slate() {
     fi
     if probe_url "$url" 2; then
         _push_transition "$ch" "SLATE" "BACKUP" "backup_probe_ok"
+        local grace_iso; grace_iso=$(_iso_plus 30)
         state_modify "$ch" '
           .state = "BACKUP"
-          | .current_source_url = "'"$url"'"
+          | .current_source_url = $url
           | .current_source_role = "backup"
-          | .grace_until = "'"$(_iso_plus 30)"'"
+          | .grace_until = $grace
           | .slate_retry_count = 0
-        '
+        ' --arg url "$url" --arg grace "$grace_iso"
         echo "SIGNAL:swap:$ch:$url"
     fi
 }
@@ -174,14 +182,14 @@ _handle_backup() {
     # Identity mismatch on the current BACKUP → exclude it, slate
     if [[ "$identity_status" == "mismatch" && "$in_grace" == "0" ]]; then
         _push_transition "$ch" "BACKUP" "SLATE" "identity_mismatch"
-        state_modify "$ch" "
-          .state = \"SLATE\"
-          | .excluded_backups += [\"$cur_url\"]
+        state_modify "$ch" '
+          .state = "SLATE"
+          | .excluded_backups += [$cur]
           | .current_source_url = null
           | .current_source_role = null
           | .reverify_requested = true
           | .slate_retry_count = 0
-        "
+        ' --arg cur "$cur_url"
         echo "SIGNAL:slate:$ch"
         return
     fi
@@ -190,13 +198,13 @@ _handle_backup() {
         is_output_fresh "$hls_dir" 10
         if [[ $? -eq 1 ]]; then
             _push_transition "$ch" "BACKUP" "SLATE" "backup_stale"
-            state_modify "$ch" "
-              .state = \"SLATE\"
-              | .excluded_backups += [\"$cur_url\"]
+            state_modify "$ch" '
+              .state = "SLATE"
+              | .excluded_backups += [$cur]
               | .current_source_url = null
               | .current_source_role = null
               | .slate_retry_count = 0
-            "
+            ' --arg cur "$cur_url"
             echo "SIGNAL:slate:$ch"
             return
         fi
@@ -211,29 +219,36 @@ _handle_backup() {
             succ=$(( succ + 1 ))
             if (( succ >= 2 )); then
                 _push_transition "$ch" "BACKUP" "LIVE" "primary_recovered"
+                local now_iso grace_iso
+                now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
                 state_modify "$ch" '
                   .state = "LIVE"
-                  | .current_source_url = "'"$primary_url"'"
+                  | .current_source_url = $url
                   | .current_source_role = "primary"
-                  | .grace_until = "'"$(_iso_plus 30)"'"
-                  | .primary_probe = {last_attempt:"'"$(_iso_plus 0)"'",consecutive_failures:0,consecutive_successes:0,next_attempt_after:"'"$(_iso_plus 0)"'"}
+                  | .grace_until = $grace
+                  | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
                   | .excluded_backups = []
                   | .reverify_requested = false
-                '
+                ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
                 echo "SIGNAL:swap:$ch:$primary_url"
             else
-                state_modify "$ch" ".primary_probe.consecutive_successes = $succ | .primary_probe.last_attempt = \"$(_iso_plus 0)\""
+                local now_iso; now_iso=$(_iso_plus 0)
+                state_modify "$ch" '
+                  .primary_probe.consecutive_successes = ($n | tonumber)
+                  | .primary_probe.last_attempt = $now
+                ' --arg n "$succ" --arg now "$now_iso"
             fi
         else
             local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
             fail=$(( fail + 1 ))
             local delay; delay=$(backoff_delay "$fail")
-            state_modify "$ch" "
-              .primary_probe.consecutive_failures = $fail
+            local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
+            state_modify "$ch" '
+              .primary_probe.consecutive_failures = ($f | tonumber)
               | .primary_probe.consecutive_successes = 0
-              | .primary_probe.last_attempt = \"$(_iso_plus 0)\"
-              | .primary_probe.next_attempt_after = \"$(_iso_plus $delay)\"
-            "
+              | .primary_probe.last_attempt = $now
+              | .primary_probe.next_attempt_after = $next
+            ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso"
         fi
     fi
 }

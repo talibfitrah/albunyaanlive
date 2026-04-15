@@ -61,18 +61,24 @@ state_read_field() {
     jq -r "$expr" "$path" 2>/dev/null
 }
 
-# state_modify <channel_id> <jq_expr>
+# state_modify <channel_id> <jq_expr> [jq args...]
 # Applies the jq expression to the state file under flock. Atomic via
-# temp-file-then-rename.
+# temp-file-then-rename. Extra arguments are passed through to jq —
+# use --arg/--argjson pairs to inject untrusted values (URLs, reasons,
+# channel IDs, etc.) WITHOUT splicing them into the jq program text.
+# Example:
+#   state_modify "$ch" '.current_source_url = $u' --arg u "$url"
 state_modify() {
-    local ch="$1" expr="$2" path lock tmp
+    local ch="$1" expr="$2"
+    shift 2
+    local path lock tmp
     path=$(_state_path "$ch"); lock=$(_state_lock "$ch")
     mkdir -p "$STATE_DIR"
     exec 200>"$lock"
     flock -x 200
     [[ -f "$path" ]] || _state_default_json "$ch" > "$path"
     tmp="${path}.tmp.$$"
-    if ! jq "$expr" "$path" > "$tmp"; then
+    if ! jq "$@" "$expr" "$path" > "$tmp"; then
         rm -f "$tmp"
         exec 200>&-
         return 1

@@ -240,7 +240,12 @@ fi
 # state file; watcher reads them each cycle (see reflex/state.sh).
 REFLEX_STATE_DIR="${REFLEX_STATE_DIR:-/var/run/albunyaan/state}"
 echo "$JSON_DOC" | python3 -c "$(cat <<'PYEOF'
-import json, sys, os, time, fcntl
+import json, sys, os, re, time, fcntl
+
+# channel_id must be a plain basename. The brain is semi-trusted but its
+# input (prompt commit messages, telegram, etc.) can carry adversarial
+# strings — "../../etc/something" would otherwise escape the state dir.
+CH_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
 state_dir = sys.argv[1]
 if not os.path.isdir(state_dir):
@@ -252,29 +257,35 @@ if not isinstance(updates, list):
 
 now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 for u in updates:
-    ch = u.get("channel_id")
-    status = u.get("identity_status")
-    if not ch or status not in ("verified", "mismatch"):
-        continue
-    path = os.path.join(state_dir, f"{ch}.json")
-    lock = os.path.join(state_dir, f"{ch}.lock")
-    if not os.path.exists(path):
-        continue
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            with open(path) as f:
-                s = json.load(f)
-            s["identity_status"] = status
-            s["identity_checked_at"] = now_iso
-            if status == "verified":
-                s["reverify_requested"] = False
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(s, f, indent=2)
-            os.replace(tmp, path)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    try:
+        ch = u.get("channel_id") if isinstance(u, dict) else None
+        status = u.get("identity_status") if isinstance(u, dict) else None
+        if not ch or not CH_RE.fullmatch(str(ch)):
+            continue
+        if status not in ("verified", "mismatch"):
+            continue
+        path = os.path.join(state_dir, f"{ch}.json")
+        lock = os.path.join(state_dir, f"{ch}.lock")
+        if not os.path.exists(path):
+            continue
+        with open(lock, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                with open(path) as f:
+                    s = json.load(f)
+                s["identity_status"] = status
+                s["identity_checked_at"] = now_iso
+                if status == "verified":
+                    s["reverify_requested"] = False
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(s, f, indent=2)
+                os.replace(tmp, path)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception as e:
+        # Per-entry isolation: one bad update shouldn't drop the rest.
+        print(f"identity_update error ch={u!r}: {type(e).__name__}: {e}", file=sys.stderr)
 PYEOF
 )" "$REFLEX_STATE_DIR" || log_line "WARN identity_updates apply failed"
 

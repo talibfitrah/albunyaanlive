@@ -9,7 +9,10 @@ User=msa
 Group=msa
 WorkingDirectory=/home/msa/Development/scripts/albunyaan/channels
 RuntimeDirectory=albunyaan
-RuntimeDirectoryMode=0755
+# 0750: target_url files in cmd/ carry provider auth tokens (Xtream,
+# seenshow, signed CDN URLs). Restrict world read while preserving group
+# access for any future same-group sidecar tools.
+RuntimeDirectoryMode=0750
 ExecStartPre=/home/msa/Development/scripts/albunyaan/channels/reflex/preflight.sh
 ExecStart=/home/msa/Development/scripts/albunyaan/channels/reflex_watcher.sh
 Restart=always
