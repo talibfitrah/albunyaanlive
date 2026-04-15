@@ -13,6 +13,12 @@ RuntimeDirectory=albunyaan
 # seenshow, signed CDN URLs). Restrict world read while preserving group
 # access for any future same-group sidecar tools.
 RuntimeDirectoryMode=0750
+# CRITICAL: preserve PID files across watcher restarts. Without this,
+# every `systemctl restart albunyaan-watcher` wipes /var/run/albunyaan/pid/,
+# and supervisors only write their PID once at startup. Signal dispatch
+# then fails with "dispatch FAILED: PID file missing?" until every
+# supervisor is restarted. Observed live 2026-04-16 00:07 CEST.
+RuntimeDirectoryPreserve=yes
 # Persistent sidecar for "sticky" reflex state that must survive tmpfs
 # wipes (e.g. circuit-breaker DEGRADED). /var/lib/albunyaan is backed
 # by disk, not tmpfs, so a systemd Restart=always crash loop can't
