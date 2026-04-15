@@ -350,13 +350,92 @@ log_anomalies() {
     disk_hls=$(disk_pct "$HLS_ROOT"); [[ -n "$disk_hls"  && "$(classify_pct "$disk_hls"  "$DISK_WARN" "$DISK_CRIT")"  != "healthy" ]] && log "disk_hls_pct=$disk_hls"
 }
 
-log "reflex_watcher started (interval=${INTERVAL}s, stall_warn=${STALL_WARN}s, stall_crit=${STALL_CRIT}s)"
 trap 'log "reflex_watcher stopping"; exit 0' INT TERM
+
+# ---------------------------------------------------------------------------
+# Reflex loop — Phase 3 dry-run mode.
+# When REFLEX_DRY_RUN=1 (default during rollout), the state machine runs
+# but signals are logged only, not dispatched to try_start_stream.
+# ---------------------------------------------------------------------------
+
+REFLEX_DRY_RUN="${REFLEX_DRY_RUN:-1}"
+REFLEX_LIB_DIR="$(dirname "${BASH_SOURCE[0]}")/reflex"
+if [[ -d "$REFLEX_LIB_DIR" ]]; then
+    # shellcheck source=reflex/state.sh
+    source "$REFLEX_LIB_DIR/state.sh"
+    # shellcheck source=reflex/freshness.sh
+    source "$REFLEX_LIB_DIR/freshness.sh"
+    # shellcheck source=reflex/backoff.sh
+    source "$REFLEX_LIB_DIR/backoff.sh"
+    # shellcheck source=reflex/probe.sh
+    source "$REFLEX_LIB_DIR/probe.sh"
+    # shellcheck source=reflex/transitions.sh
+    source "$REFLEX_LIB_DIR/transitions.sh"
+    REFLEX_ENABLED=1
+else
+    REFLEX_ENABLED=0
+fi
+
+STATE_DIR="${STATE_DIR:-/var/run/albunyaan/state}"
+
+# Build channel config JSON once per cycle from channel_*.sh configs.
+# Today's configs export stream_url, stream_url_backup{1,2,3}.
+_channel_cfg_json() {
+    local ch="$1" script_dir="$2"
+    local script; script=$(ls "$script_dir"/channel_"$ch"*.sh 2>/dev/null | head -1)
+    [[ -z "$script" ]] && { echo ""; return; }
+    local primary backups=()
+    primary=$(grep -E '^stream_url=' "$script" | head -1 | sed -E 's/^stream_url="([^"]*)".*/\1/')
+    for i in 1 2 3; do
+        local v
+        v=$(grep -E "^stream_url_backup${i}=" "$script" | head -1 | sed -E 's/^[^=]+="([^"]*)".*/\1/')
+        [[ -n "$v" ]] && backups+=("$v")
+    done
+    local backups_json="[]"
+    if (( ${#backups[@]} > 0 )); then
+        backups_json=$(printf '%s\n' "${backups[@]}" | jq -R . | jq -sc .)
+    fi
+    jq -n \
+        --arg id "$ch" \
+        --arg p "$primary" \
+        --argjson b "$backups_json" \
+        --arg d "$HLS_ROOT/$ch" \
+        '{channel_id:$id, primary_url:$p, backup_urls:$b, hls_dir:$d}'
+}
+
+_reflex_cycle() {
+    [[ "$REFLEX_ENABLED" == "1" ]] || return 0
+    mkdir -p "$STATE_DIR"
+    local script_dir; script_dir="$(dirname "${BASH_SOURCE[0]}")"
+    local now; now=$(date +%s)
+    for dir in "$HLS_ROOT"/*/; do
+        local ch; ch=$(basename "$dir")
+        [[ "$ch" == "slate" ]] && continue
+        local cfg; cfg=$(_channel_cfg_json "$ch" "$script_dir")
+        [[ -z "$cfg" ]] && continue
+        state_init "$ch"
+        local state_blob; state_blob=$(cat "$(state_path_for "$ch")")
+        local actions; actions=$(next_state "$cfg" "$state_blob" "$now")
+        if [[ -n "$actions" ]]; then
+            while IFS= read -r line; do
+                if [[ "$REFLEX_DRY_RUN" == "1" ]]; then
+                    log "reflex(dry-run) $line"
+                else
+                    log "reflex $line"
+                    # Phase 5 will wire real dispatch here.
+                fi
+            done <<<"$actions"
+        fi
+    done
+}
+
+log "reflex_watcher started (interval=${INTERVAL}s, stall_warn=${STALL_WARN}s, stall_crit=${STALL_CRIT}s, reflex_enabled=$REFLEX_ENABLED, dry_run=$REFLEX_DRY_RUN)"
 
 while true; do
     emit_state
     log_anomalies
     check_alerts
+    _reflex_cycle
     TICK_COUNT=$((TICK_COUNT + 1))
     sleep "$INTERVAL"
 done
