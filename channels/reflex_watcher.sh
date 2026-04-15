@@ -408,7 +408,7 @@ _channel_cfg_json() {
 _reflex_cycle() {
     [[ "$REFLEX_ENABLED" == "1" ]] || return 0
     mkdir -p "$STATE_DIR"
-    local script_dir; script_dir="$(dirname "${BASH_SOURCE[0]}")"
+    local script_dir; script_dir="${CHANNEL_CONFIG_DIR:-$(dirname "${BASH_SOURCE[0]}")}"
     local now; now=$(date +%s)
     for dir in "$HLS_ROOT"/*/; do
         local ch; ch=$(basename "$dir")
