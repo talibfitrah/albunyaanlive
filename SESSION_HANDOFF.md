@@ -191,3 +191,31 @@ All three gates before `REFLEX_DRY_RUN=0`:
 Operational facts discovered tonight that the original deploy plan didn't capture are in `docs/reflex-deploy-notes.md` (privilege model, PGID trap in restart, Step C checklist, rollback).
 
 [NEW]
+
+## 2026-04-16 00:00 CEST — REFLEX LOOP LIVE (REFLEX_DRY_RUN=0)
+
+All four gates complete:
+- Step A (unit + dirs) ✅
+- Privilege bridge ✅
+- Step B (fleet restart + PID files) ✅
+- **Step C (dispatch live) ✅** via drop-in `/etc/systemd/system/albunyaan-watcher.service.d/reflex-dispatch.conf`
+
+Pre-flip fix needed: probe retry (commit `38ee592`). The 2 s single-shot HTTP probe hit ~5% transient failure against vlc.news and was causing a persistent ~3/22 channels to oscillate in spurious SLATE. Retry-once stabilized the flap; post-retry soak showed 22/22 LIVE and zero dispatches (fleet is actually healthy).
+
+At `T+90s` post-flip:
+- state_distribution: 22 LIVE
+- signals dispatched: 0
+- dispatch failures: 0
+- watcher NRestarts: 0
+- fleet fresh (<15s): 22/22
+
+Next real stale event will trigger actual `kill -USR1`/`-USR2` delivery through the sudo bridge. No supervisor signal has fired yet in production.
+
+**Rollback if anything goes wrong:**
+```bash
+SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl revert albunyaan-watcher
+SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl restart albunyaan-watcher
+```
+Channels continue running independently; only dispatch stops.
+
+[NEW]
