@@ -256,6 +256,44 @@ a kids channel is: sub-agent returns mismatch + logo_detected=true
 For a `slate` verdict where `prior_state.channel_history[id]`
 shows slate accumulating across wakes, open or escalate an incident.
 
+### 6a. Identity handoff to the reflex watcher
+
+For every channel you ran a visual sub-agent on, emit an entry in the
+top-level `identity_updates` array of your JSON output:
+
+```json
+{"channel_id": "<id>", "identity_status": "verified" | "mismatch"}
+```
+
+Rules:
+
+- `verified` — logo matched (or no logo visible for a kids channel with
+  correct genre-implied content per existing rules). Always include
+  this — the watcher uses it to clear `reverify_requested`.
+- `mismatch` — logo clearly belongs to a different channel. This flips
+  the watcher into SLATE + backup-walk within ≤15 s of the wake finishing.
+- `slate`, `blackframe`, `unknown` — DO NOT include in
+  `identity_updates`. These verdicts are informational only; the watcher
+  only acts on a confident verified/mismatch signal.
+
+Priority selection for visual sub-agents this wake (replaces the
+existing rotation — still capped at 4):
+
+1. Channels whose last-known state file has `identity_status == "mismatch"`.
+2. Channels whose last-known state file has `reverify_requested == true`.
+3. Channels whose `prior_state.channel_history[id].last_visual_verdict`
+   is not `match`.
+4. Channels whose `last_visual_ts` is > 6 h old.
+5. Routine rotation.
+
+**Skip channels whose state file has `state != "LIVE"`.** Checking a
+SLATE or BACKUP channel would flag slate/backup content as mismatch —
+false positives that would cascade the reflex loop. Record the skip in
+`wake_summary`.
+
+Read the per-channel state files at `/var/run/albunyaan/state/<id>.json`
+before selecting. Use the `cat` tool (allowed by BASH_ALLOWLIST).
+
 ### 7. Security and code-review pass
 
 Read `<<<NEW_COMMITS>>>` (inline below). For each commit since the
@@ -375,6 +413,10 @@ matching this shape (no trailing prose, no code fences):
   // (low-risk). `graceful_restart` and `extra_disk_cleanup` are LOGGED
   // for the user to act on — the wrapper does NOT touch live streams.
   // List channels you'd recommend restarting; the user/operator decides.
+  "identity_updates": [
+    {"channel_id": "basmah", "identity_status": "verified"},
+    {"channel_id": "anees",  "identity_status": "mismatch"}
+  ],
   "telegram_messages": [
     {"severity": "severe", "en": "User-facing English", "ar": "نص عربي للزميل"},
     {"severity": "warn",   "en": "User-facing English", "ar": ""},
