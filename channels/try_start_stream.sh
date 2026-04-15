@@ -808,7 +808,6 @@ on_term() {
 }
 
 trap on_term TERM INT
-trap cleanup EXIT
 
 # Acquire lock (atomic using mkdir), unless handoff explicitly requests lock adoption.
 lock_adopted=0
@@ -899,7 +898,7 @@ REFLEX_PID_DIR="${REFLEX_PID_DIR:-/var/run/albunyaan/pid}"
 mkdir -p "$REFLEX_PID_DIR" 2>/dev/null || true
 REFLEX_PID_FILE="$REFLEX_PID_DIR/${channel_id}.pid"
 echo $$ > "$REFLEX_PID_FILE" 2>/dev/null || log_error "Could not write PID file $REFLEX_PID_FILE"
-trap 'rm -f "$REFLEX_PID_FILE"' EXIT
+trap 'cleanup; rm -f "$REFLEX_PID_FILE"' EXIT
 
 # =============================================================================
 # Reflex signal handlers — watcher may send SIGUSR1 (enter slate) or
@@ -907,6 +906,7 @@ trap 'rm -f "$REFLEX_PID_FILE"' EXIT
 # =============================================================================
 reflex_force_slate=0
 reflex_target_url=""
+reflex_sigusr2_pending=0
 REFLEX_CMD_DIR="${REFLEX_CMD_DIR:-/var/run/albunyaan/cmd}"
 
 _read_reflex_target_url() {
@@ -917,7 +917,7 @@ _read_reflex_target_url() {
 }
 
 trap 'reflex_force_slate=1; log "REFLEX: SIGUSR1 received — will enter slate on next loop iteration"' USR1
-trap 'reflex_force_slate=0; reflex_target_url=$(_read_reflex_target_url); log "REFLEX: SIGUSR2 received — will switch to URL: $reflex_target_url"' USR2
+trap 'reflex_force_slate=0; reflex_sigusr2_pending=1; log "REFLEX: SIGUSR2 received — will read target URL on next loop iteration"' USR2
 
 # =============================================================================
 # Build URL array (primary + backups) with YouTube URL support
@@ -4411,6 +4411,13 @@ while true; do
         fi
         sleep 1
         continue
+    fi
+
+    # Process pending SIGUSR2: read the target URL from cmd file outside
+    # the signal handler to avoid subshell-in-handler race.
+    if (( reflex_sigusr2_pending == 1 )); then
+        reflex_sigusr2_pending=0
+        reflex_target_url=$(_read_reflex_target_url)
     fi
 
     # Reflex handover: if watcher signalled a specific target URL, stop
