@@ -1,0 +1,47 @@
+#!/bin/bash
+# channels/reflex/albunyaan-signal
+# Privilege-bridge helper: lets the reflex watcher (user msa) deliver
+# SIGUSR1/SIGUSR2 to channel supervisor processes owned by root.
+#
+# Installed at /usr/local/bin/albunyaan-signal (root:root, 0755).
+# Sudoers rule (/etc/sudoers.d/albunyaan-reflex) allows msa to run it
+# via sudo -n without a password, scoped to USR1/USR2 only.
+#
+# Usage (invoked by signals.sh, not humans):
+#     albunyaan-signal USR1 <pid> <channel_id>
+#     albunyaan-signal USR2 <pid> <channel_id>
+#
+# Safety: the wrapper re-validates its arguments AFTER crossing the
+# privilege boundary (defense in depth — don't trust the caller even
+# though sudoers already restricts the argv pattern).
+#   - signal must be exactly USR1 or USR2
+#   - pid must be a positive integer
+#   - channel_id must match ^[A-Za-z0-9_-]+$
+#   - /proc/<pid>/cmdline MUST contain BOTH "try_start_stream" AND the
+#     channel_id before the signal is sent. Without both, we refuse —
+#     this mirrors the unprivileged _pid_is_try_start_stream() in
+#     signals.sh and prevents a bogus caller from killing arbitrary
+#     root processes via SIGUSR1/2.
+#
+# Return codes:
+#   0 = signal sent
+#   1 = target PID gone / cmdline guard failed
+#   2 = malformed arguments
+set -u
+
+sig="${1:-}"
+pid="${2:-}"
+ch="${3:-}"
+
+case "$sig" in USR1|USR2) ;; *) exit 2 ;; esac
+[[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 2
+[[ "$ch"  =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+
+cmdline_file="/proc/$pid/cmdline"
+[[ -r "$cmdline_file" ]] || exit 1
+
+cmdline=$(tr '\0' ' ' < "$cmdline_file" 2>/dev/null) || exit 1
+[[ "$cmdline" == *try_start_stream* ]] || exit 1
+[[ "$cmdline" == *"$ch"* ]] || exit 1
+
+exec kill "-$sig" "$pid"

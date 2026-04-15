@@ -1,9 +1,23 @@
 #!/bin/bash
 # channels/reflex/signals.sh
 # Send reflex control signals to a channel's try_start_stream.sh supervisor.
+#
+# Production note: channel supervisors run as root (launched by
+# restart.sh from root's crontab), while the reflex watcher runs as
+# user msa. User msa cannot signal root processes (EPERM). To bridge
+# that gap, a small privileged helper at /usr/local/bin/albunyaan-signal
+# is invoked via sudoers NOPASSWD (see /etc/sudoers.d/albunyaan-reflex).
+# The helper re-validates cmdline inside the privileged context so it
+# can't be abused to signal arbitrary root processes.
+#
+# _deliver_signal() tries direct kill first — that path stays zero-cost
+# when the supervisor and watcher share a UID (E2E tests, future refactor
+# where supervisors drop privilege). Falls back to the sudo wrapper only
+# on EPERM.
 
 REFLEX_PID_DIR="${REFLEX_PID_DIR:-/var/run/albunyaan/pid}"
 REFLEX_CMD_DIR="${REFLEX_CMD_DIR:-/var/run/albunyaan/cmd}"
+REFLEX_PRIV_HELPER="${REFLEX_PRIV_HELPER:-/usr/local/bin/albunyaan-signal}"
 
 # _pid_for <channel_id>
 _pid_for() {
@@ -30,12 +44,31 @@ _pid_is_try_start_stream() {
     return 0
 }
 
+# _deliver_signal <signal> <pid> <channel_id>
+# Tries `kill` directly first; if EPERM (UID mismatch: watcher is msa,
+# supervisor is root), falls back to the sudo-gated privilege helper.
+# Returns 0 on success, 1 on any failure.
+_deliver_signal() {
+    local sig="$1" pid="$2" ch="$3"
+    # Direct path: works when caller and target share a UID.
+    if kill "-$sig" "$pid" 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: privilege bridge. sudo -n fails fast if the rule is
+    # missing rather than prompting; the helper re-validates cmdline.
+    if [[ -x "$REFLEX_PRIV_HELPER" ]]; then
+        sudo -n "$REFLEX_PRIV_HELPER" "$sig" "$pid" "$ch" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
 # send_slate_signal <channel_id>    → SIGUSR1 (enter slate)
 send_slate_signal() {
     local ch="$1" pid
     pid=$(_pid_for "$ch") || return 1
     _pid_is_try_start_stream "$pid" "$ch" || return 1
-    kill -USR1 "$pid" 2>/dev/null
+    _deliver_signal USR1 "$pid" "$ch"
 }
 
 # send_resume_signal <channel_id> <target_url>
@@ -58,7 +91,7 @@ send_resume_signal() {
     local tmp="$REFLEX_CMD_DIR/$ch.target_url.tmp"
     local dst="$REFLEX_CMD_DIR/$ch.target_url"
     printf '%s\n' "$target_url" > "$tmp" && mv -f "$tmp" "$dst"
-    kill -USR2 "$pid" 2>/dev/null
+    _deliver_signal USR2 "$pid" "$ch"
 }
 
 # dispatch_signal <SIGNAL line from transitions.sh>
