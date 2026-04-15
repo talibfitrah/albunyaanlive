@@ -27,20 +27,23 @@ _pid_for() {
 }
 
 # _pid_is_try_start_stream <pid> <channel_id>
-# Returns 0 iff the PID's cmdline contains BOTH "try_start_stream" and the
-# given channel_id. Guards against two failure modes:
-#   1. PID reuse by an unrelated process (stale PID file).
-#   2. PID reuse by a try_start_stream process for a DIFFERENT channel —
-#      without the channel_id check, SIGUSR1 would hit the wrong channel.
-# try_start_stream.sh's argv always includes -d .../<channel_id>/master.m3u8
-# and -n <channel_id>, so substring match on channel_id is reliable.
+# Returns 0 iff the PID is running a try_start_stream supervisor for the
+# given channel_id. The channel_id match MUST be anchored to the
+# supervisor's argv tokens (`-d .../<ch>/master.m3u8` or `-n <ch>`);
+# a bare substring check would let the guard pass for any supervisor
+# whose cmdline contains "$ch" as a substring — e.g. a hypothetical
+# channel called "almajd" would match any of almajd-kids, hadith-almajd,
+# almajd-3aamah, mekkah-quran (contains "quran"), etc. (review round 2,
+# 2026-04-16 security + red-team, conf 9).
 _pid_is_try_start_stream() {
     local pid="$1" ch="$2" cmdline_file="/proc/$1/cmdline"
     [[ -r "$cmdline_file" ]] || return 1
     local cmdline
     cmdline=$(tr '\0' ' ' < "$cmdline_file" 2>/dev/null) || return 1
     [[ "$cmdline" == *try_start_stream* ]] || return 1
-    [[ "$cmdline" == *"$ch"* ]] || return 1
+    # Anchor to argv tokens. try_start_stream.sh always receives both
+    # -d .../<ch>/master.m3u8 AND -n <ch>; either anchor is sufficient.
+    [[ "$cmdline" == *"/hls/$ch/master.m3u8"* || "$cmdline" == *" -n $ch "* ]] || return 1
     return 0
 }
 
@@ -48,6 +51,10 @@ _pid_is_try_start_stream() {
 # Tries `kill` directly first; if EPERM (UID mismatch: watcher is msa,
 # supervisor is root), falls back to the sudo-gated privilege helper.
 # Returns 0 on success, 1 on any failure.
+#
+# Prints a one-line diagnostic to stderr per boot (not per call) when
+# the privilege helper is missing — operator otherwise sees generic
+# "dispatch FAILED" and spends time chasing the wrong cause.
 _deliver_signal() {
     local sig="$1" pid="$2" ch="$3"
     # Direct path: works when caller and target share a UID.
@@ -59,6 +66,10 @@ _deliver_signal() {
     if [[ -x "$REFLEX_PRIV_HELPER" ]]; then
         sudo -n "$REFLEX_PRIV_HELPER" "$sig" "$pid" "$ch" 2>/dev/null
         return $?
+    fi
+    if [[ "${_REFLEX_HELPER_MISSING_WARNED:-0}" != "1" ]]; then
+        echo "reflex: privilege helper not executable: $REFLEX_PRIV_HELPER" >&2
+        _REFLEX_HELPER_MISSING_WARNED=1
     fi
     return 1
 }

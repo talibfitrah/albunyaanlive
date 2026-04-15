@@ -42,6 +42,9 @@ cmdline_file="/proc/$pid/cmdline"
 
 cmdline=$(tr '\0' ' ' < "$cmdline_file" 2>/dev/null) || exit 1
 [[ "$cmdline" == *try_start_stream* ]] || exit 1
-[[ "$cmdline" == *"$ch"* ]] || exit 1
+# Anchor channel_id to argv tokens (same guard as signals.sh _pid_is_try_start_stream).
+# Bare substring match let shorter channel ids spuriously match longer
+# ones (e.g. "almajd" would match "almajd-kids").
+[[ "$cmdline" == *"/hls/$ch/master.m3u8"* || "$cmdline" == *" -n $ch "* ]] || exit 1
 
 exec kill "-$sig" "$pid"

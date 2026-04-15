@@ -413,15 +413,39 @@ _resolve_channel_script() {
 
 # Build channel config JSON once per cycle from channel_*.sh configs.
 # Today's configs export stream_url, stream_url_backup{1,2,3}.
+#
+# _valid_stream_url guards against the grep+sed extraction falling
+# through to garbage when the source line is malformed (empty value,
+# unquoted value, the sed pattern doesn't match → it returns the
+# literal input line which then flows into probe_url as a URL).
+_valid_stream_url() {
+    # Must match one of the schemes the pipeline actually supports.
+    # Rejects empty string, any string containing whitespace, and the
+    # literal pattern left behind when the sed extraction fails.
+    local u="$1"
+    [[ -n "$u" ]] || return 1
+    case "$u" in
+        *[[:space:]]*) return 1 ;;
+        *=*) return 1 ;;  # literal "stream_url=…" would contain '='
+    esac
+    case "$u" in
+        http://*|https://*|rtmp://*|rtsp://*|elahmad:*|aloula:*|seenshow:*|youtube:*|youtube://*) return 0 ;;
+    esac
+    return 1
+}
+
 _channel_cfg_json() {
     local ch="$1" script_dir="$2"
     local script; script=$(_resolve_channel_script "$ch" "$script_dir") || { echo ""; return; }
     local primary backups=()
     primary=$(grep -E '^stream_url=' "$script" | head -1 | sed -E 's/^stream_url="([^"]*)".*/\1/')
+    _valid_stream_url "$primary" || primary=""
     for i in 1 2 3; do
         local v
         v=$(grep -E "^stream_url_backup${i}=" "$script" | head -1 | sed -E 's/^[^=]+="([^"]*)".*/\1/')
-        [[ -n "$v" ]] && backups+=("$v")
+        if [[ -n "$v" ]] && _valid_stream_url "$v"; then
+            backups+=("$v")
+        fi
     done
     local backups_json="[]"
     if (( ${#backups[@]} > 0 )); then
@@ -455,7 +479,16 @@ _reflex_cycle() {
                 else
                     log "reflex $line"
                     if ! dispatch_signal "$line"; then
-                        log "reflex: dispatch FAILED for $line (PID file missing?)"
+                        # rc=1: PID missing/stale or cmdline guard failed
+                        #       (supervisor not running or recycled)
+                        # rc=2: malformed SIGNAL line from transitions.sh
+                        # also possible: privilege bridge unreachable
+                        # (/usr/local/bin/albunyaan-signal missing, or sudoers
+                        #  rule removed). Check `ls -la /usr/local/bin/albunyaan-signal`
+                        # and `sudo -n -l | grep albunyaan-signal` if rc=1
+                        # persists while supervisors are alive.
+                        local dispatch_rc=$?
+                        log "reflex: dispatch FAILED for $line (rc=$dispatch_rc)"
                     fi
                 fi
             done <<<"$actions"

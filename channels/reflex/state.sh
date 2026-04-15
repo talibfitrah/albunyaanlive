@@ -48,21 +48,37 @@ EOF
 # Persists "sticky" state to STATE_PERSIST_DIR. Separate from the main
 # state file so tmpfs wipes (systemd Restart, reboot) don't clear the
 # circuit breaker. Each call overwrites with a fresh timestamp.
+#
+# Flock-serialized because concurrent writers (circuit breaker + future
+# operator tooling) could race on the read-modify-write cycle without
+# it, corrupting the sticky file. Sticky corruption is silently
+# recoverable via state_init default LIVE, but that defeats the point
+# of the breaker — silent rehydrate failure re-enables auto-actions on
+# a truly-flapping channel. (review round 2, 2026-04-16 security +
+# red-team, conf 7.)
 state_write_sticky() {
     local ch="$1" expr="$2"
     shift 2
     mkdir -p "$STATE_PERSIST_DIR" 2>/dev/null || return 1
-    local path tmp now
+    local path lock tmp now
     path=$(_state_sticky_path "$ch")
-    tmp="${path}.tmp.$$"
+    lock="${path}.lock"
+    # mktemp defeats the $$-collision concern (bash doesn't update $$
+    # in a subshell, so two concurrent calls from the same process can
+    # collide on the temp filename under the previous ${path}.tmp.$$).
+    tmp=$(mktemp "${path}.tmp.XXXXXX") || return 1
     now=$(date +%s)
-    local base="{}"
-    [[ -r "$path" ]] && jq -e . "$path" >/dev/null 2>&1 && base=$(cat "$path")
-    if ! jq --argjson ts "$now" "$@" "$expr | .persisted_at = \$ts" <<<"$base" > "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-    mv -f "$tmp" "$path"
+    (
+        exec 201>"$lock"
+        flock -x 201
+        local base="{}"
+        [[ -r "$path" ]] && jq -e . "$path" >/dev/null 2>&1 && base=$(cat "$path")
+        if ! jq --argjson ts "$now" "$@" "$expr | .persisted_at = \$ts" <<<"$base" > "$tmp"; then
+            rm -f "$tmp"
+            exit 1
+        fi
+        mv -f "$tmp" "$path"
+    ) || return 1
 }
 
 # _state_sticky_read <ch>

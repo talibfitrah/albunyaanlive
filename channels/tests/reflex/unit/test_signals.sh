@@ -32,12 +32,49 @@ _spawn_decoy() {
     # caller's scope. Avoids the $(subshell) pattern where the spawned
     # background process becomes orphaned / receives SIGHUP when the
     # subshell exits, which caused flaky tests.
-    local name="$1" ttl="${2:-30}" pid_var="$3"
-    setsid bash -c "exec -a '$name' sleep $ttl" </dev/null &
-    local _p=$!
+    #
+    # <name> describes the kind of decoy:
+    #   "supervisor:<ch>"  — a fake try_start_stream for <ch> (cmdline
+    #                       anchored to argv tokens -n <ch> -d .../hls/<ch>/master.m3u8)
+    #   "supervisor-only" — a try_start_stream-named process without any channel_id
+    #                       (to test the channel-id guard rejects it)
+    #   "innocent"        — an unrelated process whose cmdline must not match
+    local name="$1" ttl="${2:-30}" pid_var="$3" ch=""
+    case "$name" in
+        supervisor:*) ch="${name#supervisor:}" ;;
+    esac
+    local _p fake_bin
+    # Fake supervisor: the script body just sleeps (long enough for any test);
+    # the argv carries the tokens that the anchored cmdline guard looks for.
+    # Filename contains "try_start_stream" so the supervisor-presence check
+    # (separate from the channel-id anchor) passes.
+    fake_bin="$TEST_TMPDIR/fake_try_start_stream.sh"
+    if [[ ! -x "$fake_bin" ]]; then
+        cat > "$fake_bin" <<'EOF'
+#!/bin/bash
+# Ignores all args; they're in /proc/$$/cmdline for the test's cmdline guard.
+sleep 600
+EOF
+        chmod +x "$fake_bin"
+    fi
+    if [[ -n "$ch" ]]; then
+        setsid "$fake_bin" -n "$ch" -d "/var/www/html/stream/hls/$ch/master.m3u8" </dev/null &
+        _p=$!
+    elif [[ "$name" == supervisor-only ]]; then
+        # Anchored guard expects an argv token; supervisor-only has none,
+        # so the channel-id check must fail.
+        setsid "$fake_bin" </dev/null &
+        _p=$!
+    else
+        # "innocent" — unrelated process that must not match the guard at all.
+        setsid bash -c "exec -a '$name' sleep 600" </dev/null &
+        _p=$!
+    fi
     for _ in {1..20}; do
-        [[ -r "/proc/$_p/cmdline" ]] && \
-          tr '\0' ' ' <"/proc/$_p/cmdline" 2>/dev/null | grep -q "$name" && break
+        if [[ -r "/proc/$_p/cmdline" ]]; then
+            local cl; cl=$(tr '\0' ' ' <"/proc/$_p/cmdline" 2>/dev/null)
+            [[ -n "$cl" ]] && break
+        fi
         sleep 0.05
     done
     printf -v "$pid_var" '%s' "$_p"
@@ -47,7 +84,7 @@ _spawn_decoy() {
 
 test_dispatch_slate_signals_correct_pid() {
     _test_signals_setup
-    local pid; _spawn_decoy "try_start_stream_chan_a" 30 pid
+    local pid; _spawn_decoy "supervisor:chan_a" 30 pid
     echo "$pid" > "$REFLEX_PID_DIR/chan_a.pid"
     dispatch_signal "SIGNAL:slate:chan_a"
     local rc=$?
@@ -57,7 +94,7 @@ test_dispatch_slate_signals_correct_pid() {
 
 test_dispatch_swap_writes_cmd_file_and_signals() {
     _test_signals_setup
-    local pid; _spawn_decoy "try_start_stream_chan_a" 30 pid
+    local pid; _spawn_decoy "supervisor:chan_a" 30 pid
     echo "$pid" > "$REFLEX_PID_DIR/chan_a.pid"
     dispatch_signal "SIGNAL:swap:chan_a:http://cdn.example:18080/master.m3u8"
     local rc=$?
@@ -67,6 +104,19 @@ test_dispatch_swap_writes_cmd_file_and_signals() {
     th_assert_eq "$rc" "0" "swap dispatch success" || return 1
     th_assert_eq "$written" "http://cdn.example:18080/master.m3u8" \
         "target_url preserves colons in URL" || return 1
+}
+
+test_dispatch_rejects_substring_channel_id_collision() {
+    # REGRESSION GUARD: channel_id "almajd" must NOT match the cmdline of
+    # supervisor "almajd-kids". The old bare substring match would have
+    # passed this and mis-fired SIGUSR1 to the wrong channel.
+    _test_signals_setup
+    local pid; _spawn_decoy "supervisor:almajd-kids" 30 pid
+    echo "$pid" > "$REFLEX_PID_DIR/almajd.pid"
+    dispatch_signal "SIGNAL:slate:almajd"
+    local rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    th_assert_eq "$rc" "1" "substring collision rejected" || return 1
 }
 
 test_dispatch_rejects_malformed_line() {
@@ -89,7 +139,7 @@ test_dispatch_missing_pid_file_returns_1() {
 test_pid_guard_rejects_non_supervisor_process() {
     _test_signals_setup
     # Spawn a decoy whose cmdline does NOT contain "try_start_stream".
-    local pid; _spawn_decoy "random_innocent_proc" 30 pid
+    local pid; _spawn_decoy "innocent" 30 pid
     echo "$pid" > "$REFLEX_PID_DIR/chan_a.pid"
     dispatch_signal "SIGNAL:slate:chan_a"
     local rc=$?
@@ -100,10 +150,10 @@ test_pid_guard_rejects_non_supervisor_process() {
 test_pid_guard_rejects_cross_channel_reuse() {
     # CRITICAL regression guard: if channel A's PID was recycled to
     # channel B's try_start_stream, signals for A must NOT fire on B.
-    # Guard is: cmdline must contain BOTH "try_start_stream" AND the
-    # channel_id we're signaling.
+    # Guard anchors the channel_id match to argv tokens (-n ch or
+    # /hls/ch/master.m3u8).
     _test_signals_setup
-    local pid; _spawn_decoy "try_start_stream_chan_b" 30 pid
+    local pid; _spawn_decoy "supervisor:chan_b" 30 pid
     echo "$pid" > "$REFLEX_PID_DIR/chan_a.pid"   # stale pid file for A
     dispatch_signal "SIGNAL:slate:chan_a"
     local rc=$?
@@ -111,10 +161,11 @@ test_pid_guard_rejects_cross_channel_reuse() {
     th_assert_eq "$rc" "1" "cross-channel PID reuse rejected" || return 1
 }
 
-th_run "slate dispatch delivers"           test_dispatch_slate_signals_correct_pid || exit 1
-th_run "swap writes cmd file atomically"   test_dispatch_swap_writes_cmd_file_and_signals || exit 1
-th_run "malformed lines rejected"          test_dispatch_rejects_malformed_line || exit 1
-th_run "missing pid file → rc=1"           test_dispatch_missing_pid_file_returns_1 || exit 1
-th_run "non-supervisor PID rejected"       test_pid_guard_rejects_non_supervisor_process || exit 1
-th_run "cross-channel PID reuse rejected"  test_pid_guard_rejects_cross_channel_reuse || exit 1
+th_run "slate dispatch delivers"               test_dispatch_slate_signals_correct_pid || exit 1
+th_run "swap writes cmd file atomically"       test_dispatch_swap_writes_cmd_file_and_signals || exit 1
+th_run "substring ch-id collision rejected"    test_dispatch_rejects_substring_channel_id_collision || exit 1
+th_run "malformed lines rejected"              test_dispatch_rejects_malformed_line || exit 1
+th_run "missing pid file → rc=1"               test_dispatch_missing_pid_file_returns_1 || exit 1
+th_run "non-supervisor PID rejected"           test_pid_guard_rejects_non_supervisor_process || exit 1
+th_run "cross-channel PID reuse rejected"      test_pid_guard_rejects_cross_channel_reuse || exit 1
 echo "signals tests: all PASS"

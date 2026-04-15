@@ -27,15 +27,34 @@ _probe_scheme_is_resolver() {
 
 _probe_url_is_blocklisted() {
     # Defensive: HLS upstreams should never be local. Refuse to probe
-    # anything pointing at loopback, RFC1918, or link-local — writes to
-    # channel_*.sh already imply RCE, but belt-and-suspenders matters.
+    # anything pointing at loopback, RFC1918, IPv6 ULA (fc00::/7) or
+    # link-local (fe80::/10) — writes to channel_*.sh already imply
+    # RCE, but belt-and-suspenders matters. Also refuse file: (ffprobe
+    # can read local paths) and any URL containing whitespace / control
+    # chars, which would break the SIGNAL:swap:ch:url dispatch parser.
     local url="$1"
+    # Reject any URL with whitespace (newlines, tabs, spaces inside).
+    # printf %q is too permissive; use bash extglob-free pattern.
     case "$url" in
+        *[[:space:]]*) return 0 ;;
+    esac
+    case "$url" in
+        file:*) return 0 ;;
         http://127.*|http://localhost*|http://10.*|http://169.254.*|http://[::1]*) return 0 ;;
         https://127.*|https://localhost*|https://10.*|https://169.254.*|https://[::1]*) return 0 ;;
         http://192.168.*|https://192.168.*) return 0 ;;
         http://172.1[6-9].*|http://172.2[0-9].*|http://172.3[01].*) return 0 ;;
         https://172.1[6-9].*|https://172.2[0-9].*|https://172.3[01].*) return 0 ;;
+        # IPv6 loopback + ULA fc00::/7 + link-local fe80::/10 (bracketed form).
+        http://\[::1\]*|https://\[::1\]*) return 0 ;;
+        http://\[fc*|http://\[fd*|https://\[fc*|https://\[fd*) return 0 ;;
+        http://\[fe8*|http://\[fe9*|http://\[fea*|http://\[feb*) return 0 ;;
+        https://\[fe8*|https://\[fe9*|https://\[fea*|https://\[feb*) return 0 ;;
+        # rtmp/rtsp paths through the ffprobe branch — extend same blocklist.
+        rtmp://127.*|rtmp://10.*|rtmp://169.254.*|rtmp://localhost*|rtmp://192.168.*) return 0 ;;
+        rtsp://127.*|rtsp://10.*|rtsp://169.254.*|rtsp://localhost*|rtsp://192.168.*) return 0 ;;
+        rtmp://172.1[6-9].*|rtmp://172.2[0-9].*|rtmp://172.3[01].*) return 0 ;;
+        rtsp://172.1[6-9].*|rtsp://172.2[0-9].*|rtsp://172.3[01].*) return 0 ;;
     esac
     return 1
 }
