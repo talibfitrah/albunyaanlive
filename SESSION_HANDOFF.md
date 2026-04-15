@@ -89,3 +89,19 @@ SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl restart albunyaan-watcher
 - No new alert shapes landed yet; existing `tg_alert` calls in the watcher are unchanged.
 
 [NEW]
+
+## 2026-04-15 — Phase 6 landed: brain → watcher identity handoff
+
+Two commits: `665597e` wake.sh applies identity_updates; `948d086` PROMPT.md §6a + JSON schema.
+
+**What the brain now emits:** top-level `identity_updates` array in each wake's JSON, e.g. `[{"channel_id":"anees","identity_status":"mismatch"}]`. Only `verified` / `mismatch` are honored; `slate`/`blackframe`/`unknown` are informational only.
+
+**What the wake wrapper now does:** after brain returns, writes `identity_status` + `identity_checked_at` into `/var/run/albunyaan/state/<ch>.json` under flock. On `verified`, clears `reverify_requested`. Missing state files are skipped silently — safe during cold-start before any channels are under reflex management.
+
+**Brain prioritization change:** visual sub-agents now rank mismatch + reverify_requested channels first and **skip non-LIVE channels** (avoids flagging slate/backup content as mismatch — would cascade the reflex loop).
+
+**Deviation from plan:** fixed a plan bug in the Python invocation — the planned `echo $JSON | python3 - arg <<PYEOF` pattern is broken because bash heredoc clobbers the pipe's stdin (json.load sees empty stream). Switched to `python3 -c "$(cat <<PYEOF ... PYEOF)" arg`, which keeps stdin free for the JSON. Confirmed via repro before the fix.
+
+**Telegram session:** no user-visible change yet. The `identity_updates` field is a new key in the brain's JSON — non-breaking for existing consumers. DEGRADED → "call a human" signal is still the only action cue.
+
+[NEW]
