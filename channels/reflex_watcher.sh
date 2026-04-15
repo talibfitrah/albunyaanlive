@@ -380,12 +380,42 @@ fi
 
 STATE_DIR="${STATE_DIR:-/var/run/albunyaan/state}"
 
+CHANNEL_REGISTRY="${CHANNEL_REGISTRY:-$(dirname "${BASH_SOURCE[0]}")/channel_registry.json}"
+
+# Resolve channel_id (HLS-dir basename) → channel_<name>*.sh path.
+# Priority:
+#   1. channel_registry.json's .channels.<ch>.config_file (authoritative).
+#   2. Literal glob channel_<ch>*.sh (works when the dir name and the
+#      script's channel_name agree, e.g. "saad" → channel_saad_revised.sh).
+#   3. Hyphen→underscore transform (e.g. "almajd-kids" → channel_almajd_kids*).
+# Many HLS dir names (almajd-documentary, hadith-almajd, mekkah-quran,
+# natural, makkah, almajd-islamic-science, almajd-3aamah) don't line up
+# with the script filenames at all — only the registry resolves those.
+# Without this lookup, ~9 of 22 channels fall out of the reflex state
+# machine: state files exist but next_state() never runs on them.
+_resolve_channel_script() {
+    local ch="$1" script_dir="$2"
+    if [[ -r "$CHANNEL_REGISTRY" ]]; then
+        local cfg_name
+        cfg_name=$(jq -r --arg c "$ch" '.channels[$c].config_file // empty' "$CHANNEL_REGISTRY" 2>/dev/null)
+        if [[ -n "$cfg_name" && -f "$script_dir/$cfg_name" ]]; then
+            echo "$script_dir/$cfg_name"; return 0
+        fi
+    fi
+    local match
+    match=$(ls "$script_dir"/channel_"$ch"*.sh 2>/dev/null | head -1)
+    [[ -n "$match" ]] && { echo "$match"; return 0; }
+    local ch_u="${ch//-/_}"
+    match=$(ls "$script_dir"/channel_"$ch_u"*.sh 2>/dev/null | head -1)
+    [[ -n "$match" ]] && { echo "$match"; return 0; }
+    return 1
+}
+
 # Build channel config JSON once per cycle from channel_*.sh configs.
 # Today's configs export stream_url, stream_url_backup{1,2,3}.
 _channel_cfg_json() {
     local ch="$1" script_dir="$2"
-    local script; script=$(ls "$script_dir"/channel_"$ch"*.sh 2>/dev/null | head -1)
-    [[ -z "$script" ]] && { echo ""; return; }
+    local script; script=$(_resolve_channel_script "$ch" "$script_dir") || { echo ""; return; }
     local primary backups=()
     primary=$(grep -E '^stream_url=' "$script" | head -1 | sed -E 's/^stream_url="([^"]*)".*/\1/')
     for i in 1 2 3; do
