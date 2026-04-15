@@ -42,6 +42,14 @@ send_slate_signal() {
 # Writes the target URL to a per-channel command file, then sends SIGUSR2.
 # try_start_stream.sh reads the file in its SIGUSR2 handler and switches
 # to exactly that URL (not whichever happens to be next in rotation).
+#
+# Known trade-off: rapid back-to-back swaps overwrite the cmd file
+# before the supervisor processes the first. Supervisor ends up on the
+# LATEST target URL, which is semantically correct for state-machine
+# targeting but loses the intermediate URLs from any audit trail. The
+# state machine's grace windows (30s after BACKUP, 300s+ backoff on
+# primary probe) make the race window effectively unreachable under
+# normal operation. Acknowledged at commit time; revisit if needed.
 send_resume_signal() {
     local ch="$1" target_url="$2" pid
     pid=$(_pid_for "$ch") || return 1

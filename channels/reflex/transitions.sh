@@ -55,6 +55,9 @@ next_state() {
         if (( rc > 5 )); then
             _push_transition "$ch" "$cur_state" "DEGRADED" "flapping"
             state_write_field "$ch" ".state" '"DEGRADED"'
+            # Persist DEGRADED to disk (non-tmpfs) so a systemd crash
+            # loop doesn't silently reset the breaker on every restart.
+            state_write_sticky "$ch" '.state = "DEGRADED"'
             return
         fi
     fi

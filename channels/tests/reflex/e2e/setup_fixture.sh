@@ -36,7 +36,7 @@ if [[ -e "$ROOT" ]]; then
 fi
 
 mkdir -p "$ROOT"/upstream/primary "$ROOT"/upstream/backup1 \
-         "$ROOT"/hls "$ROOT"/state "$ROOT"/pid "$ROOT"/cmd "$ROOT"/logs
+         "$ROOT"/hls "$ROOT"/state "$ROOT"/persist "$ROOT"/pid "$ROOT"/cmd "$ROOT"/logs
 
 # Generate 30 s HLS in each upstream (different color bars so a human can
 # tell them apart by eye if debugging visually). mpeg2video+aac in TS is

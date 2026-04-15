@@ -23,6 +23,7 @@ FIX_DIR="$SCRIPT_DIR/fixtures"
 # our test_channel and never touches production state.
 export HLS_ROOT=/tmp/reflex-e2e/hls
 export STATE_DIR=/tmp/reflex-e2e/state
+export STATE_PERSIST_DIR=/tmp/reflex-e2e/persist
 export REFLEX_PID_DIR=/tmp/reflex-e2e/pid
 export REFLEX_CMD_DIR=/tmp/reflex-e2e/cmd
 export LOG_FILE=/tmp/reflex-e2e/logs/watcher.log

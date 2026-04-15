@@ -13,6 +13,13 @@ RuntimeDirectory=albunyaan
 # seenshow, signed CDN URLs). Restrict world read while preserving group
 # access for any future same-group sidecar tools.
 RuntimeDirectoryMode=0750
+# Persistent sidecar for "sticky" reflex state that must survive tmpfs
+# wipes (e.g. circuit-breaker DEGRADED). /var/lib/albunyaan is backed
+# by disk, not tmpfs, so a systemd Restart=always crash loop can't
+# erase the breaker and re-enable auto-actions on a genuinely flapping
+# channel. See channels/reflex/state.sh state_{read,write}_sticky().
+StateDirectory=albunyaan
+StateDirectoryMode=0750
 ExecStartPre=/home/msa/Development/scripts/albunyaan/channels/reflex/preflight.sh
 ExecStart=/home/msa/Development/scripts/albunyaan/channels/reflex_watcher.sh
 Restart=always

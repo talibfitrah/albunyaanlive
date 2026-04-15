@@ -6,7 +6,8 @@ TEST_TMPDIR=""
 th_setup() {
     TEST_TMPDIR=$(mktemp -d -t reflex-test.XXXXXX)
     export STATE_DIR="$TEST_TMPDIR/state"
-    mkdir -p "$STATE_DIR"
+    export STATE_PERSIST_DIR="$TEST_TMPDIR/persist"
+    mkdir -p "$STATE_DIR" "$STATE_PERSIST_DIR"
 }
 
 th_teardown() {
