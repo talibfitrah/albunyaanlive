@@ -893,6 +893,33 @@ log "pidfile: $pidfile"
 log "lockdir: $lockdir"
 
 # =============================================================================
+# PID file for external signal dispatch (reflex watcher uses this).
+# =============================================================================
+REFLEX_PID_DIR="${REFLEX_PID_DIR:-/var/run/albunyaan/pid}"
+mkdir -p "$REFLEX_PID_DIR" 2>/dev/null || true
+REFLEX_PID_FILE="$REFLEX_PID_DIR/${channel_id}.pid"
+echo $$ > "$REFLEX_PID_FILE" 2>/dev/null || log_error "Could not write PID file $REFLEX_PID_FILE"
+trap 'rm -f "$REFLEX_PID_FILE"' EXIT
+
+# =============================================================================
+# Reflex signal handlers — watcher may send SIGUSR1 (enter slate) or
+# SIGUSR2 (leave slate + switch to URL from cmd file).
+# =============================================================================
+reflex_force_slate=0
+reflex_target_url=""
+REFLEX_CMD_DIR="${REFLEX_CMD_DIR:-/var/run/albunyaan/cmd}"
+
+_read_reflex_target_url() {
+    local f="$REFLEX_CMD_DIR/${channel_id}.target_url"
+    [[ -r "$f" ]] || { echo ""; return; }
+    local url; url=$(head -1 "$f" 2>/dev/null)
+    echo "$url"
+}
+
+trap 'reflex_force_slate=1; log "REFLEX: SIGUSR1 received — will enter slate on next loop iteration"' USR1
+trap 'reflex_force_slate=0; reflex_target_url=$(_read_reflex_target_url); log "REFLEX: SIGUSR2 received — will switch to URL: $reflex_target_url"' USR2
+
+# =============================================================================
 # Build URL array (primary + backups) with YouTube URL support
 # =============================================================================
 
@@ -4371,6 +4398,43 @@ check_existing_ffmpeg() {
 }
 
 while true; do
+    # Reflex handover: if watcher signalled slate, switch to slate stream
+    # for as long as the flag is held.
+    if (( reflex_force_slate == 1 )); then
+        if [[ -z "$slate_ffmpeg_pid" ]] || ! kill -0 "$slate_ffmpeg_pid" 2>$DEVNULL; then
+            kill_feeder 2>/dev/null || true
+            if start_slate_stream; then
+                log "REFLEX: slate stream engaged under external signal"
+            else
+                log "REFLEX: failed to start slate (slate video missing?)"
+            fi
+        fi
+        sleep 1
+        continue
+    fi
+
+    # Reflex handover: if watcher signalled a specific target URL, stop
+    # slate, locate that URL in the url_array, jump to it.
+    if [[ -n "$reflex_target_url" ]]; then
+        stop_slate_stream
+        target="$reflex_target_url"
+        reflex_target_url=""
+        found=-1
+        for i in "${!url_array[@]}"; do
+            if [[ "${url_array[$i]}" == "$target" ]]; then
+                found="$i"; break
+            fi
+        done
+        if [[ "$found" -ge 0 ]]; then
+            current_url_index="$found"
+            reset_url_retries
+            log "REFLEX: URL-swap to index $found ($target)"
+        else
+            log "REFLEX: target URL not in url_array, advancing normally: $target"
+            switch_to_next_url "reflex_signal"
+        fi
+    fi
+
     # NEW: Check if config file changed and reload URLs
     reload_config_if_changed
 
