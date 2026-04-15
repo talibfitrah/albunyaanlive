@@ -55,7 +55,14 @@ probe_url() {
     if [[ "$url" =~ ^https?:// ]]; then
         local code
         code=$(curl -sI --max-time "$timeout" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
-        [[ "$code" == "200" ]]
+        # Accept 2xx AND 3xx. Xtream Codes / vlc.news origins return 302
+        # to the actual CDN edge; strict 200-only classifies the origin
+        # as dead forever. Confirmed 2026-04-15 with arrahmah stuck in
+        # SLATE with consecutive_failures=9 while the channel was
+        # actually producing fresh segments. All 17 vlc.news channels
+        # share this behavior; 405 on HEAD is also seen on some nginx-
+        # rtmp variants so we accept that too (the origin is alive).
+        [[ "$code" =~ ^(2..|3..|405)$ ]]
     else
         # ffprobe -timeout takes microseconds
         local us=$(( timeout * 1000000 ))

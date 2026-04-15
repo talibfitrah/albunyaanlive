@@ -60,6 +60,38 @@ test_probe_404_fails() {
     th_assert_eq "$rc" "1" "404 → fail" || return 1
 }
 
+test_probe_302_passes() {
+    # vlc.news / Xtream Codes origins respond 302 to the CDN edge.
+    # Strict 200-only previously classified them as dead forever;
+    # arrahmah shipped to prod with consecutive_failures=9 on
+    # 2026-04-15 because of this. Regression guard.
+    local srv_pid; start_fixture_server_redirect srv_pid
+    probe_url "http://127.0.0.1:$PY_PORT/redirect" 2
+    local rc=$?
+    kill "$srv_pid" 2>/dev/null; wait "$srv_pid" 2>/dev/null || true
+    th_assert_eq "$rc" "0" "302 → pass" || return 1
+}
+
+start_fixture_server_redirect() {
+    local _out="$1"
+    python3 -c "
+import http.server, socketserver
+class H(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(302); self.send_header('Location','http://cdn.example/x.m3u8'); self.end_headers()
+    def do_GET(self): self.do_HEAD()
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(('127.0.0.1', $PY_PORT), H) as s: s.serve_forever()
+" &
+    local pid=$!
+    for _ in {1..20}; do
+        curl -sI --max-time 1 "http://127.0.0.1:$PY_PORT/redirect" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    printf -v "$_out" '%s' "$pid"
+}
+
 test_probe_timeout_fails() {
     # Hit an unrouted address to force timeout
     probe_url "http://192.0.2.1/never.m3u8" 1
@@ -98,6 +130,7 @@ test_probe_blocklist_refuses_rfc1918() {
 }
 
 th_run "probe 200 passes"              test_probe_200_passes   || exit 1
+th_run "probe 302 passes (Xtream Codes)" test_probe_302_passes || exit 1
 th_run "probe 404 fails"               test_probe_404_fails    || exit 1
 th_run "probe timeout fails"           test_probe_timeout_fails || exit 1
 th_run "resolver scheme → unknown"     test_probe_resolver_scheme_returns_unknown || exit 1
