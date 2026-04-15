@@ -175,3 +175,19 @@ timeouts the user flagged. 6 commits on main since reflex-complete:
 **Operator's deploy gate unchanged** — Steps B (restart supervisors) and C (flip REFLEX_DRY_RUN=0) still pending.
 
 [NEW]
+
+## 2026-04-15 23:30 CEST — Step A + privilege bridge + Step B all landed
+
+All three gates before `REFLEX_DRY_RUN=0`:
+- Step A (19:02): new unit file in /etc, /var/run/albunyaan 0750, /var/lib/albunyaan created by StateDirectory=, preflight OK.
+- Privilege bridge (23:09): /usr/local/bin/albunyaan-signal installed root:root 0755; /etc/sudoers.d/albunyaan-reflex scoped to USR1/USR2 only; signals.sh falls back to sudo wrapper on EPERM. Repo copy at `channels/reflex/albunyaan-signal`. Commit `546b8a2`.
+- Step B (23:30): `sudo bash restart.sh` executed. 22/22 PID files within 45 s; ~20/22 channels producing fresh segments. 24 ffmpegs running (2 transient during ramp-up). Watcher NRestarts=1.
+- Arrahmah post-restart: state=LIVE, consecutive_failures=0 (was SLATE with 9 failures pre-fix). The 302-redirect probe fix holds.
+
+**Caveat before Step C:** 12 channels show `state=SLATE` in /var/run/albunyaan/state because the restart's 30-40 s ffmpeg-restart window tripped freshness.is_output_fresh. These are dry-run-only entries — no real supervisor signal was delivered. They'll reconcile back to LIVE as the primary-probe loop succeeds (~5–10 min after probes come off backoff).
+
+**Do NOT flip REFLEX_DRY_RUN=0 until states reconcile** — otherwise SIGNAL:swap fires at supervisors that are already on primary URL. No-op on the supervisor side but noisy on the watcher side.
+
+Operational facts discovered tonight that the original deploy plan didn't capture are in `docs/reflex-deploy-notes.md` (privilege model, PGID trap in restart, Step C checklist, rollback).
+
+[NEW]
