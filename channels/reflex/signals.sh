@@ -12,9 +12,20 @@ _pid_for() {
     cat "$pf"
 }
 
+# _pid_is_try_start_stream <pid>
+# Returns 0 iff the PID's cmdline contains "try_start_stream".
+# Guards against signaling an unrelated process that reused a stale PID.
+_pid_is_try_start_stream() {
+    local pid="$1" cmdline_file="/proc/$1/cmdline"
+    [[ -r "$cmdline_file" ]] || return 1
+    # cmdline is NUL-separated; tr to spaces for grep
+    tr '\0' ' ' < "$cmdline_file" 2>/dev/null | grep -q 'try_start_stream'
+}
+
 # send_slate_signal <channel_id>    → SIGUSR1 (enter slate)
 send_slate_signal() {
     local pid; pid=$(_pid_for "$1") || return 1
+    _pid_is_try_start_stream "$pid" || return 1
     kill -USR1 "$pid" 2>/dev/null
 }
 
@@ -25,6 +36,7 @@ send_slate_signal() {
 send_resume_signal() {
     local ch="$1" target_url="$2" pid
     pid=$(_pid_for "$ch") || return 1
+    _pid_is_try_start_stream "$pid" || return 1
     mkdir -p "$REFLEX_CMD_DIR" 2>/dev/null || true
     local tmp="$REFLEX_CMD_DIR/$ch.target_url.tmp"
     local dst="$REFLEX_CMD_DIR/$ch.target_url"
@@ -47,6 +59,7 @@ dispatch_signal() {
             local rest="${line#SIGNAL:swap:}"
             local ch="${rest%%:*}"
             local url="${rest#*:}"
+            [[ -n "$ch" && -n "$url" && "$url" != "$rest" ]] || return 2
             send_resume_signal "$ch" "$url" ;;
         *) return 2 ;;
     esac
