@@ -76,6 +76,37 @@ test_sticky_missing_persist_dir_does_not_crash() {
     th_assert_eq "$s" "LIVE" "init survives unwriteable persist dir" || return 1
 }
 
+test_missing_channel_read_returns_nonzero() {
+    local v; v=$(state_read_field "never_created" ".state")
+    local rc=$?
+    th_assert_eq "$rc" "1" "missing channel read → rc=1" || return 1
+    th_assert_eq "$v" "" "missing channel read → empty output" || return 1
+}
+
+test_bad_jq_expr_leaves_state_intact_no_tmp_leak() {
+    state_init "chan_a"
+    local before; before=$(cat "$STATE_DIR/chan_a.json")
+    # Deliberately malformed jq expression — state_modify must fail
+    # cleanly without touching the state file or leaking a .tmp.
+    state_modify "chan_a" '.state | this | is | not | valid | jq | {{{' 2>/dev/null
+    local after; after=$(cat "$STATE_DIR/chan_a.json")
+    th_assert_eq "$before" "$after" "state unchanged after bad expr" || return 1
+    if ls "$STATE_DIR"/*.tmp.* >/dev/null 2>&1; then
+        echo "FAIL: tmp file leaked after bad jq expr" >&2
+        return 1
+    fi
+}
+
+test_zero_byte_state_file_reinits() {
+    # Simulate a crash mid-write that left a zero-byte file. jq -e .
+    # on empty treats as null, which the current state_init check
+    # should detect and quarantine-then-reinit.
+    : > "$STATE_DIR/chan_a.json"
+    state_init "chan_a"
+    local s; s=$(state_read_field "chan_a" ".state")
+    th_assert_eq "$s" "LIVE" "zero-byte file reinits to LIVE" || return 1
+}
+
 th_run "state_init creates default"       test_init_creates_default       || exit 1
 th_run "state write/read roundtrip"       test_write_read_roundtrip       || exit 1
 th_run "corrupt state reinits"            test_corrupt_file_reinits       || exit 1
@@ -83,4 +114,7 @@ th_run "concurrent writes don't lose"     test_concurrent_writes_dont_lose || ex
 th_run "sticky DEGRADED rehydrates"       test_sticky_degraded_rehydrates || exit 1
 th_run "stale sticky ignored"             test_sticky_expired_does_not_rehydrate || exit 1
 th_run "missing persist dir survives"     test_sticky_missing_persist_dir_does_not_crash || exit 1
+th_run "missing channel read → rc=1"      test_missing_channel_read_returns_nonzero || exit 1
+th_run "bad jq expr leaves state intact"  test_bad_jq_expr_leaves_state_intact_no_tmp_leak || exit 1
+th_run "zero-byte state file reinits"     test_zero_byte_state_file_reinits || exit 1
 echo "state tests: all PASS"

@@ -86,10 +86,17 @@ _state_sticky_read() {
 state_init() {
     local ch="$1" path; path=$(_state_path "$ch")
     mkdir -p "$STATE_DIR"
-    if [[ -f "$path" ]]; then
-        if jq -e . "$path" >/dev/null 2>&1; then
+    if [[ -s "$path" ]]; then
+        # -s requires the file to exist AND be non-empty (zero-byte
+        # files get quarantined). Then confirm .state parses as a
+        # string — catches null bodies and structurally-corrupt files.
+        if jq -e '.state | type == "string"' "$path" >/dev/null 2>&1; then
             return 0
         fi
+        local ts; ts=$(date +%s)
+        mv "$path" "${path}.broken.${ts}"
+    elif [[ -f "$path" ]]; then
+        # File exists but zero bytes — quarantine before reinit.
         local ts; ts=$(date +%s)
         mv "$path" "${path}.broken.${ts}"
     fi
