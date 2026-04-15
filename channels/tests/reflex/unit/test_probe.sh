@@ -5,6 +5,11 @@ REFLEX_DIR="$SCRIPT_DIR/../../../reflex"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
 source "$REFLEX_DIR/probe.sh"
 
+# The fixture binds to 127.0.0.1, which probe.sh blocklists in production.
+# Opt in for the HTTP-path tests; resolver-scheme and blocklist tests
+# explicitly override.
+export REFLEX_ALLOW_LOCAL_PROBE=1
+
 # Spin up a throwaway HTTP server in bash using python3 one-liner.
 PY_PORT=18089
 
@@ -62,7 +67,40 @@ test_probe_timeout_fails() {
     th_assert_eq "$rc" "1" "timeout → fail" || return 1
 }
 
-th_run "probe 200 passes"    test_probe_200_passes   || exit 1
-th_run "probe 404 fails"     test_probe_404_fails    || exit 1
-th_run "probe timeout fails" test_probe_timeout_fails || exit 1
+test_probe_resolver_scheme_returns_unknown() {
+    for u in "elahmad:makkahtv" "aloula:6" "seenshow:2120825/LIVE/3.m3u8" "youtube:@SaudiQuranTv"; do
+        probe_url "$u" 2
+        local rc=$?
+        th_assert_eq "$rc" "2" "resolver scheme '$u' → rc=2 (unknown)" || return 1
+    done
+}
+
+test_probe_blocklist_refuses_local() {
+    # Without REFLEX_ALLOW_LOCAL_PROBE=1, loopback is refused at the
+    # blocklist gate before any network call.
+    (
+        unset REFLEX_ALLOW_LOCAL_PROBE
+        probe_url "http://127.0.0.1:8080/x" 1
+        exit $?
+    )
+    local rc=$?
+    th_assert_eq "$rc" "2" "loopback → rc=2 (blocklisted)" || return 1
+}
+
+test_probe_blocklist_refuses_rfc1918() {
+    (
+        unset REFLEX_ALLOW_LOCAL_PROBE
+        probe_url "http://192.168.1.1/x" 1
+        exit $?
+    )
+    local rc=$?
+    th_assert_eq "$rc" "2" "192.168/16 → rc=2 (blocklisted)" || return 1
+}
+
+th_run "probe 200 passes"              test_probe_200_passes   || exit 1
+th_run "probe 404 fails"               test_probe_404_fails    || exit 1
+th_run "probe timeout fails"           test_probe_timeout_fails || exit 1
+th_run "resolver scheme → unknown"     test_probe_resolver_scheme_returns_unknown || exit 1
+th_run "loopback blocklisted"          test_probe_blocklist_refuses_local || exit 1
+th_run "rfc1918 blocklisted"           test_probe_blocklist_refuses_rfc1918 || exit 1
 echo "probe tests: all PASS"

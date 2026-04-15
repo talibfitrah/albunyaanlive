@@ -110,43 +110,56 @@ _handle_slate() {
     local next_after; next_after=$(jq -r '.primary_probe.next_attempt_after' <<<"$state_json")
     local next_after_u; next_after_u=$(date -d "$next_after" +%s 2>/dev/null || echo 0)
     if (( now_unix >= next_after_u )); then
-        if probe_url "$primary_url" 2; then
-            local succ; succ=$(jq -r '.primary_probe.consecutive_successes' <<<"$state_json")
-            succ=$(( succ + 1 ))
-            if (( succ >= 2 )); then
-                _push_transition "$ch" "SLATE" "LIVE" "primary_recovered"
-                local now_iso grace_iso
-                now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
+        probe_url "$primary_url" 2
+        local _probe_rc=$?
+        case "$_probe_rc" in
+            0)
+                local succ; succ=$(jq -r '.primary_probe.consecutive_successes' <<<"$state_json")
+                succ=$(( succ + 1 ))
+                if (( succ >= 2 )); then
+                    _push_transition "$ch" "SLATE" "LIVE" "primary_recovered"
+                    local now_iso grace_iso
+                    now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
+                    state_modify "$ch" '
+                      .state = "LIVE"
+                      | .current_source_url = $url
+                      | .current_source_role = "primary"
+                      | .grace_until = $grace
+                      | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
+                      | .excluded_backups = []
+                      | .reverify_requested = false
+                    ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
+                    echo "SIGNAL:swap:$ch:$primary_url"
+                    return
+                else
+                    local now_iso; now_iso=$(_iso_plus 0)
+                    state_modify "$ch" '
+                      .primary_probe.consecutive_successes = ($n | tonumber)
+                      | .primary_probe.last_attempt = $now
+                    ' --arg n "$succ" --arg now "$now_iso"
+                fi ;;
+            1)
+                local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
+                fail=$(( fail + 1 ))
+                local delay; delay=$(backoff_delay "$fail")
+                local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
                 state_modify "$ch" '
-                  .state = "LIVE"
-                  | .current_source_url = $url
-                  | .current_source_role = "primary"
-                  | .grace_until = $grace
-                  | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
-                  | .excluded_backups = []
-                  | .reverify_requested = false
-                ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
-                echo "SIGNAL:swap:$ch:$primary_url"
-                return
-            else
-                local now_iso; now_iso=$(_iso_plus 0)
-                state_modify "$ch" '
-                  .primary_probe.consecutive_successes = ($n | tonumber)
+                  .primary_probe.consecutive_failures = ($f | tonumber)
+                  | .primary_probe.consecutive_successes = 0
                   | .primary_probe.last_attempt = $now
-                ' --arg n "$succ" --arg now "$now_iso"
-            fi
-        else
-            local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
-            fail=$(( fail + 1 ))
-            local delay; delay=$(backoff_delay "$fail")
-            local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
-            state_modify "$ch" '
-              .primary_probe.consecutive_failures = ($f | tonumber)
-              | .primary_probe.consecutive_successes = 0
-              | .primary_probe.last_attempt = $now
-              | .primary_probe.next_attempt_after = $next
-            ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso"
-        fi
+                  | .primary_probe.next_attempt_after = $next
+                ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso" ;;
+            2)
+                # Unprobeable (resolver scheme / blocklisted). Don't
+                # touch counters; just push next_attempt forward so we
+                # don't hot-loop. Recovery path for these channels is
+                # out of scope — handled by supervisor internally.
+                local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus 300)
+                state_modify "$ch" '
+                  .primary_probe.last_attempt = $now
+                  | .primary_probe.next_attempt_after = $next
+                ' --arg now "$now_iso" --arg next "$next_iso" ;;
+        esac
     fi
 
     # 2. Walk one backup per cycle (round-robin)
@@ -214,41 +227,52 @@ _handle_backup() {
     local next_after; next_after=$(jq -r '.primary_probe.next_attempt_after' <<<"$state_json")
     local next_after_u; next_after_u=$(date -d "$next_after" +%s 2>/dev/null || echo 0)
     if (( now_unix >= next_after_u )); then
-        if probe_url "$primary_url" 2; then
-            local succ; succ=$(jq -r '.primary_probe.consecutive_successes' <<<"$state_json")
-            succ=$(( succ + 1 ))
-            if (( succ >= 2 )); then
-                _push_transition "$ch" "BACKUP" "LIVE" "primary_recovered"
-                local now_iso grace_iso
-                now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
+        probe_url "$primary_url" 2
+        local _probe_rc=$?
+        case "$_probe_rc" in
+            0)
+                local succ; succ=$(jq -r '.primary_probe.consecutive_successes' <<<"$state_json")
+                succ=$(( succ + 1 ))
+                if (( succ >= 2 )); then
+                    _push_transition "$ch" "BACKUP" "LIVE" "primary_recovered"
+                    local now_iso grace_iso
+                    now_iso=$(_iso_plus 0); grace_iso=$(_iso_plus 30)
+                    state_modify "$ch" '
+                      .state = "LIVE"
+                      | .current_source_url = $url
+                      | .current_source_role = "primary"
+                      | .grace_until = $grace
+                      | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
+                      | .excluded_backups = []
+                      | .reverify_requested = false
+                    ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
+                    echo "SIGNAL:swap:$ch:$primary_url"
+                else
+                    local now_iso; now_iso=$(_iso_plus 0)
+                    state_modify "$ch" '
+                      .primary_probe.consecutive_successes = ($n | tonumber)
+                      | .primary_probe.last_attempt = $now
+                    ' --arg n "$succ" --arg now "$now_iso"
+                fi ;;
+            2)
+                # Unprobeable primary (resolver scheme / blocklisted).
+                # Don't touch counters; push next_attempt forward.
+                local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus 300)
                 state_modify "$ch" '
-                  .state = "LIVE"
-                  | .current_source_url = $url
-                  | .current_source_role = "primary"
-                  | .grace_until = $grace
-                  | .primary_probe = {last_attempt:$now, consecutive_failures:0, consecutive_successes:0, next_attempt_after:$now}
-                  | .excluded_backups = []
-                  | .reverify_requested = false
-                ' --arg url "$primary_url" --arg grace "$grace_iso" --arg now "$now_iso"
-                echo "SIGNAL:swap:$ch:$primary_url"
-            else
-                local now_iso; now_iso=$(_iso_plus 0)
+                  .primary_probe.last_attempt = $now
+                  | .primary_probe.next_attempt_after = $next
+                ' --arg now "$now_iso" --arg next "$next_iso" ;;
+            1)
+                local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
+                fail=$(( fail + 1 ))
+                local delay; delay=$(backoff_delay "$fail")
+                local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
                 state_modify "$ch" '
-                  .primary_probe.consecutive_successes = ($n | tonumber)
+                  .primary_probe.consecutive_failures = ($f | tonumber)
+                  | .primary_probe.consecutive_successes = 0
                   | .primary_probe.last_attempt = $now
-                ' --arg n "$succ" --arg now "$now_iso"
-            fi
-        else
-            local fail; fail=$(jq -r '.primary_probe.consecutive_failures' <<<"$state_json")
-            fail=$(( fail + 1 ))
-            local delay; delay=$(backoff_delay "$fail")
-            local now_iso next_iso; now_iso=$(_iso_plus 0); next_iso=$(_iso_plus "$delay")
-            state_modify "$ch" '
-              .primary_probe.consecutive_failures = ($f | tonumber)
-              | .primary_probe.consecutive_successes = 0
-              | .primary_probe.last_attempt = $now
-              | .primary_probe.next_attempt_after = $next
-            ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso"
-        fi
+                  | .primary_probe.next_attempt_after = $next
+                ' --arg f "$fail" --arg now "$now_iso" --arg next "$next_iso" ;;
+        esac
     fi
 }

@@ -30,6 +30,9 @@ export CHANNEL_CONFIG_DIR="$FIX_DIR"
 export INTERVAL=1
 export REFLEX_DRY_RUN=0
 export REFLEX_ENABLED=1
+# The fixture binds upstreams to 127.0.0.1:18080/18081, which probe.sh
+# blocklists as potential SSRF targets in production. Opt in here.
+export REFLEX_ALLOW_LOCAL_PROBE=1
 # Aggressive stall thresholds so the test doesn't need to wait 60+ s.
 export STALL_WARN=3
 export STALL_CRIT=6
