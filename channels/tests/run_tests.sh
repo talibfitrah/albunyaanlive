@@ -3818,4 +3818,22 @@ echo "  PASS: no channel has seenshow as primary; ${SEENSHOW_BACKUP_COUNT} chann
 echo "--- Telegram dispatch (wake normalizer + bot offset + tg_alert + severity routing) ---"
 bash "$ROOT_DIR/tests/telegram_dispatch.unit.test.sh"
 
+# ---------------------------------------------------------------------------
+# Reflex loop — unit + integration tests
+# ---------------------------------------------------------------------------
+# E2E tests (tests/reflex/e2e/) are NOT run here: they spawn long-lived
+# python3 http.server processes and signal supervisor stubs, which is the
+# wrong shape for a fast CI check. Run them on demand via
+# `bash channels/tests/reflex/e2e/reflex_e2e.sh <scenario>`.
+# ---------------------------------------------------------------------------
+if [[ -d "$ROOT_DIR/tests/reflex" ]]; then
+    shopt -s nullglob
+    for t in "$ROOT_DIR"/tests/reflex/unit/*.sh "$ROOT_DIR"/tests/reflex/integration/*.sh; do
+        [[ -f "$t" ]] || continue
+        echo "--- reflex: $(basename "$t") ---"
+        bash "$t" || fail "$t failed"
+    done
+    shopt -u nullglob
+fi
+
 echo "All tests passed."
