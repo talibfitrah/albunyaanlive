@@ -53,16 +53,21 @@ probe_url() {
     _probe_scheme_is_resolver "$url" && return 2
 
     if [[ "$url" =~ ^https?:// ]]; then
-        local code
-        code=$(curl -sI --max-time "$timeout" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
-        # Accept 2xx AND 3xx. Xtream Codes / vlc.news origins return 302
-        # to the actual CDN edge; strict 200-only classifies the origin
-        # as dead forever. Confirmed 2026-04-15 with arrahmah stuck in
-        # SLATE with consecutive_failures=9 while the channel was
-        # actually producing fresh segments. All 17 vlc.news channels
-        # share this behavior; 405 on HEAD is also seen on some nginx-
-        # rtmp variants so we accept that too (the origin is alive).
-        [[ "$code" =~ ^(2..|3..|405)$ ]]
+        # Retry once. Single-shot HTTP probes against cross-WAN origins
+        # hit ~5% transient failure from normal packet loss / queuing.
+        # With a 2 s timeout and strict SLATE→LIVE gating (needs 2
+        # consecutive successes), that pushed live production into
+        # persistent-spurious-SLATE tonight (2026-04-15). One retry per
+        # call absorbs the blips without doubling the happy-path cost
+        # (only runs when the first attempt failed). Accept 2xx AND
+        # 3xx — Xtream Codes / vlc.news origins return 302 to CDN
+        # edge. 405 also accepted (nginx-rtmp variants reject HEAD).
+        local attempt code
+        for attempt in 1 2; do
+            code=$(curl -sI --max-time "$timeout" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")
+            [[ "$code" =~ ^(2..|3..|405)$ ]] && return 0
+        done
+        return 1
     else
         # ffprobe -timeout takes microseconds
         local us=$(( timeout * 1000000 ))
