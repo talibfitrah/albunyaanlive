@@ -105,3 +105,46 @@ Two commits: `665597e` wake.sh applies identity_updates; `948d086` PROMPT.md §6
 **Telegram session:** no user-visible change yet. The `identity_updates` field is a new key in the brain's JSON — non-breaking for existing consumers. DEGRADED → "call a human" signal is still the only action cue.
 
 [NEW]
+
+## 2026-04-15 — Reflex loop landed end-to-end
+
+All phases 1–8 merged. Per-channel state files at
+`/var/run/albunyaan/state/<id>.json` now carry:
+- `state` ∈ {LIVE, SLATE, BACKUP, DEGRADED}
+- `identity_status` ∈ {unknown, verified, mismatch}
+- `reverify_requested` (boolean — brain sets on mismatch, watcher
+  clears when brain returns verified)
+- `transition_history` (FIFO, capped at 50)
+- `excluded_backups` (URLs the watcher probed and found dead during
+  the current slate episode)
+
+Phase 6 brain handoff: the wake wrapper now consumes an
+`identity_updates` array from the brain's JSON and writes
+`identity_status` + `identity_checked_at` into each state file under
+flock. The brain's prompt (§6a) tells it to emit those entries and to
+skip non-LIVE channels when doing visual checks.
+
+Phase 7 E2E: `channels/tests/reflex/e2e/reflex_e2e.sh` runs five
+scenarios (`happy_path`, `all_dead`, `backup_dies`, `identity_handoff`,
+`flapping`) against an isolated `/tmp/reflex-e2e/` fixture. Uses a stub
+supervisor to avoid spawning real ffmpeg pipelines on the production
+box. All five pass on this host.
+
+Phase 8: systemd preflight + RuntimeDirectory (commit `3149601`) already
+active in production dry-run mode since earlier today. Reflex unit +
+integration tests are now part of `run_tests.sh`.
+
+**What the dedicated Telegram session may want to do next:**
+- Surface `state != LIVE` in the daily 08:00 report.
+- Surface `identity_status == mismatch` until brain clears it.
+- Watch for `state == DEGRADED` — that's a "call a human" signal
+  (>5 transitions in 120 s, circuit breaker tripped).
+
+**Operator's activation deploy gate is unchanged** — see the earlier
+"ACTIVATION CHECKLIST" entry in this log. Steps B (restart channel
+supervisors) and C (flip REFLEX_DRY_RUN=0) are still pending.
+
+Rate-limit resilience, playability probe, and the 08:00 report are
+explicitly out of scope for this plan — they're spec §11 follow-ups.
+
+[NEW]
