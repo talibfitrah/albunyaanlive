@@ -1024,6 +1024,13 @@ if [[ -n "$config_file" && -f "$config_file" ]]; then
     log "Config hot-reload enabled: $config_file (mtime: $config_file_mtime)"
 fi
 
+# Audio resync mode: default 0=off. Actual value is read lazily inside
+# build_ffmpeg_cmd (after parse_config_value/config_has_var are defined),
+# so the latest config value takes effect on each ffmpeg restart.
+# Protects against upstreams that emit audio packets with wildly wrong PTS
+# (observed with vlc.news on Makkah, 2026-04-14 — blanked ExoPlayer on Android).
+audio_resync_mode=0
+
 # =============================================================================
 # NEW: Primary URL health check with auto-fallback
 # =============================================================================
@@ -4063,6 +4070,30 @@ build_ffmpeg_cmd() {
     fi
     local effective_scale="${effective_scale:-$scale}"
 
+    # Per-channel audio resync. When audio_resync_mode=1:
+    #   Input:  -use_wallclock_as_timestamps 1  (ignore upstream PTS; stamp by arrival)
+    #   Output: -af "aresample=async=1000:min_hard_comp=0.100000:first_pts=0"
+    #          (gradual drift correction up to 1000 samples/sec; only hard-compensate
+    #           when drift exceeds 100ms — keeps audio smooth, avoids per-sample
+    #           stutter that aggressive async=1 caused on 2026-04-14 first roll-out)
+    # Only meaningful on re-encode paths (scales 4|3, 9|5|6|10|11, 12|13).
+    # Stream-copy paths pass audio through untouched, so the filter is skipped.
+    # Re-read per ffmpeg restart so config edits take effect without needing a
+    # full try_start_stream.sh relaunch.
+    if [[ -n "$config_file" && -f "$config_file" ]] && config_has_var "$config_file" "audio_resync_mode"; then
+        local _arm_now
+        _arm_now=$(parse_config_value "$config_file" "audio_resync_mode")
+        if [[ "$_arm_now" =~ ^[0-9]+$ ]]; then
+            audio_resync_mode=$_arm_now
+        fi
+    fi
+    local -a audio_resync_input_flags=()
+    local -a audio_resync_output_flags=()
+    if [[ "${audio_resync_mode:-0}" -eq 1 ]]; then
+        audio_resync_input_flags=( -use_wallclock_as_timestamps 1 )
+        audio_resync_output_flags=( -af "aresample=async=1000:min_hard_comp=0.100000:first_pts=0" )
+    fi
+
     ffmpeg_cmd=( ffmpeg -loglevel error )
     local scheme
     scheme=$(get_url_scheme "$stream_url")
@@ -4080,7 +4111,7 @@ build_ffmpeg_cmd() {
             # CPU-side scale absorbs source format changes (logo overlays, ad insertion)
             # that previously crashed scale_npp/hwupload_cuda filter chain.
             # (scale 3 aliased here — always scale to ensure consistent 1080p)
-            ffmpeg_cmd+=( -i "$actual_input_url" )
+            ffmpeg_cmd+=( "${audio_resync_input_flags[@]}" -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
                 log "SCALE4: Forced COPY mode due to repeated GPU filter crashes (filter_crash_count=$filter_crash_count). No re-encoding."
@@ -4089,7 +4120,7 @@ build_ffmpeg_cmd() {
                 ffmpeg_cmd+=( -vf "scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda" )
                 ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
                 ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 2 )
-                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+                ffmpeg_cmd+=( "${audio_resync_output_flags[@]}" -c:a aac -b:a 192k -ar 48000 -ac 2 )
             else
                 log "SCALE4: GPU unavailable, falling back to stream copy (no re-encoding)"
                 ffmpeg_cmd+=( -c copy )
@@ -4103,7 +4134,7 @@ build_ffmpeg_cmd() {
             # Falls back to stream copy if GPU is unavailable or repeatedly crashes.
             # (scales 5,6,10,11 aliased here)
             ffmpeg_cmd+=( -err_detect ignore_err -fflags +discardcorrupt+genpts )
-            ffmpeg_cmd+=( -i "$actual_input_url" )
+            ffmpeg_cmd+=( "${audio_resync_input_flags[@]}" -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
                 # Safety net: GPU pipeline failed repeatedly — fall back to stream copy
@@ -4119,7 +4150,7 @@ build_ffmpeg_cmd() {
                 ffmpeg_cmd+=( -vf "scale=1920:1080:flags=fast_bilinear,format=nv12,hwupload_cuda" )
                 ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune ll -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 0 )
                 ffmpeg_cmd+=( -b:v 3500k -maxrate 4000k -bufsize 7000k -threads 2 )
-                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+                ffmpeg_cmd+=( "${audio_resync_output_flags[@]}" -c:a aac -b:a 192k -ar 48000 -ac 2 )
                 ffmpeg_cmd+=( -f hls -hls_time 6 )
                 ffmpeg_cmd+=( "${hls_seamless[@]}" -hls_flags delete_segments+temp_file+omit_endlist "$output_path" )
             else
@@ -4134,7 +4165,7 @@ build_ffmpeg_cmd() {
             # For sources with non-16:9 aspect ratios (stretch-fill to 1080p)
             # CPU-side scale absorbs source format changes mid-stream.
             # (scale 13 aliased here)
-            ffmpeg_cmd+=( -i "$actual_input_url" )
+            ffmpeg_cmd+=( "${audio_resync_input_flags[@]}" -i "$actual_input_url" )
             ffmpeg_cmd+=( -map 0:v:0 -map 0:a:0? )
             if [[ "${force_copy_mode:-0}" -eq 1 ]]; then
                 log "SCALE12: Forced COPY mode due to repeated GPU filter crashes (filter_crash_count=$filter_crash_count). No re-encoding."
@@ -4143,7 +4174,7 @@ build_ffmpeg_cmd() {
                 ffmpeg_cmd+=( -vf "scale=1920:1080:flags=lanczos,format=nv12,hwupload_cuda" )
                 ffmpeg_cmd+=( -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -profile:v high -level:v auto -g 180 -keyint_min 180 -bf 2 )
                 ffmpeg_cmd+=( -b:v 6000k -maxrate 8000k -bufsize 12000k -threads 2 )
-                ffmpeg_cmd+=( -c:a aac -b:a 192k -ar 48000 -ac 2 )
+                ffmpeg_cmd+=( "${audio_resync_output_flags[@]}" -c:a aac -b:a 192k -ar 48000 -ac 2 )
             else
                 log "SCALE12: GPU unavailable, falling back to stream copy (no re-encoding)"
                 ffmpeg_cmd+=( -c copy )
