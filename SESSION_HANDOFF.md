@@ -219,3 +219,62 @@ SUDO_ASKPASS=~/.sudo_pass.sh sudo -A systemctl restart albunyaan-watcher
 Channels continue running independently; only dispatch stops.
 
 [NEW]
+
+## 2026-04-16 01:05 CEST — Full post-activation validation: A / B / D / F verified; round-2 review fixes committed
+
+**Sequence outcomes:**
+
+- **A (end-to-end dispatch)** ✅
+  During my zaad-stall induction at 00:09, the watcher had a real
+  transition in flight — `reflex SIGNAL:swap:zaad:https://.../@ZadTVchannel/live`
+  at 00:09:05. Supervisor log: `REFLEX: SIGUSR2 received` at 00:09:06.
+  Fresh YouTube-backup segments followed. Bridge proven under load.
+
+- **B (audio_resync committed)** ✅ (`07e4542`). Makkah is the sole opt-in. Clean review.
+
+- **C (30-min soak)** ~✅ — reflex_watcher.log was rotated/truncated to
+  0 bytes at 01:00 (log rotation fired), so signal/fail count since
+  flip can't be read from that log. Cross-evidence: NRestarts=0 from
+  the 00:00:31 flip until my deliberate 01:04:25 restart for round-2
+  fixes; journalctl shows `sudo: msa : COMMAND=/usr/local/bin/albunyaan-signal USR2 2317117 natural`
+  confirming the bridge dispatched cleanly in production; state files
+  show healthy fleet throughout.
+
+- **D (DEGRADED sticky persistence)** ✅
+  Seeded 6 transitions on basmah; breaker tripped within 4 s; sticky
+  written to `/var/lib/albunyaan/basmah.sticky.json`; watcher restart
+  rehydrated DEGRADED from sticky (state_init did its job); then
+  cleaned up sticky + reset basmah to LIVE manually. End-to-end
+  persistence confirmed.
+
+- **F (RuntimeDirectoryPreserve=yes)** ✅
+  Controlled restart at 01:04:25 preserved all 22 PID files and 22
+  state files. Before the fix (commit `bcfdf52`), each restart wiped
+  `/var/run/albunyaan/*` and caused ~7 dispatch failures because
+  supervisors had no mechanism to re-write their PID.
+
+- **E (brain identity_updates)** monitoring now — `albunyaan-brain.timer`
+  next fires at 01:09:33 CEST (~4 min). That wake will exercise the
+  Phase 6 identity_updates path (commit `665597e` wake.sh + `948d086`
+  PROMPT.md) naturally.
+
+**Round-2 review pipeline fixes** (commit `b06824b`):
+- Anchored cmdline match for PID guard (was substring → could misfire
+  across channels with common prefixes).
+- state_write_sticky now flock'd (was racy under concurrent writers).
+- Dispatch error message now shows rc instead of misleading
+  "PID file missing?".
+- probe.sh blocklist extended to IPv6 ULA/link-local, rtmp/rtsp
+  internal, file: scheme, URLs containing whitespace.
+- `_channel_cfg_json` validates extracted URL scheme, rejects garbage
+  from malformed `stream_url=` lines.
+
+**Still deferred** (non-blocking, backlog):
+- TOCTOU between cmdline validation and `exec kill` (pidfd
+  migration — larger refactor)
+- Clock skew / NTP jump robustness (epoch-int refactor)
+- DEGRADED auto-recovery window (design change)
+- Probe retry performance test (transient-fail scenario)
+- `_resolve_channel_script` regression test
+
+[NEW]
