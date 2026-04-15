@@ -371,6 +371,8 @@ if [[ -d "$REFLEX_LIB_DIR" ]]; then
     source "$REFLEX_LIB_DIR/probe.sh"
     # shellcheck source=reflex/transitions.sh
     source "$REFLEX_LIB_DIR/transitions.sh"
+    # shellcheck source=reflex/signals.sh
+    source "$REFLEX_LIB_DIR/signals.sh"
     REFLEX_ENABLED=1
 else
     REFLEX_ENABLED=0
@@ -422,7 +424,9 @@ _reflex_cycle() {
                     log "reflex(dry-run) $line"
                 else
                     log "reflex $line"
-                    # Phase 5 will wire real dispatch here.
+                    if ! dispatch_signal "$line"; then
+                        log "reflex: dispatch FAILED for $line (PID file missing?)"
+                    fi
                 fi
             done <<<"$actions"
         fi
