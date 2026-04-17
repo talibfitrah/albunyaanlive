@@ -145,6 +145,18 @@ main() {
         log "FATAL no channels in registry"
         return 2
     fi
+    # Flag state files for channels that exist on disk but are absent
+    # from the registry. Those channels won't get sampled (iteration is
+    # driven by registry keys), so their logo_history stays null and
+    # rule 10 cannot apply. Without this warning they drift silently.
+    for sf in "$STATE_DIR"/*.json; do
+        [[ -f "$sf" ]] || continue
+        local sch
+        sch=$(basename "$sf" .json)
+        if ! echo "$channels" | grep -qxF "$sch"; then
+            log "WARN state file exists for '$sch' but it's not in channel_registry.json; sampler will skip it. Add to registry to enable logo_history coverage."
+        fi
+    done
     local started_at processed=0
     started_at=$(date +%s)
     while IFS= read -r ch; do

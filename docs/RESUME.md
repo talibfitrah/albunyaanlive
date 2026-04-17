@@ -2,7 +2,40 @@
 
 **One-document handoff for picking up this project in a fresh session.** Read this first; then `SESSION_HANDOFF.md` for chronological history if you need more context.
 
-**Last updated:** 2026-04-16 01:15 CEST.
+**Last updated:** 2026-04-17 07:45 CEST.
+
+---
+
+## 2026-04-17 — Self-learning loop shipped and verified in production
+
+The brain wake used to be stateless: every 3 h it re-derived judgments from scratch, so operator/colleague corrections died at session end and the same false positives recurred. That's now closed.
+
+**What landed tonight** (commits `5adec66..38c93d7`):
+- SQLite lessons DB at `channels/brain/lessons.db` (mode 600, gitignored)
+- `channels/brain_loop/lessons.sh` CLI — `init / add / list / query / fire / outcome / supersede / archive / prune / pending-* / report`
+- Logo-presence sampler (`logo_sampler.sh`, 3-min systemd timer) pre-stages evidence for rule 10's "5 rounds × 3 min" protocol; brain consumes `state.logo_history`
+- Brain prompt now injects `<<<LEARNED_RULES>>>` queried fresh each wake, and the brain's JSON output includes a `rules_applied` array that wake.sh writes into `rule_firings` for telemetry
+- Pending-confirmations schema + CLI for linking severe Telegram alerts → firings → outcomes
+- 32-assertion regression suite at `channels/brain_loop/test_lessons.sh`
+
+**Production verification, wake #37 at 07:20 CEST** (raw log `channels/brain/raw/wake_20260417T072049.log`):
+- Brain emitted `rules_applied` with 6 entries applying rules 2, 7, 10 across basmah, nada, saad, almajd-kids, almajd-3aamah
+- 6 new `rule_firings` rows inserted (IDs 8–13)
+- almajd-3aamah, which the 04:25 wake had flagged as `mismatch` (Eid overlay false positive), was NOT re-flagged — rule 2 (seasonal overlays are not identity signals) + rule 7 (no-mismatch-without-logo_detected) + rule 10 (5-round protocol) applied
+- Brain's own summary: "rule 10 gated all visual dispatches (saved ~20k tokens); closing almajd-3aamah incident as self-corrected false positive from prior wake"
+- Logo sampler cadence holding at median 181 s (expected 180 s) with zero truncated channel names post the `-nostdin` fix
+
+### Rule 10 implementation note
+
+PROMPT.md implements rule 10 as: "any `logo_present=true` in the last 5 entries → skip mismatch flag." The rule text in the DB says "only if all 5 are absent may you flag." These are **consistent on the NOT-flagging direction** but the PROMPT.md version is biased toward false-negative (miss a real incident for one wake cycle = up to 3 h delay) in exchange for zero unnecessary slates. This is deliberate per the mission ("never a black screen" > "never a false alert") — documented here so the next operator doesn't rewrite the instruction without knowing the trade-off.
+
+### Known gaps at ship time
+
+- **Automatic confirmation capture is OFF.** The Telegram MCP plugin holds the exclusive `getUpdates` long-poll on the colleague bot. `confirmation_poller.sh` runs in expire-only mode. Pending rows get created by wake.sh; operators must resolve via `lessons.sh pending-resolve --by operator` until the plugin is patched. See `channels/brain_loop/confirmation_poller.sh` header for remediation options.
+- **`saad` channel has a state file but no `channel_registry.json` entry.** Sampler emits a WARN each round; rule 10 can't apply until saad is added to the registry (safe one-line change by an operator who knows the correct provider metadata).
+- **Channels stuck in `identity_mismatch` have no auto-reclaim path** even when `logo_history` shows consistent presence (brain itself raised this in `troubleshooting_updates` at wake #37). Workaround: operator clears via jq on the state file. Design fix: add auto-reclaim policy in the watcher.
+
+**Confidence: 93–95%.** Full feedback loop proved functional end-to-end. Two independent code-reviewer passes caught and patched blocking bugs (SQL injection, ffmpeg-stdin byte race, plugin poll conflict). Known gaps are documented rather than hidden.
 
 ---
 

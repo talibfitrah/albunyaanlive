@@ -55,7 +55,11 @@ fi
 "$LESSONS_CLI" pending-expire >>"$LOG_FILE" 2>&1
 log "pending-expire complete (getUpdates disabled — see script header for why)"
 
-# Rotate log at 5 MB.
+# Rotate log at 5 MB. NB: this must remain the LAST step of the script —
+# any log() call after the rotation would write to a now-unexpected path
+# if the rotation has just occurred (the logger re-opens $LOG_FILE each
+# call, so new writes go to a fresh file, but the message the
+# maintainer intended to write before rotation would be lost).
 if [[ -f "$LOG_FILE" ]] && [[ "$(stat -c %s "$LOG_FILE")" -gt 5242880 ]]; then
     mv "$LOG_FILE" "$LOG_FILE.1"
 fi

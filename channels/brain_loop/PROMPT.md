@@ -333,6 +333,18 @@ presumed healthy from an identity standpoint this wake. Skip the
 sub-agent, save the tokens, and emit `verified` (or omit from
 `identity_updates` entirely).
 
+**Rule 10 requires observational grounding.** If a channel's state
+file has `logo_history` absent, null, or empty (e.g. the sampler
+hasn't covered it yet, or the channel isn't in
+`channel_registry.json`), rule 10 is INAPPLICABLE — you MUST NOT
+record a `rules_applied` entry claiming rule 10 gated a decision
+on that channel. For those channels, fall back to the normal
+selection criteria (priority (a)–(e) above) and either dispatch
+the sub-agent or leave the verdict `unknown`. Recording rule 10
+as "applied" without a logo_history pollutes effectiveness
+telemetry and produces false positives when operators review
+`lessons.sh report`.
+
 The sampler's `logo_present` is a presence signal only — it cannot
 detect WRONG-channel content (the logo region simply being
 "occupied"). That's why, after 5 rounds of absence, the visual

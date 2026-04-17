@@ -533,8 +533,8 @@ except Exception as exc:
 # so a reply like "تمام / صحيح / خطأ" can be matched to those firings
 # by the confirmation poller. Without this, rule_firings.outcome stays
 # NULL forever and effectiveness scoring never converges.
-if [[ -x "$LESSONS_CLI" ]] && [[ -f $STATE_DIR/wake_firings.csv ]]; then
-    FIRINGS_CSV="$(cat $STATE_DIR/wake_firings.csv)"
+if [[ -x "$LESSONS_CLI" ]] && [[ -f "$STATE_DIR/wake_firings.csv" ]]; then
+    FIRINGS_CSV="$(cat "$STATE_DIR/wake_firings.csv")"
     SEVERE_COUNT="$(echo "$JSON_DOC" | python3 -c '
 import json, sys
 try:
@@ -560,7 +560,7 @@ except Exception:
             >>"$WAKE_LOG" 2>&1 \
             || log_line "WARN pending-record failed for chat=$CO_CHAT firings=$FIRINGS_CSV"
     fi
-    rm -f $STATE_DIR/wake_firings.csv
+    rm -f "$STATE_DIR/wake_firings.csv"
 fi
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)
