@@ -239,8 +239,8 @@ JSON object):
 
 Dispatch the SELECTED channel sub-agents in PARALLEL — one tool
 message with N Task calls, not sequential. They are independent.
-N is already capped at 8 by the selective-dispatch rule above, so
-no further batching is needed.
+N is already capped at **4** by the selective-dispatch rule above
+(see the §6 cap), so no further batching is needed.
 
 **HARD CONTRACT — read this twice:** the sub-agent's `logo_detected`
 boolean is AUTHORITATIVE. The brain (you) does not re-interpret it,

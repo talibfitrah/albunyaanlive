@@ -37,6 +37,18 @@ mkdir -p "$SAMPLE_DIR" "$(dirname "$LOG_FILE")"
 
 log() { echo "[$(date -Iseconds)] $*" >> "$LOG_FILE"; }
 
+# Concurrency guard. systemd timer fires every 3 min; a pathological
+# slow run (22 ffmpeg probes on a loaded host) could overlap with the
+# next tick. Without a lock, two runs would append duplicate samples
+# to logo_history and confuse rule 10.
+LOCK_FILE="$STATE_DIR/logo_sampler.lock"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+exec 8>"$LOCK_FILE"
+if ! flock -n 8; then
+    log "another sampler run in progress (lock held); skipping"
+    exit 0
+fi
+
 # Given a channel id, returns 0 if the state file says state=LIVE.
 # Non-LIVE channels are skipped — a SLATE/BACKUP channel is not
 # showing the real feed, so sampling its logo would pollute history.
@@ -85,7 +97,13 @@ _sample_one() {
     # no `-ss` because short segments (~7.2s) sometimes overshoot with
     # fast seek and produce an empty output.
     local frame="$SAMPLE_DIR/${ch}_$(date +%s).png"
-    if ! "$FFMPEG_BIN" -y -loglevel error -i "$latest_ts" \
+    # -nostdin: ffmpeg inherits stdin from the while-read loop and eats a
+    # byte per invocation, corrupting the NEXT channel name the loop
+    # reads (truncating e.g. "almajd-3aamah" → "lmajd-3aamah" → SKIP).
+    # Live-log evidence before this fix: 55.7% of channel names truncated
+    # across 183 iterations, causing ~1-2 LIVE channels/round to miss
+    # their sample and rule 10's 12-min window to drift.
+    if ! "$FFMPEG_BIN" -nostdin -y -loglevel error -i "$latest_ts" \
             -frames:v 1 -update 1 "$frame" 2>>"$LOG_FILE"; then
         log "WARN $ch: ffmpeg frame extract failed"
         rm -f "$frame"
@@ -142,8 +160,9 @@ main() {
     fi
     # Clean up orphan sample frames older than 10 min (should be 0
     # normally since _sample_one removes on completion, but belt+braces
-    # for crashes mid-sample).
-    find "$SAMPLE_DIR" -maxdepth 1 -name '*.jpg' -mmin +10 -delete 2>/dev/null
+    # for crashes mid-sample). Match .png because the sampler switched
+    # from JPEG to PNG (mjpeg encoder rejects some YUV ranges in HLS).
+    find "$SAMPLE_DIR" -maxdepth 1 -name '*.png' -mmin +10 -delete 2>/dev/null
 }
 
 main "$@"

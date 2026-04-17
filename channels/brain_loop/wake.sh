@@ -442,10 +442,11 @@ for ch, rids in buckets.items():
 # file. wake.sh reads this after running the Telegram-send block to link
 # pending_confirmations when at least one severe alert went out to the
 # colleague.
-with open("/tmp/albunyaan-wake-firings.csv", "w") as f:
+firings_path = sys.argv[3]
+with open(firings_path, "w") as f:
     f.write(",".join(str(i) for i in all_firing_ids))
 PYEOF
-)" "$LESSONS_CLI" "$JSON_DOC" 2>>"$WAKE_LOG" || log_line "WARN rules_applied processing failed"
+)" "$LESSONS_CLI" "$JSON_DOC" "$STATE_DIR/wake_firings.csv" 2>>"$WAKE_LOG" || log_line "WARN rules_applied processing failed"
 fi
 
 # Post telegram messages, capped to TELEGRAM_MAX_MSGS_PER_WAKE (default 10).
@@ -532,8 +533,8 @@ except Exception as exc:
 # so a reply like "تمام / صحيح / خطأ" can be matched to those firings
 # by the confirmation poller. Without this, rule_firings.outcome stays
 # NULL forever and effectiveness scoring never converges.
-if [[ -x "$LESSONS_CLI" ]] && [[ -f /tmp/albunyaan-wake-firings.csv ]]; then
-    FIRINGS_CSV="$(cat /tmp/albunyaan-wake-firings.csv)"
+if [[ -x "$LESSONS_CLI" ]] && [[ -f $STATE_DIR/wake_firings.csv ]]; then
+    FIRINGS_CSV="$(cat $STATE_DIR/wake_firings.csv)"
     SEVERE_COUNT="$(echo "$JSON_DOC" | python3 -c '
 import json, sys
 try:
@@ -559,7 +560,7 @@ except Exception:
             >>"$WAKE_LOG" 2>&1 \
             || log_line "WARN pending-record failed for chat=$CO_CHAT firings=$FIRINGS_CSV"
     fi
-    rm -f /tmp/albunyaan-wake-firings.csv
+    rm -f $STATE_DIR/wake_firings.csv
 fi
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)

@@ -917,7 +917,10 @@ rules = cur.execute("""
            SUM(CASE WHEN rf.outcome = 'wrong'          THEN 1 ELSE 0 END) AS wrong,
            SUM(CASE WHEN rf.outcome = 'no_effect'      THEN 1 ELSE 0 END) AS no_effect,
            SUM(CASE WHEN rf.outcome IS NULL            THEN 1 ELSE 0 END) AS unscored,
-           substr(r.rule_text, 1, 70) AS preview,
+           -- Flatten newlines in rule_text so table columns stay aligned.
+           -- rule_text commonly has paragraph breaks; 70 chars is just a
+           -- preview so whitespace-collapse is safe.
+           substr(replace(replace(r.rule_text, char(10), ' '), char(13), ' '), 1, 70) AS preview,
            julianday('now') - julianday(r.created_at) AS age_days
     FROM rules r
     LEFT JOIN rule_firings rf ON rf.rule_id = r.id
