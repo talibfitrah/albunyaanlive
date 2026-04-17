@@ -1,0 +1,30 @@
+[Unit]
+Description=Albunyaan Telegram confirmation poller — closes the self-improvement loop
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/brain_loop/confirmation_poller.sh
+
+[Service]
+Type=oneshot
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/brain_loop/confirmation_poller.sh
+
+# This is a short-poll HTTP call + a few SQLite writes; should be well
+# under 20 s even on a bad network. Tight caps guard against runaway.
+TimeoutStartSec=30s
+MemoryMax=128M
+CPUQuota=25%
+
+# Reads the Telegram env file, writes lessons.db + an offset file and a
+# log under channels/brain. No filesystem access beyond that.
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels/brain
+ReadOnlyPaths=/home/msa/.claude/channels/telegram
+ProtectHome=read-only
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

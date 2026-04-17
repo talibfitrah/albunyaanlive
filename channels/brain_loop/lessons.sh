@@ -19,6 +19,17 @@
 #                             Set rule to archived (soft delete).
 #   prune [--days N]
 #                             Archive rules expired by TTL or idle for N days (default 90).
+#   pending-record --chat-id X --firing-ids 1,2,3 [--channel-id X] [--message-id N]
+#                  [--alert-text TEXT] [--expires-hours N]
+#                             Record a pending Telegram confirmation. Called by wake.sh
+#                             when it sends a severe alert so replies can be matched later.
+#   pending-list [--chat-id X] [--status S] [--limit N]
+#                             Show pending confirmations. Default: all pending across chats.
+#   pending-resolve --id N --outcome O [--reply-text TEXT] [--by poller|operator]
+#                             Mark a pending row resolved and write the outcome to every
+#                             linked firing. Atomic: one transaction.
+#   pending-expire
+#                             Flip any pending rows past their expires_at to status=expired.
 #   version                   Print schema version.
 #
 # The CLI is the only recommended way to touch the DB. Do not hand-edit
@@ -352,21 +363,22 @@ PYEOF
 }
 
 fire_rules() {
-    # Args: --rule-ids id,id,... [--channel ch]
+    # Args: --rule-ids id,id,... [--channel ch] [--print-ids]
     require_sqlite
-    local ids="" channel=""
+    local ids="" channel="" print_ids=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --rule-ids) ids="$2"; shift 2 ;;
             --channel)  channel="$2"; shift 2 ;;
+            --print-ids) print_ids=1; shift 1 ;;
             *) die "unknown flag: $1" ;;
         esac
     done
     [[ -n "$ids" ]] || die "--rule-ids is required"
 
-    python3 - "$DB_PATH" "$ids" "$channel" <<'PYEOF'
+    python3 - "$DB_PATH" "$ids" "$channel" "$print_ids" <<'PYEOF'
 import sys, sqlite3
-db_path, ids_csv, channel = sys.argv[1], sys.argv[2], sys.argv[3] or None
+db_path, ids_csv, channel, print_ids = sys.argv[1], sys.argv[2], sys.argv[3] or None, sys.argv[4] == "1"
 ids = [int(x) for x in ids_csv.split(',') if x.strip().isdigit()]
 if not ids:
     print("no valid rule ids", file=sys.stderr)
@@ -377,20 +389,29 @@ con = sqlite3.connect(db_path)
 # silently become orphan telemetry.
 con.execute("PRAGMA foreign_keys = ON")
 cur = con.cursor()
-recorded = 0
+recorded_ids = []
 skipped = []
 for rid in ids:
     try:
         cur.execute("INSERT INTO rule_firings(rule_id, channel_id) VALUES (?, ?)",
                     (rid, channel))
+        recorded_ids.append(cur.lastrowid)
         cur.execute("UPDATE rules SET times_applied = times_applied + 1, "
                     "last_applied_at = datetime('now') WHERE id = ?", (rid,))
-        recorded += 1
     except sqlite3.IntegrityError:
         skipped.append(rid)
 con.commit()
 con.close()
-print(f"recorded {recorded} firings" + (f", skipped (no such rule): {skipped}" if skipped else ""))
+if print_ids:
+    # Machine-readable: one firing id per line on stdout. Used by wake.sh
+    # to link firings to pending_confirmations.
+    for fid in recorded_ids:
+        print(fid)
+else:
+    msg = f"recorded {len(recorded_ids)} firings"
+    if skipped:
+        msg += f", skipped (no such rule): {skipped}"
+    print(msg)
 if skipped:
     sys.exit(1)
 PYEOF
@@ -580,6 +601,249 @@ print_version() {
     sqlite3 "$DB_PATH" "SELECT value FROM schema_meta WHERE key = 'version';"
 }
 
+# ---------------------------------------------------------------------------
+# pending_confirmations — Telegram capture layer
+# ---------------------------------------------------------------------------
+
+pending_record() {
+    require_sqlite
+    local chat_id="" firing_ids="" channel_id="" message_id="" alert_text=""
+    local expires_hours=6
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chat-id)       chat_id="$2"; shift 2 ;;
+            --firing-ids)    firing_ids="$2"; shift 2 ;;
+            --channel-id)    channel_id="$2"; shift 2 ;;
+            --message-id)    message_id="$2"; shift 2 ;;
+            --alert-text)    alert_text="$2"; shift 2 ;;
+            --expires-hours) expires_hours="$2"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    [[ -n "$chat_id" ]]    || die "--chat-id is required"
+    [[ -n "$firing_ids" ]] || die "--firing-ids is required"
+
+    python3 - "$DB_PATH" "$chat_id" "$firing_ids" "$channel_id" "$message_id" \
+             "$alert_text" "$expires_hours" <<'PYEOF'
+import sys, sqlite3, json, re
+db_path, chat_id, firing_csv, channel_id, message_id, alert_text, expires_hours = sys.argv[1:8]
+
+if not re.fullmatch(r'-?\d+', chat_id):
+    print(f"error: --chat-id must be numeric, got {chat_id!r}", file=sys.stderr)
+    sys.exit(2)
+
+fids = []
+for token in firing_csv.split(','):
+    token = token.strip()
+    if not token:
+        continue
+    if not token.isdigit():
+        print(f"error: firing_ids must be positive integers, got {token!r}", file=sys.stderr)
+        sys.exit(2)
+    fids.append(int(token))
+if not fids:
+    print("error: at least one firing_id is required", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    hours = int(expires_hours)
+    if hours < 1 or hours > 168:
+        raise ValueError
+except ValueError:
+    print(f"error: --expires-hours must be 1..168, got {expires_hours!r}", file=sys.stderr)
+    sys.exit(2)
+
+mid = None
+if message_id:
+    if not re.fullmatch(r'-?\d+', message_id):
+        print(f"error: --message-id must be an integer", file=sys.stderr)
+        sys.exit(2)
+    mid = int(message_id)
+
+con = sqlite3.connect(db_path)
+con.execute("PRAGMA foreign_keys = ON")
+cur = con.cursor()
+# Confirm every firing exists — guards against stale input corrupting the
+# pending row.
+q_marks = ','.join('?' * len(fids))
+existing = {r[0] for r in cur.execute(
+    f"SELECT id FROM rule_firings WHERE id IN ({q_marks})", fids).fetchall()}
+missing = [f for f in fids if f not in existing]
+if missing:
+    print(f"error: firing_ids not in DB: {missing}", file=sys.stderr)
+    sys.exit(2)
+
+cur.execute("""
+    INSERT INTO pending_confirmations(
+        chat_id, message_id, alert_text, channel_id,
+        firing_ids, expires_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now', ?))
+""", (chat_id, mid, alert_text or None, channel_id or None,
+      json.dumps(fids), f'+{hours} hours'))
+pid = cur.lastrowid
+con.commit()
+con.close()
+print(f"pending id={pid} chat={chat_id} firings={fids} expires_hours={hours}")
+PYEOF
+}
+
+pending_list() {
+    require_sqlite
+    local chat_id="" status="pending" limit=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chat-id) chat_id="$2"; shift 2 ;;
+            --status)  status="$2";  shift 2 ;;
+            --limit)   limit="$2";   shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+
+    python3 - "$DB_PATH" "$chat_id" "$status" "$limit" <<'PYEOF'
+import sys, sqlite3
+db_path, chat_id, status, limit = sys.argv[1:5]
+try:
+    limit = int(limit)
+    if limit < 1 or limit > 10000:
+        limit = 20
+except ValueError:
+    limit = 20
+
+sql = ("SELECT id, chat_id, channel_id, firing_ids, "
+       "datetime(sent_at) as sent, datetime(expires_at) as expires, "
+       "status, resolved_outcome, substr(COALESCE(alert_text, ''), 1, 50) as alert_preview "
+       "FROM pending_confirmations WHERE 1=1")
+params = []
+if chat_id:
+    sql += " AND chat_id = ?"
+    params.append(chat_id)
+if status and status != 'all':
+    sql += " AND status = ?"
+    params.append(status)
+sql += " ORDER BY sent_at DESC LIMIT ?"
+params.append(limit)
+
+con = sqlite3.connect(db_path)
+con.execute("PRAGMA foreign_keys = ON")
+rows = con.execute(sql, params).fetchall()
+con.close()
+if not rows:
+    print("(no rows)")
+    sys.exit(0)
+headers = ["id", "chat", "ch", "firings", "sent", "expires", "status", "outcome", "alert"]
+widths = [max(len(str(h)), max((len(str(r[i])) for r in rows), default=0))
+          for i, h in enumerate(headers)]
+print("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+print("  ".join("-" * w for w in widths))
+for r in rows:
+    print("  ".join(str(v if v is not None else "-").ljust(widths[i])
+                    for i, v in enumerate(r)))
+PYEOF
+}
+
+pending_resolve() {
+    require_sqlite
+    local pid="" outcome="" reply_text="" by="operator"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)         pid="$2"; shift 2 ;;
+            --outcome)    outcome="$2"; shift 2 ;;
+            --reply-text) reply_text="$2"; shift 2 ;;
+            --by)         by="$2"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    [[ -n "$pid" && -n "$outcome" ]] || die "--id and --outcome are required"
+    case "$outcome" in
+        prevented_fp|confirmed_flag|no_effect|wrong) ;;
+        *) die "outcome must be prevented_fp|confirmed_flag|no_effect|wrong" ;;
+    esac
+    case "$by" in
+        poller|operator) ;;
+        *) die "--by must be poller or operator" ;;
+    esac
+
+    python3 - "$DB_PATH" "$pid" "$outcome" "$reply_text" "$by" <<'PYEOF'
+import sys, sqlite3, json
+db_path, pid, outcome, reply_text, by = sys.argv[1:6]
+try:
+    pid = int(pid)
+except ValueError:
+    print("error: --id must be an integer", file=sys.stderr)
+    sys.exit(2)
+
+con = sqlite3.connect(db_path)
+con.execute("PRAGMA foreign_keys = ON")
+cur = con.cursor()
+
+# Atomic: resolve pending AND stamp outcome on every linked firing, in
+# one transaction. If either side fails, nothing changes.
+try:
+    cur.execute("BEGIN IMMEDIATE")
+    row = cur.execute(
+        "SELECT status, firing_ids FROM pending_confirmations WHERE id = ?",
+        (pid,)).fetchone()
+    if row is None:
+        con.rollback()
+        print(f"error: pending_confirmations id={pid} not found", file=sys.stderr)
+        sys.exit(2)
+    if row[0] != 'pending':
+        # Idempotency: if already resolved/expired, say so but don't error —
+        # lets the poller retry safely on transient crashes.
+        con.rollback()
+        print(f"pending id={pid} already {row[0]}; no change")
+        sys.exit(0)
+    firing_ids = json.loads(row[1])
+    if not isinstance(firing_ids, list) or not all(isinstance(x, int) for x in firing_ids):
+        con.rollback()
+        print(f"error: pending id={pid} has malformed firing_ids", file=sys.stderr)
+        sys.exit(2)
+
+    updated = 0
+    for fid in firing_ids:
+        cur.execute(
+            "UPDATE rule_firings SET outcome = ?, outcome_at = datetime('now'), "
+            "notes = COALESCE(notes, ?) WHERE id = ? AND outcome IS NULL",
+            (outcome, reply_text or None, fid))
+        updated += cur.rowcount
+
+    cur.execute("""
+        UPDATE pending_confirmations
+        SET status = 'resolved', resolved_outcome = ?, resolved_reply_text = ?,
+            resolved_at = datetime('now'), resolved_by = ?
+        WHERE id = ?
+    """, (outcome, reply_text or None, by, pid))
+
+    con.commit()
+    print(f"resolved pending id={pid} outcome={outcome} firings_updated={updated}")
+except Exception as e:
+    con.rollback()
+    print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    con.close()
+PYEOF
+}
+
+pending_expire() {
+    require_sqlite
+    python3 - "$DB_PATH" <<'PYEOF'
+import sys, sqlite3
+db_path = sys.argv[1]
+con = sqlite3.connect(db_path)
+con.execute("PRAGMA foreign_keys = ON")
+cur = con.cursor()
+cur.execute("""
+    UPDATE pending_confirmations SET status = 'expired'
+    WHERE status = 'pending' AND expires_at <= datetime('now')
+""")
+n = cur.rowcount
+con.commit()
+con.close()
+print(f"expired: {n}")
+PYEOF
+}
+
 cmd="${1:-}"
 shift 2>/dev/null || true
 case "$cmd" in
@@ -592,6 +856,10 @@ case "$cmd" in
     supersede)  supersede_rule "$@" ;;
     archive)    archive_rule "$@" ;;
     prune)      prune_rules "$@" ;;
+    pending-record)  pending_record "$@" ;;
+    pending-list)    pending_list "$@" ;;
+    pending-resolve) pending_resolve "$@" ;;
+    pending-expire)  pending_expire "$@" ;;
     version)    print_version ;;
     ""|help|-h|--help)
         sed -n '/^# Subcommands:/,/^# The CLI/p' "$0" | sed 's/^# \?//'

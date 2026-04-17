@@ -404,22 +404,37 @@ for entry in applied:
         # Same character whitelist as identity_updates — refuse surprising input.
         continue
     buckets[ch].append(rid)
+all_firing_ids = []
 for ch, rids in buckets.items():
-    args = [cli, "fire", "--rule-ids", ",".join(str(r) for r in rids)]
+    args = [cli, "fire", "--rule-ids", ",".join(str(r) for r in rids), "--print-ids"]
     if ch:
         args += ["--channel", ch]
     try:
         # Capture stderr so bad rule IDs / FK violations surface in wake.log
         # rather than silently dropping — the operator needs to know the
-        # brain is hallucinating rule IDs or the DB has drifted.
+        # brain is hallucinating rule IDs or the DB has drifted. Capture
+        # stdout to collect the firing IDs created so we can link them to
+        # pending_confirmations when this wake also emits severe Telegram
+        # alerts.
         result = subprocess.run(args, check=False, timeout=10,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
         if result.returncode != 0:
             print(f"rules_applied: fire rc={result.returncode} ch={ch!r} rids={rids} "
                   f"stderr={result.stderr.strip()!r}", file=sys.stderr)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                all_firing_ids.append(int(line))
     except Exception as e:
         print(f"rules_applied: fire call failed for ch={ch!r}: {e}", file=sys.stderr)
+
+# Hand the collected firing IDs to the outer bash scope via a sidecar
+# file. wake.sh reads this after running the Telegram-send block to link
+# pending_confirmations when at least one severe alert went out to the
+# colleague.
+with open("/tmp/albunyaan-wake-firings.csv", "w") as f:
+    f.write(",".join(str(i) for i in all_firing_ids))
 PYEOF
 )" "$LESSONS_CLI" "$JSON_DOC" 2>>"$WAKE_LOG" || log_line "WARN rules_applied processing failed"
 fi
@@ -502,6 +517,41 @@ except Exception as exc:
          f"تنبيه: تقرير الفحص غير صالح. راجع السجل على الخادم.")
     sys.exit(0)
 ' <<<"$JSON_DOC"
+
+# If the wake sent any severe alerts to the colleague AND recorded any
+# firings from rules_applied, link them into a pending_confirmation row
+# so a reply like "تمام / صحيح / خطأ" can be matched to those firings
+# by the confirmation poller. Without this, rule_firings.outcome stays
+# NULL forever and effectiveness scoring never converges.
+if [[ -x "$LESSONS_CLI" ]] && [[ -f /tmp/albunyaan-wake-firings.csv ]]; then
+    FIRINGS_CSV="$(cat /tmp/albunyaan-wake-firings.csv)"
+    SEVERE_COUNT="$(echo "$JSON_DOC" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    msgs = d.get("telegram_messages") or []
+    print(sum(1 for m in msgs if isinstance(m, dict)
+              and (m.get("severity") or "").lower() == "severe"
+              and (m.get("ar") or "").strip()))
+except Exception:
+    print(0)
+')"
+    CO_CHAT="${COLLEAGUE_OWNER_ID:-}"
+    if [[ -n "$FIRINGS_CSV" ]] && [[ "$SEVERE_COUNT" -gt 0 ]] && [[ -n "$CO_CHAT" ]]; then
+        # Use the wake's summary as the alert_text hint — cheaper than
+        # trying to reconstruct which specific severe message is "the"
+        # one; the poller doesn't need exact text, just a recency window.
+        ALERT_HINT="wake $(date -Iseconds | cut -c1-19): ${SEVERE_COUNT} severe alert(s)"
+        "$LESSONS_CLI" pending-record \
+            --chat-id "$CO_CHAT" \
+            --firing-ids "$FIRINGS_CSV" \
+            --alert-text "$ALERT_HINT" \
+            --expires-hours 6 \
+            >>"$WAKE_LOG" 2>&1 \
+            || log_line "WARN pending-record failed for chat=$CO_CHAT firings=$FIRINGS_CSV"
+    fi
+    rm -f /tmp/albunyaan-wake-firings.csv
+fi
 
 # Honor the action: restart_watcher (safe — uses sudo via askpass if available)
 RESTART_WATCHER="$(echo "$JSON_DOC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if (d.get("actions") or {}).get("restart_watcher") else "no")')"

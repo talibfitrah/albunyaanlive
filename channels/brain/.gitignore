@@ -10,3 +10,7 @@ lessons.db
 lessons.db-wal
 lessons.db-shm
 logo_sampler.log
+tg_confirm_offset.txt
+confirmation_poller.log
+confirmation_poller.log.1
+logo_sampler.log.1

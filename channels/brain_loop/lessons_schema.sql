@@ -107,6 +107,57 @@ CREATE INDEX IF NOT EXISTS idx_firings_rule ON rule_firings(rule_id);
 CREATE INDEX IF NOT EXISTS idx_firings_wake ON rule_firings(wake_ts);
 
 -- ---------------------------------------------------------------------------
+-- Pending confirmations: severe brain alerts waiting for colleague reply.
+--
+-- When wake.sh sends a severity=severe Telegram message to the colleague,
+-- it records a row here pinning the alert to the firing_ids produced that
+-- wake. The confirmation poller (systemd timer every ~2 min) matches
+-- colleague replies to pending rows by chat_id + recency + keyword
+-- parsing, then updates rule_firings.outcome for each linked firing.
+--
+-- Without this table, every firing stays outcome=NULL forever and
+-- effectiveness scoring never converges. This is the capture layer for
+-- the self-improvement loop.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pending_confirmations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Telegram routing
+    chat_id         TEXT NOT NULL,
+    message_id      INTEGER,   -- our sent alert's Telegram message_id, for thread matching
+
+    -- Content captured for operator review
+    alert_text      TEXT,
+    channel_id      TEXT,      -- optional; the channel this alert was about
+
+    -- What we're waiting on
+    firing_ids      TEXT NOT NULL,  -- JSON array of rule_firings.id values
+
+    -- Lifecycle
+    sent_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                        'pending',   -- awaiting colleague reply
+                        'resolved',  -- a confirming/rejecting reply has arrived
+                        'expired'    -- TTL elapsed without a usable reply
+                    )),
+
+    -- Resolution
+    resolved_outcome    TEXT CHECK(resolved_outcome IS NULL OR resolved_outcome IN (
+                            'prevented_fp', 'confirmed_flag', 'no_effect', 'wrong'
+                        )),
+    resolved_reply_text TEXT,
+    resolved_at         TEXT,
+    resolved_by         TEXT CHECK(resolved_by IS NULL OR resolved_by IN (
+                            'poller', 'operator'
+                        ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_chat_open
+    ON pending_confirmations(chat_id, status, sent_at);
+
+-- ---------------------------------------------------------------------------
 -- Schema version. Bump when changing anything above and write a migration.
 -- ---------------------------------------------------------------------------
 
@@ -115,4 +166,4 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '1');
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '2');

@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger Albunyaan confirmation poller every 2 minutes
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/brain_loop/confirmation_poller.sh
+
+[Timer]
+# 2-minute cadence. Tight enough that a colleague reply gets stamped
+# onto its firings before the brain's next wake (3 h). Loose enough
+# that Telegram's rate limits won't care.
+OnBootSec=60s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+Unit=albunyaan-confirm-poller.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
