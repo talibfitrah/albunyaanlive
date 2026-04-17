@@ -30,6 +30,10 @@
 #                             linked firing. Atomic: one transaction.
 #   pending-expire
 #                             Flip any pending rows past their expires_at to status=expired.
+#   report [--top N] [--json]
+#                             Print an effectiveness dashboard: per-rule score, top
+#                             never-fired, problematic (high-wrong) rules, and recent
+#                             activity. --json emits a machine-readable object.
 #   version                   Print schema version.
 #
 # The CLI is the only recommended way to touch the DB. Do not hand-edit
@@ -202,6 +206,21 @@ if 'category' not in d or 'rule_text' not in d:
     print("error: --category and --rule-text are required", file=sys.stderr)
     sys.exit(2)
 
+# Length cap — keep each rule's contribution to the LEARNED_RULES prompt
+# block bounded. 2000 chars ≈ 500 tokens. At 50 rules × 500 tokens = 25k
+# tokens max; well under any brain context budget. Rationale paragraphs
+# should live in the `rationale` column, not in rule_text.
+MAX_RULE_CHARS = 2000
+if len(d['rule_text']) > MAX_RULE_CHARS:
+    print(f"error: rule_text is {len(d['rule_text'])} chars; cap is {MAX_RULE_CHARS}. "
+          f"Split the long text — put the operational rule in --rule-text, "
+          f"background in --rationale.", file=sys.stderr)
+    sys.exit(2)
+if d.get('rationale') and len(d['rationale']) > 4000:
+    print(f"error: rationale is {len(d['rationale'])} chars; cap is 4000",
+          file=sys.stderr)
+    sys.exit(2)
+
 valid_cats = {'identity', 'overlay', 'source', 'provider',
               'operational', 'tone', 'escalation', 'other'}
 if d['category'] not in valid_cats:
@@ -311,8 +330,12 @@ cur = con.cursor()
 
 # Global rules + rules for the given channels, ordered by priority then
 # recency. Skip expired. Limit to 50 so the prompt doesn't blow up.
+QUERY_LIMIT = 50
 if channels:
     placeholders = ','.join('?' * len(channels))
+    # Get both the page and the total count. If count > page size, the
+    # brain is seeing a truncated view — warn on stderr so the operator
+    # can prune or raise the cap before rules silently drop.
     sql = f"""
         SELECT id, category, channel_id, rule_text, source, priority, created_at
         FROM rules
@@ -320,20 +343,37 @@ if channels:
           AND (expires_at IS NULL OR expires_at > datetime('now'))
           AND (channel_id IS NULL OR channel_id IN ({placeholders}))
         ORDER BY priority ASC, datetime(created_at) DESC
-        LIMIT 50
+        LIMIT {QUERY_LIMIT}
     """
+    count_sql = f"""
+        SELECT COUNT(*) FROM rules
+        WHERE status = 'active'
+          AND (expires_at IS NULL OR expires_at > datetime('now'))
+          AND (channel_id IS NULL OR channel_id IN ({placeholders}))
+    """
+    total = cur.execute(count_sql, channels).fetchone()[0]
     rows = cur.execute(sql, channels).fetchall()
 else:
-    sql = """
+    sql = f"""
         SELECT id, category, channel_id, rule_text, source, priority, created_at
         FROM rules
         WHERE status = 'active'
           AND (expires_at IS NULL OR expires_at > datetime('now'))
           AND channel_id IS NULL
         ORDER BY priority ASC, datetime(created_at) DESC
-        LIMIT 50
+        LIMIT {QUERY_LIMIT}
     """
+    total = cur.execute("""
+        SELECT COUNT(*) FROM rules
+        WHERE status = 'active'
+          AND (expires_at IS NULL OR expires_at > datetime('now'))
+          AND channel_id IS NULL
+    """).fetchone()[0]
     rows = cur.execute(sql).fetchall()
+if total > QUERY_LIMIT:
+    print(f"WARN lessons.sh query: {total} rules match but only top {QUERY_LIMIT} "
+          f"returned (sorted by priority ASC, created_at DESC). "
+          f"Prune or archive idle rules, or raise QUERY_LIMIT.", file=sys.stderr)
 
 if not rows:
     print("(no active rules)")
@@ -844,6 +884,154 @@ print(f"expired: {n}")
 PYEOF
 }
 
+report_effectiveness() {
+    require_sqlite
+    local top=10 as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --top)  top="$2"; shift 2 ;;
+            --json) as_json=1; shift 1 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+
+    python3 - "$DB_PATH" "$top" "$as_json" <<'PYEOF'
+import sys, sqlite3, json
+from datetime import datetime, timezone
+
+db_path, top, as_json = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+
+con = sqlite3.connect(db_path)
+con.execute("PRAGMA foreign_keys = ON")
+con.row_factory = sqlite3.Row
+cur = con.cursor()
+
+# Per-rule effectiveness. Score = (confirmed + prevented_fp - 2*wrong) / total.
+# Range: -2 (always wrong) to +1 (always right). Rules with no scored
+# firings get NULL and sort last.
+rules = cur.execute("""
+    SELECT r.id, r.category, r.channel_id, r.source, r.priority, r.status,
+           r.times_applied,
+           SUM(CASE WHEN rf.outcome = 'confirmed_flag' THEN 1 ELSE 0 END) AS confirmed,
+           SUM(CASE WHEN rf.outcome = 'prevented_fp'   THEN 1 ELSE 0 END) AS prevented,
+           SUM(CASE WHEN rf.outcome = 'wrong'          THEN 1 ELSE 0 END) AS wrong,
+           SUM(CASE WHEN rf.outcome = 'no_effect'      THEN 1 ELSE 0 END) AS no_effect,
+           SUM(CASE WHEN rf.outcome IS NULL            THEN 1 ELSE 0 END) AS unscored,
+           substr(r.rule_text, 1, 70) AS preview,
+           julianday('now') - julianday(r.created_at) AS age_days
+    FROM rules r
+    LEFT JOIN rule_firings rf ON rf.rule_id = r.id
+    GROUP BY r.id
+""").fetchall()
+
+def score(r):
+    scored = r["confirmed"] + r["prevented"] + r["wrong"] + r["no_effect"]
+    if scored == 0:
+        return None
+    return (r["confirmed"] + r["prevented"] - 2 * r["wrong"]) / scored
+
+enriched = []
+for r in rules:
+    d = dict(r)
+    d["score"] = score(r)
+    enriched.append(d)
+
+# Partition rules into categories for the dashboard.
+active = [r for r in enriched if r["status"] == "active"]
+never_fired = [r for r in active if r["times_applied"] == 0]
+high_wrong = [r for r in active if r["wrong"] >= 3 and (r["score"] is not None and r["score"] < 0)]
+most_used = sorted(active, key=lambda r: -r["times_applied"])[:top]
+
+# Pending confirmations summary.
+pending = cur.execute("""
+    SELECT status, COUNT(*) AS n FROM pending_confirmations GROUP BY status
+""").fetchall()
+pending_by_status = {r["status"]: r["n"] for r in pending}
+
+# Recent activity (last 24 h).
+recent = cur.execute("""
+    SELECT outcome, COUNT(*) AS n FROM rule_firings
+    WHERE wake_ts >= datetime('now', '-24 hours')
+    GROUP BY outcome
+""").fetchall()
+recent_by_outcome = {(r["outcome"] or "unscored"): r["n"] for r in recent}
+
+con.close()
+
+if as_json:
+    def r_for_json(r):
+        return {k: (round(v, 3) if isinstance(v, float) and v is not None else v)
+                for k, v in r.items()}
+    print(json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "active_rules": len(active),
+            "never_fired": len(never_fired),
+            "high_wrong": len(high_wrong),
+            "pending": pending_by_status,
+            "recent_24h": recent_by_outcome,
+        },
+        "most_used": [r_for_json(r) for r in most_used],
+        "never_fired": [r_for_json(r) for r in never_fired],
+        "high_wrong": [r_for_json(r) for r in high_wrong],
+    }, indent=2, ensure_ascii=False))
+    sys.exit(0)
+
+# Plain-text dashboard.
+print("=" * 72)
+print("Albunyaan Brain Lessons DB — Effectiveness Report")
+print(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+print("=" * 72)
+
+print()
+print("SUMMARY")
+print("-" * 72)
+print(f"  Active rules:          {len(active)}")
+print(f"  Never fired:           {len(never_fired)}")
+print(f"  High-wrong (>=3 wr):   {len(high_wrong)}")
+pend_str = ", ".join(f"{k}={v}" for k, v in pending_by_status.items()) or "(none)"
+print(f"  Pending confirmations: {pend_str}")
+rec_str = ", ".join(f"{k}={v}" for k, v in recent_by_outcome.items()) or "(no firings last 24h)"
+print(f"  Firings (last 24h):    {rec_str}")
+
+print()
+print(f"TOP {len(most_used)} MOST-USED RULES")
+print("-" * 72)
+print(f"  {'id':>3}  {'cat':<12}  {'prio':>4}  {'fires':>5}  {'conf':>4}  {'wrong':>5}  {'score':>6}  preview")
+for r in most_used:
+    s = "   --" if r["score"] is None else f"{r['score']:+6.2f}"
+    print(f"  {r['id']:>3}  {r['category']:<12}  {r['priority']:>4}  "
+          f"{r['times_applied']:>5}  {r['confirmed']:>4}  {r['wrong']:>5}  {s}  "
+          f"{r['preview'][:45]}")
+
+if never_fired:
+    print()
+    print(f"NEVER-FIRED RULES ({len(never_fired)} — candidates for prune)")
+    print("-" * 72)
+    print(f"  {'id':>3}  {'cat':<12}  {'age_d':>6}  {'source':<9}  preview")
+    for r in sorted(never_fired, key=lambda x: -x["age_days"])[:top]:
+        print(f"  {r['id']:>3}  {r['category']:<12}  {r['age_days']:>6.1f}  "
+              f"{r['source']:<9}  {r['preview'][:45]}")
+
+if high_wrong:
+    print()
+    print(f"HIGH-WRONG RULES ({len(high_wrong)} — review/supersede)")
+    print("-" * 72)
+    for r in high_wrong:
+        print(f"  rule {r['id']}: wrong={r['wrong']} confirmed={r['confirmed']} "
+              f"score={r['score']:+.2f} — {r['preview'][:50]}")
+        print(f"    > channels/brain_loop/lessons.sh archive --id {r['id']}")
+        print(f"    > (or) supersede --old {r['id']} --new <NEW_ID>")
+else:
+    print()
+    print("HIGH-WRONG RULES")
+    print("-" * 72)
+    print("  (none)")
+
+print()
+PYEOF
+}
+
 cmd="${1:-}"
 shift 2>/dev/null || true
 case "$cmd" in
@@ -860,6 +1048,7 @@ case "$cmd" in
     pending-list)    pending_list "$@" ;;
     pending-resolve) pending_resolve "$@" ;;
     pending-expire)  pending_expire "$@" ;;
+    report)          report_effectiveness "$@" ;;
     version)    print_version ;;
     ""|help|-h|--help)
         sed -n '/^# Subcommands:/,/^# The CLI/p' "$0" | sed 's/^# \?//'

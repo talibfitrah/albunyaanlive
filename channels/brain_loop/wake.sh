@@ -105,6 +105,15 @@ if [[ -x "$LESSONS_CLI" ]]; then
     if [[ -z "$ALL_CHANNELS" ]]; then
         log_line "WARN channel_registry.json unreadable or empty; LEARNED_RULES includes global rules only"
     fi
+    # Prompt-budget guard. 8000 chars ≈ 2000 tokens — a meaningful slice
+    # of any reasonable context window. If the rules block grows past
+    # that, either the operator is filling the DB with junk or rule_text
+    # hasn't been kept terse. Surface it so action can be taken before
+    # wake costs spiral.
+    LEARNED_RULES_BYTES=${#LEARNED_RULES}
+    if [[ "$LEARNED_RULES_BYTES" -gt 8000 ]]; then
+        log_line "WARN LEARNED_RULES block is ${LEARNED_RULES_BYTES} chars (soft cap 8000). Run 'lessons.sh prune' or archive idle rules."
+    fi
 fi
 
 LAST_REVIEWED_SHA="$(echo "$PRIOR_STATE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("last_commit_reviewed") or "")' 2>/dev/null || echo "")"
