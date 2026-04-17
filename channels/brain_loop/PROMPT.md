@@ -314,6 +314,32 @@ false positives that would cascade the reflex loop. Record the skip in
 Read the per-channel state files at `/var/run/albunyaan/state/<id>.json`
 before selecting. Use the `cat` tool (allowed by BASH_ALLOWLIST).
 
+**Consult `logo_history` before dispatching any visual sub-agent.**
+The logo sampler (`channels/brain_loop/logo_sampler.sh`, timer
+`albunyaan-logo-sampler.timer`, runs every 3 min) appends a
+presence signal to each LIVE channel's state file under
+`.logo_history` — most recent 7 entries. Each entry:
+
+```json
+{ "ts": "<ISO8601>", "logo_present": bool,
+  "variance": float, "edge_density": float, "confidence": float }
+```
+
+Rule 10 in the lessons DB is binding here: **do NOT dispatch a visual
+sub-agent or emit `identity_status=mismatch` unless the last 5
+entries in `logo_history` all have `logo_present=false`.** Fewer
+than 5 entries, or any `true` in the last 5 → the channel is
+presumed healthy from an identity standpoint this wake. Skip the
+sub-agent, save the tokens, and emit `verified` (or omit from
+`identity_updates` entirely).
+
+The sampler's `logo_present` is a presence signal only — it cannot
+detect WRONG-channel content (the logo region simply being
+"occupied"). That's why, after 5 rounds of absence, the visual
+sub-agent still runs: its job is the semantic "is this the right
+logo?" check. The sampler just filters out the 99% of wakes where
+logo presence is obvious and no LLM call is needed.
+
 ### 7. Security and code-review pass
 
 Read `<<<NEW_COMMITS>>>` (inline below). For each commit since the

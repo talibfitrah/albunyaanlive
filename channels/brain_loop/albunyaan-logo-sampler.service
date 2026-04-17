@@ -1,0 +1,39 @@
+[Unit]
+Description=Albunyaan logo-presence sampler — pre-stages evidence for rule 10
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/brain_loop/logo_sampler.sh
+
+# Don't run if the reflex watcher isn't up; sampler only makes sense
+# when channels are actively supervised.
+After=albunyaan-watcher.service
+Wants=albunyaan-watcher.service
+
+[Service]
+Type=oneshot
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/brain_loop/logo_sampler.sh
+
+# Resource caps — the sampler should be cheap (≤10 s per round,
+# 22 ffmpeg frame extracts + 22 PIL analyses). Tight limits catch
+# runaway behaviour.
+TimeoutStartSec=60s
+MemoryMax=512M
+CPUQuota=50%
+
+# Filesystem: the sampler reads HLS under /var/www/html/stream, writes
+# PNGs to /tmp/albunyaan-logo-samples, and updates state files under
+# /var/run/albunyaan/state. Nothing else.
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/var/run/albunyaan /tmp/albunyaan-logo-samples /home/msa/Development/scripts/albunyaan/channels/brain
+ReadOnlyPaths=/var/www/html/stream
+ProtectHome=read-only
+
+# Logs to journal; the script also writes a dedicated log under
+# channels/brain/logo_sampler.log for the operator.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
