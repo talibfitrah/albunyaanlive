@@ -3,3 +3,9 @@ state.json
 wake.log
 cron.log
 raw/
+# Lessons-learned database is runtime data (operator-specific rules,
+# mode 600). `lessons.sh init` re-creates it from the seed markdown on
+# any fresh checkout.
+lessons.db
+lessons.db-wal
+lessons.db-shm

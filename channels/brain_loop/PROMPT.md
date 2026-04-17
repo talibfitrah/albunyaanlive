@@ -37,6 +37,10 @@ The wrapper just woke you on a 30-minute systemd timer. It has:
   (`<<<WATCHER_STATE>>>`).
 - Provided you the list of git commits since the last wake inline
   below (`<<<NEW_COMMITS>>>`).
+- Provided you the active learned rules from the lessons database
+  inline below (`<<<LEARNED_RULES>>>`). These are operator/colleague
+  corrections accumulated across wakes — apply them before the
+  default heuristics in this prompt. See section 6 for details.
 - Made the following tools available: `Read`, `Glob`, `Grep`, `Bash`,
   `Task` (for parallel sub-agents).
 
@@ -142,9 +146,21 @@ gets a visual sub-agent on this wake if ANY of:
      6 hours old (stale verdict — re-verify to catch drift even on
      watcher-healthy channels).
 
-Cap total visual sub-agents per wake at **8**. If more than 8 channels
+Cap total visual sub-agents per wake at **4**. If more than 4 channels
 qualify, prioritize (a) > (b) > (c) and defer the rest to the next
 wake. Record which channels were checked in `new_state`.
+
+**Apply learned rules first.** The `<<<LEARNED_RULES>>>` block inlined
+at the end of this prompt contains accumulated operator and colleague
+corrections, queried fresh from the lessons database every wake.
+These rules OVERRIDE default behavior. New entries are added by
+operator sessions via `channels/brain_loop/lessons.sh add ...` as
+they learn from real incidents — you see them automatically on the
+next wake, no PROMPT.md edit required. Treat every listed rule as a
+binding instruction. If a rule contradicts default heuristics in this
+file, the rule wins. When a rule applies to a judgement you make,
+note the rule id in your reasoning so future sessions can track
+effectiveness via the `rule_firings` table.
 
 Then read `channels/identity_manifest.json` to get the per-channel
 expectations. For each SELECTED channel, dispatch a sub-agent via the
@@ -199,6 +215,10 @@ evaluate at the SEMANTIC level:
    reference images are provided. A channel showing unexpected
    content but with the correct logo = `match`. Unexpected content
    without a visible logo = `unknown` (not mismatch).
+   (Rules for specific overlay classes — e.g. Eid banners,
+   donation tickers — are now driven from the learned-rules
+   database and appear in the LEARNED_RULES block for each wake.
+   Apply them from there, not from hardcoded text here.)
 5. **The baseline thumbnail is a REFERENCE for the logo only.** Use
    it to learn what the channel's logo looks like. Never return
    `mismatch` because the current frame looks different from the
@@ -416,6 +436,19 @@ matching this shape (no trailing prose, no code fences):
   "identity_updates": [
     {"channel_id": "basmah", "identity_status": "verified"},
     {"channel_id": "anees",  "identity_status": "mismatch"}
+  ],
+  "rules_applied": [
+    // Record every learned rule you used while judging this wake.
+    // The wrapper inserts one row in rule_firings per entry — that is
+    // how times_applied gets incremented and how the rule effectiveness
+    // feedback loop stays alive. Leave empty if no rules applied.
+    // - rule_id is the integer id from the LEARNED_RULES block.
+    // - channel_id is the channel the rule affected (null for global
+    //   judgments).
+    // - notes is one short sentence on HOW the rule changed your call
+    //   (e.g. "ignored Eid overlay, logo was المجد → verified").
+    {"rule_id": 2, "channel_id": "almajd-3aamah",
+     "notes": "Seasonal overlay ignored; verified on logo alone."}
   ],
   "telegram_messages": [
     {"severity": "severe", "en": "User-facing English", "ar": "نص عربي للزميل"},
