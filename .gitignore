@@ -43,8 +43,16 @@ __pycache__/
 *.m3u8
 
 # Cookies / credentials (sensitive)
+# 2026-04-19: generalized to *credentials*.json so any current OR future
+# provider credential file is blocked by default. Previously we maintained
+# per-provider exceptions and missed channels/ayyadonline_credentials.json,
+# which resulted in a 56-day public-repo exposure (CSO finding 2026-04-19,
+# fixed same day).
+channels/*credentials*.json
+!channels/*.example.json
 channels/provider_credentials.json
 channels/seenshow_credentials.json
+channels/ayyadonline_credentials.json
 channels/.seenshow_cookies.json
 channels/*cookies.txt
 playlists/*.m3u
