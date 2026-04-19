@@ -1,5 +1,11 @@
 # Project Guidelines
 
+## Project
+
+Albunyaan HLS restreaming supervisor — 22 Islamic TV channels, reflex watcher (5 s) + brain wake (3 h) + logo sampler (3 min) + lessons SQLite + Telegram integration. **Read `docs/RESUME.md` first** for architecture, runbooks, and current-state handoff. Regression suite: `channels/brain_loop/test_lessons.sh`.
+
+**Never commit credentials.** `.gitignore` covers `channels/*credentials*.json`. If you add a new provider, its secrets file must not be committed — store server-side only. A leak cannot be fully cleaned by git history rewrite; GitHub caches the old SHA for days. Rotation at the provider is the only complete remediation.
+
 ## Sudo Commands
 
 All commands requiring `sudo` must use the askpass helper approach:
