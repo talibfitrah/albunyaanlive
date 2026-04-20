@@ -10,11 +10,11 @@ stream_name="zaad"
 # Clean full-rate feed (tested at 50fps / SD 720x576). YouTube kept as
 # backup1 for HD failover; restream.io demoted to backup2 after confirmed
 # upstream frame starvation.
-stream_url="http://eg.ayyadonline.net:80/farouq200226/tqidc6qejy/77065"
+stream_url="rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
 
 # Backup URLs (optional) - leave empty if not available
 stream_url_backup1="https://www.youtube.com/@ZadTVchannel/live"
-stream_url_backup2="rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq200226/tqidc6qejy/77065"
 stream_url_backup3=""
 
 rtmp_url="/var/www/html/stream/hls/zaad/master.m3u8"

@@ -10,11 +10,11 @@ stream_name="705729222787/345515312457/1421"
 # Config now mirrors the running pipeline (ayyad primary, vlc.news demoted to
 # backup2). audio_resync_mode=1 activates wallclock-based input timestamps +
 # aresample=async=1 so returning to vlc.news will no longer blank clients.
-stream_url="elahmad:makkahtv"
+stream_url="http://vlc.news:80/705729222787/345515312457/1421"
 
 # Backup URLs (optional) - leave empty if not available
-stream_url_backup1="http://vlc.news:80/705729222787/345515312457/1421"
-stream_url_backup2=""
+stream_url_backup1="elahmad:makkahtv"
+stream_url_backup2="http://eg.ayyadonline.net:80/farouq70226/g7mt67ciwg/28179"
 stream_url_backup3=""
 
 # Audio resync: protects against upstreams with intermittent bad audio PTS
