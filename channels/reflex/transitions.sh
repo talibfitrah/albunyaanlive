@@ -10,6 +10,16 @@
 #
 # Depends on: state.sh, freshness.sh, backoff.sh, probe.sh
 
+# Staleness threshold, derived from the supervisor's own self-heal window.
+# Invariant: REFLEX_STALENESS_SEC > SEGMENT_STALE_THRESHOLD. If this is
+# violated, reflex trips SIGUSR1 on transient jitter that try_start_stream.sh
+# would have absorbed on its own — the 2026-04-15→-20 flap storm.
+# The +10s margin gives supervisor at least one full segment to self-heal.
+# An operator can override REFLEX_STALENESS_SEC directly (e.g. e2e fixture
+# uses 10s) or raise SEGMENT_STALE_THRESHOLD and we follow suit automatically.
+: "${REFLEX_STALENESS_SEC:=$(( ${SEGMENT_STALE_THRESHOLD:-90} + 10 ))}"
+export REFLEX_STALENESS_SEC
+
 # Helper used by tests to locate the state file path
 state_path_for() { echo "${STATE_DIR:-/var/run/albunyaan/state}/$1.json"; }
 
@@ -89,14 +99,10 @@ _handle_live() {
 
     [[ "$in_grace" == "1" ]] && return
 
-    # Threshold must exceed try_start_stream.sh's own SEGMENT_STALE_THRESHOLD (90s)
-    # so reflex acts as a safety net *after* the supervisor's self-heal window,
-    # not a racing competitor. Lowering this below ~100s reintroduces the
-    # 2026-04-15→-20 flap storm where reflex tripped SIGUSR1 every ~60s on
-    # transient jitter that ffmpeg would have absorbed on its own.
-    # Env override REFLEX_STALENESS_SEC exists so the e2e fixture can use a
-    # smaller value (10s) without waiting 100+ s per scenario.
-    is_output_fresh "$hls_dir" "${REFLEX_STALENESS_SEC:-100}"
+    # REFLEX_STALENESS_SEC is derived at script load from SEGMENT_STALE_THRESHOLD + 10s
+    # (see header). Guarantees we run as a safety net *after* the supervisor's
+    # self-heal window rather than racing it.
+    is_output_fresh "$hls_dir" "$REFLEX_STALENESS_SEC"
     case $? in
         0) return ;;   # fresh — stay
         1)             # stale — slate
@@ -218,8 +224,8 @@ _handle_backup() {
     fi
 
     if [[ "$in_grace" == "0" ]]; then
-        # Same 100s threshold as LIVE handler — see comment above for rationale.
-        is_output_fresh "$hls_dir" "${REFLEX_STALENESS_SEC:-100}"
+        # Same derived threshold as LIVE handler — see header for rationale.
+        is_output_fresh "$hls_dir" "$REFLEX_STALENESS_SEC"
         if [[ $? -eq 1 ]]; then
             _push_transition "$ch" "BACKUP" "SLATE" "backup_stale"
             state_modify "$ch" '
