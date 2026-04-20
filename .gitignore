@@ -28,6 +28,13 @@ __pycache__/
 *.pyc
 *.pyo
 
+# ML model binaries (too large for git; separate project-scope storage)
+# Added after 45MB yolo11m-seg.pt from the discontinued halal-video project
+# appeared untracked in the working tree.
+*.pt
+*.onnx
+*.safetensors
+
 # Lock files
 /tmp/stream_*.lock
 
