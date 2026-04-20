@@ -89,7 +89,12 @@ _handle_live() {
 
     [[ "$in_grace" == "1" ]] && return
 
-    is_output_fresh "$hls_dir" 10
+    # Threshold must exceed try_start_stream.sh's own SEGMENT_STALE_THRESHOLD (90s)
+    # so reflex acts as a safety net *after* the supervisor's self-heal window,
+    # not a racing competitor. Lowering this below ~100s reintroduces the
+    # 2026-04-15→-20 flap storm where reflex tripped SIGUSR1 every ~60s on
+    # transient jitter that ffmpeg would have absorbed on its own.
+    is_output_fresh "$hls_dir" 100
     case $? in
         0) return ;;   # fresh — stay
         1)             # stale — slate
@@ -211,7 +216,8 @@ _handle_backup() {
     fi
 
     if [[ "$in_grace" == "0" ]]; then
-        is_output_fresh "$hls_dir" 10
+        # Same 100s threshold as LIVE handler — see comment above for rationale.
+        is_output_fresh "$hls_dir" 100
         if [[ $? -eq 1 ]]; then
             _push_transition "$ch" "BACKUP" "SLATE" "backup_stale"
             state_modify "$ch" '
