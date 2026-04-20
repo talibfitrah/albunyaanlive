@@ -94,7 +94,9 @@ _handle_live() {
     # not a racing competitor. Lowering this below ~100s reintroduces the
     # 2026-04-15→-20 flap storm where reflex tripped SIGUSR1 every ~60s on
     # transient jitter that ffmpeg would have absorbed on its own.
-    is_output_fresh "$hls_dir" 100
+    # Env override REFLEX_STALENESS_SEC exists so the e2e fixture can use a
+    # smaller value (10s) without waiting 100+ s per scenario.
+    is_output_fresh "$hls_dir" "${REFLEX_STALENESS_SEC:-100}"
     case $? in
         0) return ;;   # fresh — stay
         1)             # stale — slate
@@ -217,7 +219,7 @@ _handle_backup() {
 
     if [[ "$in_grace" == "0" ]]; then
         # Same 100s threshold as LIVE handler — see comment above for rationale.
-        is_output_fresh "$hls_dir" 100
+        is_output_fresh "$hls_dir" "${REFLEX_STALENESS_SEC:-100}"
         if [[ $? -eq 1 ]]; then
             _push_transition "$ch" "BACKUP" "SLATE" "backup_stale"
             state_modify "$ch" '

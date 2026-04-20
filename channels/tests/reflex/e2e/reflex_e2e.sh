@@ -34,9 +34,14 @@ export REFLEX_ENABLED=1
 # The fixture binds upstreams to 127.0.0.1:18080/18081, which probe.sh
 # blocklists as potential SSRF targets in production. Opt in here.
 export REFLEX_ALLOW_LOCAL_PROBE=1
-# Aggressive stall thresholds so the test doesn't need to wait 60+ s.
+# Aggressive stall thresholds so the test doesn't need to wait 100+ s.
+# REFLEX_STALENESS_SEC overrides the production 100s default in
+# transitions.sh (raised from 10s in 2026-04-20 commit c8e24ba to stop
+# the flap storm against supervisor's own 90s self-heal). 10s keeps
+# the happy-path scenario within its ~50s budget.
 export STALL_WARN=3
 export STALL_CRIT=6
+export REFLEX_STALENESS_SEC=10
 
 CH=test_channel
 PRIMARY_URL="http://127.0.0.1:18080/master.m3u8"
@@ -65,7 +70,10 @@ setup() {
     # setsid gives the stub its own session + process group so teardown can
     # TERM/KILL the whole tree. Note: `$!` points at the setsid wrapper,
     # not the stub — read the real PID from the PID file the stub writes.
-    setsid bash "$FIX_DIR/stub_try_start_stream.sh" "$CH" "$PRIMARY_URL" \
+    # Trailing "-n $CH" satisfies signals.sh's _pid_is_try_start_stream
+    # anchor guard (added in 2026-04-16 security round 2), which rejects
+    # bare substring matches. The stub itself ignores extra argv.
+    setsid bash "$FIX_DIR/stub_try_start_stream.sh" "$CH" "$PRIMARY_URL" -n "$CH" \
         </dev/null >/tmp/reflex-e2e/logs/stub.out 2>&1 &
     local waited=0
     while (( waited < 20 )); do
