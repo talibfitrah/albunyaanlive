@@ -1,0 +1,35 @@
+# /etc/systemd/system/albunyaan-wake-reminder.service
+[Unit]
+Description=Albunyaan pre-wake reminder — pings operator T-30min and T-15min before next brain wake
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/brain_loop/wake_reminder.sh
+
+[Service]
+Type=oneshot
+User=msa
+Group=msa
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/brain_loop/wake_reminder.sh
+
+# Short-lived: one systemctl query, one SQLite SELECT, optional Telegram
+# POST. Any runaway is a bug.
+TimeoutStartSec=20s
+MemoryMax=64M
+CPUQuota=10%
+
+# Filesystem hardening — same pattern as confirm-poller.
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels/brain /run/albunyaan
+ReadOnlyPaths=/home/msa/.claude/channels/telegram
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

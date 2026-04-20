@@ -1,0 +1,18 @@
+# /etc/systemd/system/albunyaan-wake-reminder.timer
+[Unit]
+Description=Trigger pre-wake reminder every 5 minutes (T-30 and T-15 before brain wake)
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/brain_loop/wake_reminder.sh
+
+[Timer]
+# 5-minute cadence gives ±2.5min resolution against the T-30 and T-15
+# phase windows (±2min each). The script is idempotent per cycle, so
+# firing inside a window more than once is harmless.
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+Unit=albunyaan-wake-reminder.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
