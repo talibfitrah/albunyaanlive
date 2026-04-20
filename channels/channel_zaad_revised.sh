@@ -5,11 +5,16 @@
 # =============================================================================
 
 stream_name="zaad"
-# 2026-04-13: ayyadonline promoted to primary (user request, this time
-# applied to stream_url as well — earlier edit only updated the comment).
-# Clean full-rate feed (tested at 50fps / SD 720x576). YouTube kept as
-# backup1 for HD failover; restream.io demoted to backup2 after confirmed
-# upstream frame starvation.
+# Current layout (2026-04-19 operator rotation):
+#   primary  = restream.io, backup1 = YouTube (HD), backup2 = ayyad.
+# History:
+#   2026-04-13 — restream.io delivered 144 frames/12s (expected ~300 @
+#                25fps); freezes confirmed upstream frame starvation
+#                (TROUBLESHOOTING.md §2026-04-13). Demoted to backup2.
+#   2026-04-13..2026-04-19 — ayyad primary, YouTube backup1.
+#   2026-04-19 — operator re-promoted restream.io to primary. If frame
+#                starvation recurs, revert: ayyad primary, restream.io
+#                back to backup2.
 stream_url="rtmp://live.restream.io/pull/play_4504673_039e9fbc150af973ecc0"
 
 # Backup URLs (optional) - leave empty if not available

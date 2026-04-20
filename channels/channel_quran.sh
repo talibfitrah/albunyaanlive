@@ -5,11 +5,14 @@
 # =============================================================================
 
 stream_name="705729222787/345515312457/1421"
-# 2026-04-14: failed over to ayyad — vlc.news was emitting audio packets with
-# ~95k-sec PTS offset vs video, blanking Android/ExoPlayer clients.
-# Config now mirrors the running pipeline (ayyad primary, vlc.news demoted to
-# backup2). audio_resync_mode=1 activates wallclock-based input timestamps +
-# aresample=async=1 so returning to vlc.news will no longer blank clients.
+# Current layout (2026-04-19 operator rotation):
+#   primary  = vlc.news, backup1 = elahmad, backup2 = ayyad.
+# History:
+#   2026-04-14 — vlc.news emitted ~95k-sec audio-PTS offset vs video,
+#                blanking Android/ExoPlayer clients; failed over to ayyad.
+#   2026-04-14..2026-04-19 — ayyad was primary, vlc.news backup2.
+#   2026-04-19 — operator rotated vlc.news back to primary (with
+#                audio_resync_mode=1 active to absorb its PTS quirk).
 stream_url="http://vlc.news:80/705729222787/345515312457/1421"
 
 # Backup URLs (optional) - leave empty if not available
@@ -17,12 +20,12 @@ stream_url_backup1="elahmad:makkahtv"
 stream_url_backup2="http://eg.ayyadonline.net:80/farouq70226/g7mt67ciwg/28179"
 stream_url_backup3=""
 
-# Audio resync: protects against upstreams with intermittent bad audio PTS
+# Audio resync: wallclock-based input timestamps + aresample=async=1
 # (see try_start_stream.sh audio_resync_mode block). 1=on, 0=off.
-# Currently 0: ayyad upstream has clean PTS; the wallclock-timestamps flag
-# was causing video stutter (colleague reported "picture freezes then
-# resumes repeatedly" 2026-04-14 20:09). Re-enable to 1 only when reverting
-# to vlc.news, whose bad audio PTS is what the patch was designed to absorb.
+# Required when vlc.news is primary — absorbs its intermittent audio-PTS
+# corruption. When ayyad was primary (2026-04-14..2026-04-19) this was 0,
+# since the wallclock flag caused stutter on ayyad's clean PTS. Current
+# rotation back to vlc.news requires this to be 1.
 audio_resync_mode=1
 
 rtmp_url="/var/www/html/stream/hls/makkah/master.m3u8"
