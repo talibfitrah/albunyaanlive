@@ -25,6 +25,10 @@
 #                             when it sends a severe alert so replies can be matched later.
 #   pending-list [--chat-id X] [--status S] [--limit N]
 #                             Show pending confirmations. Default: all pending across chats.
+#   pending-count [--chat-id X] [--status S]
+#                             Print a pure integer count (for shell scripts).
+#                             Exits non-zero on DB error — distinguishes "0 pending"
+#                             from "DB unavailable" in a way pending-list cannot.
 #   pending-resolve --id N --outcome O [--reply-text TEXT] [--by poller|operator]
 #                             Mark a pending row resolved and write the outcome to every
 #                             linked firing. Atomic: one transaction.
@@ -781,6 +785,44 @@ for r in rows:
 PYEOF
 }
 
+pending_count() {
+    # Prints a pure integer: the count of pending_confirmations rows
+    # matching the filters. Intended for shell consumption (e.g.,
+    # wake_reminder.sh) where parsing a formatted table is fragile.
+    # Exits non-zero on DB error so callers can distinguish "zero pending"
+    # from "DB locked / missing / corrupt" — pending-list swallows those.
+    require_sqlite
+    local chat_id="" status="sent"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chat-id) chat_id="$2"; shift 2 ;;
+            --status)  status="$2";  shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    python3 - "$DB_PATH" "$chat_id" "$status" <<'PYEOF'
+import sys, sqlite3
+db_path, chat_id, status = sys.argv[1:4]
+sql = "SELECT COUNT(*) FROM pending_confirmations WHERE 1=1"
+params = []
+if chat_id:
+    sql += " AND chat_id = ?"
+    params.append(chat_id)
+if status and status != 'all':
+    sql += " AND status = ?"
+    params.append(status)
+try:
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA foreign_keys = ON")
+    (n,) = con.execute(sql, params).fetchone()
+    con.close()
+except sqlite3.Error as e:
+    print(f"error: {e}", file=sys.stderr)
+    sys.exit(2)
+print(n)
+PYEOF
+}
+
 pending_resolve() {
     require_sqlite
     local pid="" outcome="" reply_text="" by="operator"
@@ -1049,6 +1091,7 @@ case "$cmd" in
     prune)      prune_rules "$@" ;;
     pending-record)  pending_record "$@" ;;
     pending-list)    pending_list "$@" ;;
+    pending-count)   pending_count "$@" ;;
     pending-resolve) pending_resolve "$@" ;;
     pending-expire)  pending_expire "$@" ;;
     report)          report_effectiveness "$@" ;;

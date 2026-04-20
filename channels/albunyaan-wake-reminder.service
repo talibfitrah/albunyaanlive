@@ -16,10 +16,13 @@ TimeoutStartSec=20s
 MemoryMax=64M
 CPUQuota=10%
 
-# Filesystem hardening — same pattern as confirm-poller.
+# Filesystem hardening — same pattern as confirm-poller, plus channels/logs
+# so tg_alert.sh can record delivery failures (default TG_ALERT_LOG path).
+# Without this, failed Telegram sends would be silently unlogged under the
+# sandbox — the exact case review 2026-04-20 flagged as a blind spot.
 PrivateTmp=no
 ProtectSystem=strict
-ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels/brain /run/albunyaan
+ReadWritePaths=/home/msa/Development/scripts/albunyaan/channels/brain /home/msa/Development/scripts/albunyaan/channels/logs /run/albunyaan
 ReadOnlyPaths=/home/msa/.claude/channels/telegram
 ProtectHome=read-only
 ProtectKernelTunables=yes
