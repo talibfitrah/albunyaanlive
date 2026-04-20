@@ -1,0 +1,36 @@
+# /etc/systemd/system/albunyaan-farouq-cleanup.service
+[Unit]
+Description=Albunyaan farouq-* cleanup — remove halal-video HLS artifacts after 48h
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/farouq_cleanup.sh
+
+[Service]
+Type=oneshot
+# Runs as root because /var/www/html/stream/hls/farouq-*/*.mp4 files have
+# mixed ownership (root+msa) from the halal-video pipeline; removal needs
+# root write perm on both the files and the parent inode.
+User=root
+Group=root
+WorkingDirectory=/home/msa/Development/scripts/albunyaan
+ExecStart=/home/msa/Development/scripts/albunyaan/channels/farouq_cleanup.sh
+
+# Short-lived — handful of stat calls + rm. Anything longer is a bug.
+TimeoutStartSec=60s
+MemoryMax=64M
+CPUQuota=10%
+
+# Filesystem hardening — only touches the two paths we explicitly write.
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/www/html/stream/hls /run/albunyaan/state
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

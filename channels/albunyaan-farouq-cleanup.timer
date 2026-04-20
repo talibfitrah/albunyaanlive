@@ -1,0 +1,17 @@
+# /etc/systemd/system/albunyaan-farouq-cleanup.timer
+[Unit]
+Description=Trigger farouq-* HLS cleanup hourly
+Documentation=file:///home/msa/Development/scripts/albunyaan/channels/farouq_cleanup.sh
+
+[Timer]
+# Hourly cadence is plenty — the 48h TTL is coarse. AccuracySec loose
+# so systemd can coalesce with other maintenance timers on the host.
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+
+Unit=albunyaan-farouq-cleanup.service
+
+[Install]
+WantedBy=timers.target
