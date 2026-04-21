@@ -80,6 +80,18 @@ if ! flock -n 9; then
 fi
 log "SINGLETON: acquired $SINGLETON_LOCK (pid=$$)"
 
+# Not every directory under $HLS_ROOT is a channel we monitor.
+#   - "slate": the placeholder mp4 source, always present, never streams.
+#   - "farouq-*": ephemeral halal-video outputs from Farouq's standalone
+#     product (auto-removed 48h after last activity by
+#     albunyaan-farouq-cleanup.timer). They look "stalled" because their
+#     feed stopped — that's exactly their end-of-life state. Never alert.
+_is_ephemeral() {
+    [[ "$1" == "slate" ]] && return 0
+    [[ "$1" == farouq-* ]] && return 0
+    return 1
+}
+
 json_escape() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 newest_segment_age() {
@@ -139,7 +151,7 @@ emit_state() {
     local channels_json="" first=1
     for dir in "$HLS_ROOT"/*/; do
         local ch="$(basename "$dir")"
-        [[ "$ch" == "slate" ]] && continue
+        _is_ephemeral "$ch" && continue
         local age status
         age=$(newest_segment_age "$dir")
         status=$(classify_age "$age")
@@ -308,7 +320,7 @@ check_alerts() {
     # Per-channel
     for dir in "$HLS_ROOT"/*/; do
         local ch; ch="$(basename "$dir")"
-        [[ "$ch" == "slate" ]] && continue
+        _is_ephemeral "$ch" && continue
         local age status
         age=$(newest_segment_age "$dir")
         status=$(classify_age "$age")
@@ -353,7 +365,7 @@ log_anomalies() {
     local mem cpu gpu disk_root disk_hls
     for dir in "$HLS_ROOT"/*/; do
         local ch="$(basename "$dir")"
-        [[ "$ch" == "slate" ]] && continue
+        _is_ephemeral "$ch" && continue
         local age status
         age=$(newest_segment_age "$dir")
         status=$(classify_age "$age")
@@ -482,7 +494,7 @@ _reflex_cycle() {
     local now; now=$(date +%s)
     for dir in "$HLS_ROOT"/*/; do
         local ch; ch=$(basename "$dir")
-        [[ "$ch" == "slate" ]] && continue
+        _is_ephemeral "$ch" && continue
         local cfg; cfg=$(_channel_cfg_json "$ch" "$script_dir")
         [[ -z "$cfg" ]] && continue
         state_init "$ch"
