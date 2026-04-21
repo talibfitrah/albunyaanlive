@@ -64,6 +64,22 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
 
+# Singleton guard: exactly one reflex_watcher per host. Any second invocation
+# — manual bash, test runner, wake.sh side-effect — finds the flock held
+# and exits cleanly. Without this, two instances race on STATE_FILE and the
+# orphan sits outside the service cgroup, invisible to `systemctl restart`.
+# Incident: 2026-04-20 08:19 CEST, orphan ran 17h blinding operator view.
+SINGLETON_LOCK="${SINGLETON_LOCK:-/var/run/albunyaan/reflex_watcher.singleton.lock}"
+if [[ ! -d "$(dirname "$SINGLETON_LOCK")" ]]; then
+    SINGLETON_LOCK="/tmp/reflex_watcher.singleton.lock"
+fi
+exec 9>"$SINGLETON_LOCK" || { echo "reflex_watcher: cannot open $SINGLETON_LOCK" >&2; exit 1; }
+if ! flock -n 9; then
+    log "SINGLETON: another reflex_watcher holds $SINGLETON_LOCK — refusing to start (pid=$$)"
+    exit 0
+fi
+log "SINGLETON: acquired $SINGLETON_LOCK (pid=$$)"
+
 json_escape() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 newest_segment_age() {
